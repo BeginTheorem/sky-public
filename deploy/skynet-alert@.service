@@ -1,0 +1,8 @@
+[Unit]
+Description=SkyNet owner alert for %i
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/skynet/config/skynet.env
+ExecStart=/opt/skynet/scripts/alert.sh %i "unit failed"
+SuccessExitStatus=0

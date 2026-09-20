@@ -1,0 +1,7 @@
+[Unit]
+Description=SkyNet automatic startup rollback
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/bin/bash /opt/skynet/scripts/skynet-startup-rollback.sh

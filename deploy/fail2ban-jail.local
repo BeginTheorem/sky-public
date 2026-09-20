@@ -1,0 +1,13 @@
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 5
+backend = systemd
+destemail = root@localhost
+banaction = ufw
+
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+logpath = %(sshd_log)s

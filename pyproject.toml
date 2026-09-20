@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skynet"
+version = "0.1.0"
+description = "Durable research harness for a continuously running agent"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.13"
+dependencies = ["pysocks>=1.7", "playwright>=1.50,<2", "psutil>=5.9"]
+
+[project.scripts]
+skynet = "skynet.cli:main"
+skynet-telegram = "skynet.telegram_bot:main"
+
+[project.optional-dependencies]
+# The self-improvement gate runs these; pyright is pinned so all consumers of
+# the gate use the same version. mypy is deliberately absent: pyright is the
+# single type authority, and keeping two checkers meant two baselines to
+# maintain.
+dev = [
+    "pyright==1.1.413",
+    "ruff>=0.16",
+    "pytest>=8",
+    "coverage>=7",
+]
+
+[tool.setuptools.packages.find]
+include = ["skynet*"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 160
+
+[tool.ruff.lint]
+# A broad, high-signal set: correctness (E/W/F), imports (I), bugbears (B),
+# simplifications (SIM), modernisation (UP), security (S), exception handling
+# (TRY/BLE), plus ruff/perflint/pie/ret. E501 is ignored on purpose: the tree
+# has long literal lines and rewrapping them would be churn, not correctness.
+# The subprocess/SQL/urlopen security rules are ignored because those calls are
+# the tool layer's deliberate job, not an accident.
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM", "RUF", "PERF", "PIE", "RET", "S", "TRY"]
+ignore = [
+    "E501",     # long literal lines; rewrapping is churn, not correctness
+    "E402",     # imports after env/sys.path setup are deliberate in a few entry points
+    "BLE001",   # broad except is the deliberate resilience boundary of the daemon
+    "S108",     # /tmp scratch paths are the documented sandbox, not a leak
+    "S311",     # deterministic random.Random in tests, not crypto
+    "S603",     # the tool layer runs subprocesses on purpose
+    "S607",     # partial executable paths are resolved via PATH on purpose
+    "S608",     # SQL is built from trusted internal table names
+    "S310",     # urlopen is the tool layer's job
+    "TRY003",   # rich exception messages are the provider/gate contract
+    "TRY300",   # moving the last statement into an else block is a style call
+    "TRY301",   # hoisting a validation raise into a helper hurts readability here
+    "RUF001",   # Russian text in user-facing strings is intentional
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert and touch private members on purpose.
+"tests/**" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

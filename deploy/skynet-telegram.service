@@ -1,0 +1,25 @@
+[Unit]
+Description=SkyNet private Telegram control bot
+After=network-online.target
+Wants=network-online.target
+OnFailure=skynet-alert@%n.service
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/skynet
+EnvironmentFile=/opt/skynet/config/skynet.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TZ=UTC
+ExecStart=/opt/skynet/.venv/bin/python -m skynet.telegram_bot --state /opt/skynet/state/skynet.sqlite3 --service skynet.service
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
