@@ -1,4 +1,5 @@
 """Shared fixtures for the SkyNet test suite."""
+
 from __future__ import annotations
 
 import json

@@ -9,12 +9,12 @@ from urllib import error, request
 
 from ..models import ModelTurn, ToolCall
 from ..provider import Message, ToolSchema
-from .errors import ProviderError
-from .openai_compatible import OpenAICompatibleProvider, _as_int, _looks_like_reasoning_leak
+from .errors import ProviderError, tool_arguments
+from .openai_compatible import OpenAICompatibleProvider, _as_finish_reason, _as_int, _looks_like_reasoning_leak
 
 
 class OpenRouterProvider(OpenAICompatibleProvider):
-    """OpenRouter Router client matching the OpenCode plugin's streaming options."""
+    """OpenAI-compatible streaming client for the OpenRouter API."""
 
     def __init__(
         self,
@@ -123,6 +123,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         usage_tokens = 0
         prompt_tokens = 0
         completion_tokens = 0
+        finish_reason: str | None = None
         saw_done = False
         try:
             iterator = iter(response)
@@ -153,13 +154,24 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                         completion_tokens = _as_int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
                 choices = chunk.get("choices") or []
                 for choice in choices:
+                    # The stop reason arrives on the final content chunk, and
+                    # the stream can still carry a later usage-only chunk.
+                    reason = _as_finish_reason(choice.get("finish_reason"))
+                    if reason is not None:
+                        finish_reason = reason
                     delta = choice.get("delta") or {}
                     content = delta.get("content")
                     if isinstance(content, str) and content:
                         text_parts.append(content)
-                    reasoning = delta.get("reasoning_content")
-                    if isinstance(reasoning, str) and reasoning:
-                        reasoning_parts.append(reasoning)
+                    # Providers differ in the spelling of the reasoning channel
+                    # (``reasoning`` vs ``reasoning_content``). Read the aliases
+                    # first-non-empty-per-delta, so a provider that sends both
+                    # cannot have the same text counted twice.
+                    for key in ("reasoning_content", "reasoning"):
+                        reasoning = delta.get(key)
+                        if isinstance(reasoning, str) and reasoning:
+                            reasoning_parts.append(reasoning)
+                            break
                     for call in delta.get("tool_calls") or []:
                         index = int(call.get("index", 0))
                         target = tool_calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
@@ -191,9 +203,13 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 provider=self.name,
                 model=self.model,
             ) from exc
-        if not saw_done:
-            # A truncated stream is a transient transport failure, not a
-            # protocol violation: let the fallback chain retry it.
+        if not saw_done and finish_reason is None:
+            # A stream is terminated by *either* protocol terminator: the
+            # ``[DONE]`` sentinel or a terminal ``finish_reason``. Requiring the
+            # sentinel alone discards a completed response whose tool calls and
+            # usage already arrived in full. A stream that closed with neither
+            # terminator was really cut off mid-generation, so that case stays a
+            # retryable transport failure.
             raise ProviderError(
                 "openrouter SSE stream ended before [DONE]",
                 category="network",
@@ -203,7 +219,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 model=self.model,
             )
         try:
-            calls = [ToolCall(tool_name=item["name"], arguments=json.loads(item["arguments"] or "{}"), call_id=item["id"]) for item in tool_calls.values()]
+            calls = [ToolCall(tool_name=item["name"], arguments=tool_arguments(json.loads(item["arguments"] or "{}")), call_id=item["id"]) for item in tool_calls.values()]
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ProviderError("openrouter returned malformed streamed tool call", category="invalid_response", provider=self.name, model=self.model) from exc
         text = "".join(text_parts)
@@ -217,7 +233,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 provider=self.name,
                 model=self.model,
             )
-        return ModelTurn(text=text, reasoning_content=reasoning_content, tool_calls=calls, usage_tokens=usage_tokens, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+        return ModelTurn(text=text, reasoning_content=reasoning_content, tool_calls=calls, usage_tokens=usage_tokens, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, finish_reason=finish_reason)
 
     def _read_timeout(self, idle_seconds: float, deadline: float | None) -> float:
         timeout = idle_seconds

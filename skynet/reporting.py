@@ -280,7 +280,15 @@ def _report_block(store: Any, run_row: Any) -> dict[str, Any]:
         "evidence": len(parsed["evidence"]),
         "changes": len(parsed["changes"]),
         "tests": len(parsed["tests"]),
-        "blocker": parsed["blocker"] or (str(result["failure"]) if result is not None and result["failure"] else ""),
+        # `failure` is a *control* label on a completed run, not a fault. The
+        # deferred-restart path stores "deferred restart" there while the status
+        # stays COMPLETED (51 of 66 rows on the live ledger, 0 non-completed
+        # rows), so using it as the blocker fallback printed
+        # "blocker: deferred restart" beneath "status: COMPLETED" in 16 of the
+        # newest 25 owner-facing reports. A completed run has no blocker unless
+        # the model authored one; every other status keeps the fallback.
+        "blocker": parsed["blocker"]
+        or (str(result["failure"]) if status != "COMPLETED" and result is not None and result["failure"] else ""),
         "summary": summary,
     }
 

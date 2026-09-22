@@ -9,23 +9,15 @@ from collections.abc import Sequence
 from typing import Any
 
 from .idea_archive import CELLS_TOTAL, CHANGE_TYPES, EVIDENCE_SOURCES, SUBSYSTEMS, learnability_defect
-from .model_contracts import PLANNER_RESPONSE_SCHEMA, json_contract, parse_json_object, validate_shape
+from .model_contracts import PLANNER_RESPONSE_SCHEMA, validate_shape
 from .models import ModelTurn
 from .planner import hypothesis_fingerprint, normalize_hypothesis_text, structural_fingerprint
+from .planner_contract import PLANNER_INSTRUCTION, PLANNER_RETRY_INSTRUCTION, parse_planner_reply, planner_system_prompt
 from .provider import LLMProvider, Message
-
-PLANNER_INSTRUCTION = """Return exactly one JSON object matching the planner response contract. Generate at most 3 bounded proposals for active goals.
-Each proposal must contain goal_id, title, problem, hypothesis, expected_new_fact, validation, scope (list), kind.
-The proposal must be useful without user input, have observable validation, and be smaller than a broad project.
-Do not repeat completed, blocked, exhausted, pending, or rejected work. Do not generate numbered pass/iteration/cycle variants.
-Do not execute tools or describe tool calls. Allowed kind values: engineering, research, validation, recovery, observation, self_improvement.
-For kind=research, set inspiration_ref to the external source (arXiv id, repository URL, or page URL) and make expected_new_fact the distilled, testable claim taken from it; a research proposal without a source will be rejected.
-Prefer proposals that occupy an empty descriptor cell: the payload lists cell_coverage, and an idea in an unexplored subsystem/change-type/evidence-source combination outranks a third variation of an already-worked one.
-A proposal may name parent_idea_id to develop an archived idea instead of starting from nothing."""
 
 
 class AutonomousPlanner:
-    def __init__(self, provider: LLMProvider, store: Any, *, output_tokens: int = 4096, max_input_chars: int = 700_000, timeout_seconds: float = 120.0, max_active_goals: int = 8, hypothesis_ttl_days: float = 30.0) -> None:
+    def __init__(self, provider: LLMProvider, store: Any, *, output_tokens: int = 16_384, max_input_chars: int = 700_000, timeout_seconds: float = 120.0, max_active_goals: int = 8, hypothesis_ttl_days: float = 30.0) -> None:
         self.provider = provider
         self.store = store
         self.output_tokens = output_tokens
@@ -33,6 +25,10 @@ class AutonomousPlanner:
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.max_active_goals = max(1, int(max_active_goals))
         self.hypothesis_ttl_days = max(0.0, float(hypothesis_ttl_days))
+        # The outcome of the most recent generate() call. The reactor reads it
+        # to distinguish "the planner crashed" from "the planner found nothing",
+        # which the empty list return value cannot express on its own.
+        self.last_status: str = ""
 
     def _complete_bounded(self, messages: Sequence[Message]) -> ModelTurn:
         """Bound the planner provider call; a stuck request must not freeze PLAN."""
@@ -58,18 +54,58 @@ class AutonomousPlanner:
 
     def generate(self, *, generation: int, goals: list[dict[str, Any]], tasks: list[dict[str, Any]], memories: list[dict[str, Any]], previous: dict[str, Any], trigger: str) -> list[dict[str, Any]]:
         attempt = self.store.start_planner_attempt(generation, trigger, "explore-alternatives")
+        self.last_status = ""
         payload = self._bounded_payload(goals, tasks, memories, previous)
-        messages = [{"role": "system", "content": "You are SkyNet's bounded autonomous planner. The harness owns execution. Return exactly one JSON object matching this schema: " + json_contract(PLANNER_RESPONSE_SCHEMA)}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+        messages = [{"role": "system", "content": planner_system_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
         try:
             turn: ModelTurn = self._complete_bounded(messages)
         except Exception as exc:
-            self.store.finish_planner_attempt(attempt, "provider_error", failure=str(exc)[:1000])
+            self._fail_attempt(attempt, trigger, "provider_error", str(exc))
             return []
+        retried = False
         try:
             parsed = self._parse(turn.text)
-        except Exception as exc:
-            self.store.finish_planner_attempt(attempt, "invalid_response", failure=str(exc)[:1000])
-            return []
+        except Exception as first_exc:
+            # One bounded repair attempt: the model is told exactly what was
+            # wrong and asked for one object. It never loops, so a model that
+            # keeps emitting the same shape cannot burn the run budget. The
+            # turn's own stop reason rides along, so a first attempt cut off at
+            # the output ceiling stays diagnosable even when the retry repairs it.
+            retried = True
+            # Remember whether the FIRST reply was cut off: if the retry also
+            # fails, the truncation must stay diagnosable even when the retry
+            # ended for an unrelated reason (a non-truncated garbage reply).
+            first_truncated = self._truncated(turn)
+            self.store.append_event("planner_retry", {
+                "attempt_id": attempt,
+                "trigger": trigger,
+                "reason": str(first_exc)[:500],
+                "finish_reason": turn.finish_reason,
+                "text_chars": len(turn.text),
+            })
+            correction = [*messages, {"role": "assistant", "content": turn.text}, {"role": "user", "content": PLANNER_RETRY_INSTRUCTION}]
+            try:
+                turn = self._complete_bounded(correction)
+            except Exception as exc:
+                self._fail_attempt(attempt, trigger, "provider_error", f"retry provider error: {exc}")
+                return []
+            try:
+                parsed = self._parse(turn.text)
+            except Exception as retry_exc:
+                # A completion stopped by the output ceiling is a distinct event
+                # from a model that answered garbage: the first is a budget knob
+                # (SKYNET_PLANNER_OUTPUT_TOKENS), the second is a contract break.
+                # Either attempt hitting the ceiling names the budget problem.
+                if first_truncated or self._truncated(turn):
+                    self._fail_attempt(
+                        attempt,
+                        trigger,
+                        "output_truncated",
+                        f"reply stopped at the output ceiling (first={first_truncated}, retry=finish_reason={turn.finish_reason}); retried once; still no decodable content",
+                    )
+                else:
+                    self._fail_attempt(attempt, trigger, "invalid_response", f"retried once; still invalid: {retry_exc}")
+                return []
         data = [item for item in parsed.get("proposals", []) if isinstance(item, dict)]
         self._apply_goal_proposals(parsed.get("goal_proposals"), goals, attempt)
         accepted = 0
@@ -114,10 +150,41 @@ class AutonomousPlanner:
             status = "all_rejected" if rejected else "all_deduplicated"
         else:
             status = "no_work"
-        self.store.finish_planner_attempt(attempt, status, proposal_count=len(data))
+        # The retry is visible in the attempt row's failure field, which stays
+        # the one place a reader of planner_attempts sees it without joining
+        # event_log.
+        self.store.finish_planner_attempt(attempt, status, proposal_count=len(data), failure="repaired_after_retry" if retried else "")
+        self.last_status = status
         if not accepted:
             self.store.append_event("planner_no_work", {"attempt_id": attempt, "trigger": trigger, "reason": status, "rejected": rejected, "deduplicated": deduplicated})
         return result
+
+    @staticmethod
+    def _truncated(turn: ModelTurn) -> bool:
+        """Whether the provider itself says the completion hit the output ceiling.
+
+        ``finish_reason == "length"`` is the provider's own stop reason, not an
+        inference from token counts: a reply that ends there was cut off by
+        ``max_tokens``, so its undecodable text names a budget problem rather
+        than a malformed model answer.
+        """
+        return turn.finish_reason == "length"
+
+    def _fail_attempt(self, attempt: str, trigger: str, status: str, failure: str) -> None:
+        """Close a failed attempt and make the failure kind a distinct event.
+
+        ``planner_generation_finished`` already carries the status, but a
+        dedicated event keeps "the model replied with garbage" separable from
+        "the provider was unreachable" and from "the reply was cut off at the
+        output ceiling" without parsing the status vocabulary.
+        """
+        self.store.finish_planner_attempt(attempt, status, failure=failure[:1000])
+        self.last_status = status
+        event = {
+            "invalid_response": "planner_invalid_response",
+            "output_truncated": "planner_output_truncated",
+        }.get(status, "planner_provider_error")
+        self.store.append_event(event, {"attempt_id": attempt, "trigger": trigger, "failure": failure[:500]})
 
     def _fingerprints_occupied(self, hypothesis_fingerprint_value: str, structural_fingerprint_value: str) -> bool:
         """A fingerprint is occupied only by terminal hypotheses or genuinely live work.
@@ -203,12 +270,17 @@ class AutonomousPlanner:
 
     @staticmethod
     def _parse(text: str) -> dict[str, Any]:
-        value = text.strip()
-        if "{" in value:
-            value = value[value.find("{"): value.rfind("}") + 1]
-        data = parse_json_object(value)
+        """Decode and validate a planner reply.
+
+        Decoding moved to the unprotected ``planner_contract`` module (the
+        instrument is repairable by the organism); validation stays here (the
+        decision is not). ``parse_planner_reply`` only reshapes text into a JSON
+        value and normalizes a top-level list; this protected call is what
+        refuses anything that is not a schema-valid object.
+        """
+        data = parse_planner_reply(text)
         validate_shape(data, PLANNER_RESPONSE_SCHEMA)
-        return data if isinstance(data, dict) else {}
+        return data
 
     def _apply_goal_proposals(self, raw: Any, goals: list[dict[str, Any]], attempt: str) -> list[str]:
         """Create at most one bounded goal per planning attempt.

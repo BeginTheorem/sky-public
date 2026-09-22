@@ -1,11 +1,11 @@
 """Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import json
 import tempfile
 import threading
 import unittest
-from datetime import UTC
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import cast
@@ -17,11 +17,6 @@ from skynet.outbox import deliver_to_http
 from skynet.planner import PlannerCandidate
 from skynet.store import StateStore
 
-
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 def _candidate(goal_id: str, task_id: str) -> PlannerCandidate:
     """A minimal planner candidate for `record_planner_decision`."""
@@ -35,6 +30,7 @@ def _candidate(goal_id: str, task_id: str) -> PlannerCandidate:
         repetition_penalty=0.0,
         reason="test",
     )
+
 
 class CoreTests(unittest.TestCase):
     def test_reset_short_memory_preserves_durable_state_and_audits(self) -> None:
@@ -51,7 +47,7 @@ class CoreTests(unittest.TestCase):
                 "recovery": {"reason": "loop"},
             }
             state.retry_count = 4
-            state.next_wake_at = _iso(86400.0)
+            state.next_wake_at = "2099-01-01T00:00:00+00:00"
             store.set_state(state)
 
             details = store.reset_short_memory()
@@ -107,7 +103,7 @@ class CoreTests(unittest.TestCase):
                 message_id = store.add_outbox("test", {"value": 1})
             self.assertEqual(store.claim_outbox(lease_seconds=300)[0]["message_id"], message_id)
             self.assertEqual(store.claim_outbox(lease_seconds=0), [])
-            store.connection.execute("UPDATE outbox SET claimed_at=? WHERE message_id=?", (_iso(0.0), message_id))
+            store.connection.execute("UPDATE outbox SET claimed_at='2000-01-01T00:00:00+00:00' WHERE message_id=?", (message_id,))
             self.assertEqual(store.claim_outbox(lease_seconds=300)[0]["message_id"], message_id)
             store.close()
     def test_run_result_commit_reconciles_status(self) -> None:
@@ -218,7 +214,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             row = store.connection.execute("SELECT version, name FROM schema_migrations ORDER BY version DESC").fetchone()
-            self.assertEqual((row[0], row[1]), (11, "memory-decay-clock"))
+            self.assertEqual((row[0], row[1]), (12, "run-progress"))
             store.close()
 
     def test_schema_v4_upgrade_adds_alerts_area_and_pinned(self) -> None:
@@ -248,7 +244,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(upgraded.connection.execute("SELECT area FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "general")
             self.assertEqual(upgraded.connection.execute("SELECT content FROM memories").fetchone()[0], "legacy memory")
             versions = [row[0] for row in upgraded.connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
-            self.assertEqual(versions[-1], 11)
+            self.assertEqual(versions[-1], 12)
             # v11 names the decay clock: the column must exist after an upgrade
             # even though an older database already had every earlier column.
             self.assertIn("decayed_at", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(memories)")})
@@ -272,7 +268,7 @@ class CoreTests(unittest.TestCase):
             ])
             pinned = store.connection.execute("SELECT memory_id FROM memories WHERE content='pinned truth'").fetchone()[0]
             store.set_memory_pinned(str(pinned))
-            store.connection.execute("UPDATE memories SET updated_at=?", (_iso(0.0),))
+            store.connection.execute("UPDATE memories SET updated_at='2020-01-01T00:00:00Z'")
             result = store.decay_memory_confidence(factor=0.5, stale_days=7.0, drop_below=0.1)
             self.assertEqual(result["faded"], 2, "pinned memories are not faded")
             self.assertEqual(result["dropped"], 1, "the weakest unpinned memory is removed")
@@ -289,7 +285,7 @@ class CoreTests(unittest.TestCase):
                 {"kind": "fact", "content": "well evidenced", "confidence": 0.9},
                 {"kind": "fact", "content": "weak guess", "confidence": 0.3},
             ])
-            store.connection.execute("UPDATE memories SET updated_at=?", (_iso(0.0),))
+            store.connection.execute("UPDATE memories SET updated_at='2020-01-01T00:00:00Z'")
             store.decay_memory_confidence(factor=0.5, stale_days=7.0, drop_below=0.0)
             rows = {row["content"]: row["confidence"] for row in store.connection.execute("SELECT content, confidence FROM memories")}
             self.assertAlmostEqual(rows["well evidenced"], 0.855, places=3)
@@ -343,12 +339,35 @@ class CoreTests(unittest.TestCase):
             store.append_event("provider_lockout", {"consecutive_failures": 3})
             store.append_event("task_gave_up", {"task_id": "t"})
             # Backdate everything beyond the window.
-            store.connection.execute("UPDATE event_log SET created_at=?", (_iso(0.0),))
+            store.connection.execute("UPDATE event_log SET created_at='2020-01-01T00:00:00Z'")
             self.assertEqual(store.prune_event_log(0), 0, "a disabled window must be a no-op")
             removed = store.prune_event_log(30)
             self.assertEqual(removed, 1, "only the routine event is pruned")
             kinds = {row[0] for row in store.connection.execute("SELECT kind FROM event_log")}
             self.assertEqual(kinds, {"provider_lockout", "task_gave_up"})
+            store.close()
+
+    def test_event_log_retention_keeps_the_planner_and_restart_post_mortem(self) -> None:
+        # "The planner crashed" and "there was genuinely no work" leave the same
+        # empty portfolio, so the kinds that separate them must survive retention;
+        # a restart request is the row that makes restarts observable at all.
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            protected = {
+                "restart_requested",
+                "planner_invalid_response",
+                "planner_provider_error",
+                "planner_fallback_capped",
+                "judge_health_degraded",
+            }
+            for kind in sorted(protected):
+                store.append_event(kind, {"evidence": kind})
+            store.append_event("planner_decision", {"routine": True})
+            store.connection.execute("UPDATE event_log SET created_at='2020-01-01T00:00:00Z'")
+            removed = store.prune_event_log(30)
+            self.assertEqual(removed, 1, "only the routine event is pruned")
+            kinds = {row[0] for row in store.connection.execute("SELECT kind FROM event_log")}
+            self.assertEqual(kinds, protected)
             store.close()
 
     def test_hot_query_paths_are_indexed(self) -> None:
@@ -521,6 +540,67 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM goals").fetchone()[0], 1)
             store.close()
 
+    def test_capability_effect_referenced_only_by_retained_transcript_survives(self) -> None:
+        # The folded tool result keeps its address in two retained places: the
+        # tool_result event and the react_history tool message, whose `content` is
+        # itself a JSON string. Transcript pruning is by run count, not days, so a
+        # retained transcript can outlive the 30-day effect window and the row it
+        # names must not be deleted.
+        from skynet.models import Budget, RunRecord
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.create_run(RunRecord("run-1", 1, RunStatus.COMPLETED, utc_now(), Budget()))
+            key = "run-1:0:call-folded"
+            store.record_effect(key, "bash", "hash", {"ok": True, "blob": "x" * 5000}, "applied")
+            folded = json.dumps({
+                "ok": True,
+                "truncated": True,
+                "preview": "x" * 10,
+                "effect_key": key,
+                "full_result_in": "capability_effects.idempotency_key",
+            })
+            store.append_transcript("react_history", {"messages": [{"role": "tool", "tool_call_id": "call-folded", "content": folded}]}, "run-1")
+            store.connection.execute("UPDATE capability_effects SET created_at='2020-01-01T00:00:00Z'")
+            removed = store.prune_capability_effects(30)
+            self.assertEqual(removed, 0, "the retained transcript still names the row")
+            self.assertIsNotNone(store.effect(key), "the address in the retained transcript must resolve")
+            store.close()
+
+    def test_capability_effect_not_referenced_by_retained_history_is_pruned(self) -> None:
+        # The guard must not silently disable pruning: an aged row nothing retained
+        # points at is still reclaimed.
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            key = "run-1:0:call-orphan"
+            store.record_effect(key, "bash", "hash", {"ok": True}, "applied")
+            store.connection.execute("UPDATE capability_effects SET created_at='2020-01-01T00:00:00Z'")
+            removed = store.prune_capability_effects(30)
+            self.assertEqual(removed, 1)
+            self.assertIsNone(store.effect(key))
+            store.close()
+
+    def test_capability_effect_pin_is_released_when_its_transcript_is_pruned(self) -> None:
+        # The pin is bounded: once prune_run_history drops the run holding the
+        # pointer, the next effect pass reclaims the row.
+        from skynet.models import Budget, RunRecord
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            for index in range(3):
+                store.create_run(RunRecord(f"run-{index}", 1, RunStatus.COMPLETED, utc_now(), Budget()))
+            key = "run-0:0:call-folded"
+            store.record_effect(key, "bash", "hash", {"ok": True}, "applied")
+            folded = json.dumps({"ok": True, "truncated": True, "preview": "x", "effect_key": key, "full_result_in": "capability_effects.idempotency_key"})
+            store.append_transcript("react_history", {"messages": [{"role": "tool", "tool_call_id": "call-folded", "content": folded}]}, "run-0")
+            store.connection.execute("UPDATE capability_effects SET created_at='2020-01-01T00:00:00Z'")
+            self.assertEqual(store.prune_capability_effects(30), 0, "pinned while the run-0 transcript is retained")
+            store.prune_run_history(2)
+            self.assertEqual(store.prune_capability_effects(30), 1, "the pin is released with the transcript")
+            store.close()
+
     def test_repair_status_consistency_cancels_unselectable_pending_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
@@ -546,6 +626,33 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.connection.execute("SELECT status FROM hypotheses WHERE fingerprint=?", (fingerprint,)).fetchone()[0], "ready")
             store.close()
 
+    def test_repair_status_consistency_excludes_safety_net_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("g", priority=1.0)
+            task_id = store.add_task("safety net", goal_id)
+            fingerprint = store.connection.execute("SELECT hypothesis_fingerprint FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0]
+            store.connection.execute("UPDATE hypotheses SET status='completed' WHERE fingerprint=?", (fingerprint,))
+            store.connection.commit()
+            self.assertEqual(store.repair_status_consistency(exclude_fingerprints=(fingerprint,))["tasks"], 0)
+            self.assertEqual(store.connection.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "pending")
+            # Without the exclusion the same row is repair-eligible, proving the
+            # exclusion (not the row shape) is what protected it.
+            self.assertEqual(store.repair_status_consistency()["tasks"], 1)
+            self.assertEqual(store.connection.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "cancelled")
+            store.close()
+
+    def test_task_update_without_status_keeps_current_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("g", priority=1.0)
+            task_id = store.add_task("done", goal_id)
+            store.connection.execute("UPDATE tasks SET status='completed' WHERE task_id=?", (task_id,))
+            store.connection.commit()
+            store.apply_task_updates([{"task_id": task_id, "outcome": "finished"}], run_id="run-1")
+            self.assertEqual(store.connection.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "completed")
+            store.close()
+
     def test_outbox_delivery_drains_pending(self) -> None:
         from skynet.outbox import deliver_to_jsonl
         with tempfile.TemporaryDirectory() as directory:
@@ -565,7 +672,7 @@ class CoreTests(unittest.TestCase):
             store.commit_run_result("done-2", RunStatus.COMPLETED, "ok", 1, 300, "")
             store.commit_run_result("failed", RunStatus.FAILED, "no", 1, 5000, "boom")
             store.commit_run_result("recover", RunStatus.NEEDS_RECOVERY, "?", 1, 2000, "stuck")
-            outcomes = metrics.outcome_mix(store.connection, _iso(0.0))
+            outcomes = metrics.outcome_mix(store.connection, "1970-01-01T00:00:00Z")
             self.assertEqual(outcomes["tokens_total"], 7400)
             self.assertEqual(outcomes["tokens_per_completed_run"], 200, "only completed runs pay")
             self.assertEqual(outcomes["tokens_wasted"], 7000, "failed and recovering runs are waste")
@@ -576,7 +683,7 @@ class CoreTests(unittest.TestCase):
             store = StateStore(Path(directory) / "state.sqlite3")
             for task_id in ("A", "A", "B", "A", "A", "C", "C", "C"):
                 store.record_planner_decision([], _candidate("goal-1", task_id))
-            streaks = metrics.livelock_streaks(store.connection, _iso(0.0), threshold=3)
+            streaks = metrics.livelock_streaks(store.connection, "1970-01-01T00:00:00Z", threshold=3)
             self.assertEqual(streaks, [{"task_id": "C", "streak": 3}], "A was selected 4 times but never 3 in a row")
             store.close()
 
@@ -611,3 +718,112 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("previous_context", columns)
             upgraded.reset_planning_context(reason="upgrade-check")
             upgraded.close()
+
+    def test_unexpired_outbox_lease_is_not_reclaimed_by_startup_recovery(self) -> None:
+        # `recover_inflight_outbox` is startup recovery, so it must reclaim only
+        # leases older than the window: a live lease another process is holding
+        # would double-deliver if reset.
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            fresh = store.add_outbox("test", {"value": "fresh"})
+            stale = store.add_outbox("test", {"value": "stale"})
+            store.claim_outbox(lease_seconds=1.0)
+            store.connection.execute("UPDATE outbox SET claimed_at='2000-01-01T00:00:00Z' WHERE message_id=?", (stale,))
+            store.connection.commit()
+            self.assertEqual(store.recover_inflight_outbox(stale_after_seconds=300.0), 1)
+            states = dict(store.connection.execute("SELECT message_id, delivery_state FROM outbox").fetchall())
+            self.assertEqual(states[stale], "pending")
+            self.assertEqual(states[fresh], "delivering", "a lease inside the window is live")
+            # The explicit operator call without a window keeps the original
+            # "recover every delivering row" behaviour.
+            self.assertEqual(store.recover_inflight_outbox(), 1)
+            store.close()
+
+    def test_run_effect_capabilities_are_scoped_to_the_run_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.record_effect("run-1:0:call-a", "send_message_to_user", "h1", {"ok": True}, "applied")
+            store.record_effect("run-1:1:call-b", "send_message_to_user", "h2", {"ok": True}, "applied")
+            store.record_effect("run-2:0:call-c", "bash", "h3", {"ok": True}, "applied")
+            self.assertEqual(store.run_effect_capabilities("run-1"), {"send_message_to_user": 2})
+            self.assertEqual(store.run_effect_capabilities("run-2"), {"bash": 1})
+            self.assertEqual(store.run_effect_capabilities("run-3"), {})
+            store.close()
+
+    def test_snapshot_episode_stores_a_transcript_pointer_not_a_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.append_transcript("provider_request", {"messages": []}, "run-1")
+            snapshot = store.snapshot_episode("run-1")
+            stored = json.loads(
+                store.connection.execute(
+                    "SELECT payload FROM episode_snapshots WHERE run_id=?", ("run-1",)
+                ).fetchone()[0]
+            )
+            self.assertEqual(stored["transcript"], {"rebuilt_from": "transcript", "rows_at_freeze": 1})
+            self.assertEqual(snapshot["transcript"][0]["kind"], "provider_request", "the read path rebuilds the projection")
+            store.close()
+
+    def test_compact_episode_snapshots_rewrites_only_byte_identical_legacy_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.append_transcript("provider_request", {"messages": []}, "run-1")
+            rebuilt = store._snapshot_transcript("run-1")
+            events = [{"sequence": 1, "kind": "tool_result", "payload": {"ok": True}}]
+            legacy = json.dumps({"events": events, "transcript": rebuilt}, ensure_ascii=False, sort_keys=True)
+            store.connection.execute(
+                "INSERT INTO episode_snapshots(snapshot_id, run_id, first_sequence, last_sequence, payload_hash, payload, created_at) "
+                "VALUES ('legacy', 'run-1', 1, 1, 'old', ?, '2026-01-01T00:00:00Z')",
+                (legacy,),
+            )
+            mismatched = json.dumps({"events": [], "transcript": [{"kind": "wrong"}]}, sort_keys=True)
+            store.connection.execute(
+                "INSERT INTO episode_snapshots(snapshot_id, run_id, first_sequence, last_sequence, payload_hash, payload, created_at) "
+                "VALUES ('mismatch', 'run-2', 0, 0, 'old', ?, '2026-01-01T00:00:00Z')",
+                (mismatched,),
+            )
+            store.connection.commit()
+
+            result = store.compact_episode_snapshots()
+            self.assertEqual(result["snapshots"], 1)
+            self.assertGreater(result["bytes"], 0)
+            rows = {
+                row["run_id"]: json.loads(row["payload"])
+                for row in store.connection.execute("SELECT run_id, payload FROM episode_snapshots").fetchall()
+            }
+            self.assertEqual(rows["run-1"]["transcript"], {"rebuilt_from": "transcript", "rows_at_freeze": len(rebuilt)})
+            self.assertEqual(rows["run-1"]["events"], events, "events are not rebuildable and must be untouched")
+            self.assertEqual(rows["run-2"]["transcript"], [{"kind": "wrong"}], "a mismatched rebuild keeps the old bytes")
+            stored_hash = store.connection.execute(
+                "SELECT payload_hash FROM episode_snapshots WHERE run_id='run-1'"
+            ).fetchone()[0]
+            self.assertNotEqual(stored_hash, "old")
+            store.close()
+
+    def test_capability_effect_referenced_only_by_episode_snapshot_survives(self) -> None:
+        # The snapshot stores the run's tool_result events verbatim, so an
+        # effect address lives there too; a snapshot is pruned by run count, not
+        # age, so the pin must hold past the effect retention window.
+        from skynet.models import Budget, RunRecord
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.create_run(RunRecord("run-1", 1, RunStatus.COMPLETED, utc_now(), Budget()))
+            key = "run-1:0:call-ev"
+            store.record_effect(key, "bash", "hash", {"ok": True}, "applied")
+            store.append_event(
+                "tool_result",
+                {"call": {"call_id": "call-ev", "tool_name": "bash"}, "result": {"ok": True, "effect_key": key}},
+                "run-1",
+            )
+            store.snapshot_episode("run-1")
+            # Drop the event-log holder so the snapshot is the only remaining
+            # pointer to the effect row.
+            store.connection.execute("DELETE FROM event_log WHERE kind='tool_result'")
+            store.connection.execute("UPDATE capability_effects SET created_at='2020-01-01T00:00:00Z'")
+            self.assertEqual(store.prune_capability_effects(30), 0, "the retained snapshot still names the row")
+            self.assertIsNotNone(store.effect(key), "the address in the retained snapshot must resolve")
+            store.connection.execute("DELETE FROM episode_snapshots WHERE run_id='run-1'")
+            self.assertEqual(store.prune_capability_effects(30), 1, "with the snapshot gone the pin releases")
+            store.close()

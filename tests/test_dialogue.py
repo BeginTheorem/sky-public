@@ -1,19 +1,15 @@
 """The asynchronous owner dialogue: durable questions and outbound messages."""
+
 from __future__ import annotations
 
 import tempfile
 import unittest
 from pathlib import Path
 
-from skynet.dialogue import AskUserTool, SendMessageToUserTool
+from skynet.dialogue import AskUserTool, ReadInboxTool, SendMessageToUserTool
 from skynet.outbox import render_outbox_message
 from skynet.store import StateStore
 
-
-def _iso(seconds: float) -> str:
-    from datetime import UTC, datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 class DialogueTests(unittest.TestCase):
     def _store(self, directory: str) -> StateStore:
@@ -42,12 +38,12 @@ class DialogueTests(unittest.TestCase):
             store = self._store(directory)
             question_id = store.ask_question("Which host?", run_id="run-1")
             self.assertEqual(store.open_questions()[0]["question"], "Which host?")
-            self.assertTrue(store.answer_question(question_id, "acknowledged", source="telegram"))
+            self.assertTrue(store.answer_question(question_id, "203.0.113.7", source="telegram"))
             self.assertEqual(store.open_questions(), [])
             row = store.connection.execute(
                 "SELECT answer, source FROM user_questions WHERE question_id=?", (question_id,)
             ).fetchone()
-            self.assertEqual((row["answer"], row["source"]), ("acknowledged", "telegram"))
+            self.assertEqual((row["answer"], row["source"]), ("203.0.113.7", "telegram"))
             # Answering twice is refused, not silently overwritten.
             self.assertFalse(store.answer_question(question_id, "something else"))
             self.assertEqual(
@@ -59,7 +55,7 @@ class DialogueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = self._store(directory)
             store.ask_question("Too late?", ttl_seconds=60.0)
-            store.connection.execute("UPDATE user_questions SET expires_at=?", (_iso(0.0),))
+            store.connection.execute("UPDATE user_questions SET expires_at='2020-01-01T00:00:00Z'")
             self.assertEqual(store.open_questions(), [])
             self.assertEqual(
                 store.connection.execute("SELECT status FROM user_questions").fetchone()[0], "expired"
@@ -98,12 +94,53 @@ class DialogueTests(unittest.TestCase):
             self.assertEqual(store.open_questions(), [])
             store.close()
 
+    def test_read_inbox_returns_pending_owner_messages_without_consuming_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            store.add_inbox_event("m1", "user_message", {"text": "first"})
+            store.add_inbox_event("m2", "user_message", {"text": "second"})
+            # A different pending kind must not be returned by the read tool and
+            # must not consume the small limit before ``user_message`` rows.
+            store.add_inbox_event("a1", "user_answer", {"answer": "an answer"})
+            result = ReadInboxTool(store).execute({}, idempotency_key="read")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["count"], 2)
+            self.assertEqual([item["event_id"] for item in result["messages"]], ["m1", "m2"])
+            self.assertEqual([item["text"] for item in result["messages"]], ["first", "second"])
+            # Read-only: nothing is consumed, and a second read returns the same.
+            self.assertEqual(len(store.pending_inbox()), 3)
+            again = ReadInboxTool(store).execute({}, idempotency_key="read-2")
+            self.assertEqual([item["event_id"] for item in again["messages"]], ["m1", "m2"])
+            store.close()
+
+    def test_read_inbox_is_empty_when_the_queue_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            result = ReadInboxTool(store).execute({}, idempotency_key="read")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["count"], 0)
+            self.assertEqual(result["messages"], [])
+            store.close()
+
+    def test_read_inbox_bounds_the_limit_and_the_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            for index in range(25):
+                store.add_inbox_event(f"m{index}", "user_message", {"text": "x" * 5000})
+            tool = ReadInboxTool(store)
+            result = tool.execute({"limit": 1000}, idempotency_key="read")
+            # The tool cap, not the argument, owns the bound.
+            self.assertEqual(result["count"], tool.MAX_LIMIT)
+            self.assertTrue(all(len(item["text"]) <= tool.MAX_TEXT_CHARS for item in result["messages"]))
+            store.close()
+
     def test_outbox_rendering_covers_the_new_kinds(self) -> None:
         question = render_outbox_message("user_question", {"question_id": "abcdef1234", "question": "Prefer?", "options": ["a", "b"]})
         self.assertIn("[QUESTION abcdef12]", question)
         self.assertIn("/answer", question)
         message = render_outbox_message("agent_message", {"message": "done", "severity": "critical"})
         self.assertEqual(message, "[CRITICAL] done")
+
 
 class AlertReconciliationTests(unittest.TestCase):
     def test_a_delivered_outbox_message_closes_its_pending_alert(self) -> None:
@@ -132,6 +169,7 @@ class AlertReconciliationTests(unittest.TestCase):
             self.assertEqual(store.reconcile_delivered_alerts(), 0)
             self.assertEqual(len(store.pending_alerts()), 1)
             store.close()
+
 
 class BlockingWaitTests(unittest.TestCase):
     def test_wait_returns_the_answer_when_the_owner_replies(self) -> None:

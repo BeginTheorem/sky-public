@@ -8,7 +8,7 @@ mkdir -p "$BIN_DIR"
 command -v node >/dev/null || { printf 'node is required\n' >&2; exit 1; }
 command -v python3 >/dev/null || { printf 'python3 is required\n' >&2; exit 1; }
 
-# Standalone launchers for the MCP servers.
+# Keep the same standalone launchers used by the local OpenCode installation.
 NODE_ROOT="${HOME}/.local/share/skynet-mcp-node"
 npm install --prefix "$NODE_ROOT" @playwright/mcp@0.0.79
 NODE_BIN="$(command -v node)"

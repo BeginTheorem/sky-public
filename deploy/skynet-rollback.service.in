@@ -4,4 +4,4 @@ Description=SkyNet automatic startup rollback
 [Service]
 Type=oneshot
 User=root
-ExecStart=/bin/bash /opt/skynet/scripts/skynet-startup-rollback.sh
+ExecStart=/bin/bash @ROOT@/scripts/skynet-startup-rollback.sh

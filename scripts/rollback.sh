@@ -2,8 +2,10 @@
 
 set -euo pipefail
 
-# Deployment target. Infrastructure values must not live in tracked files.
-# Keep the real values in config/deploy.env, which is gitignored.
+# Deployment target. Infrastructure values must not live in tracked files: the
+# host changed once already and every hardcoded copy broke with it. Keep the real
+# values in config/deploy.env, which is gitignored.
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_ENV="$ROOT_DIR/config/deploy.env"
 if [[ -f "$DEPLOY_ENV" ]]; then
     # shellcheck disable=SC1090
@@ -15,8 +17,13 @@ REMOTE_USER="${REMOTE_USER:-}"
 REMOTE_DIR="${REMOTE_DIR:-$HOME/project-skynet}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/deploy_key}"
 
-if [[ -z "$REMOTE_HOST" || -z "$REMOTE_USER" ]]; then
-    printf 'REMOTE_HOST and REMOTE_USER must be set; create config/deploy.env with both\n' >&2
+if [[ -z "$REMOTE_HOST" ]]; then
+    printf 'REMOTE_HOST is not set; create config/deploy.env with REMOTE_HOST=<host>\n' >&2
+    exit 2
+fi
+
+if [[ -z "$REMOTE_USER" ]]; then
+    printf 'REMOTE_USER is not set; create config/deploy.env with REMOTE_USER=<account>\n' >&2
     exit 2
 fi
 TARGET="${1:-}"

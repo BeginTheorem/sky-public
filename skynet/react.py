@@ -9,12 +9,12 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .model_contracts import FINISH_REPORT_SCHEMA, parse_json_object, validate_shape
+from .model_contracts import FINISH_REPORT_SCHEMA, clamp_to_schema, parse_json_object, validate_shape
 from .models import AgentRunResult, ModelTurn, RunStatus, StartEnvelope
 from .provider import LLMProvider, Message, Tool
 from .providers.errors import ProviderError
@@ -25,6 +25,14 @@ log = logging.getLogger("skynet.react")
 MAX_RESPONSE_LOG_PREVIEW = 2000
 WORKTREE_STATUS_TIMEOUT_SECONDS = 5.0
 WORKTREE_WARNING_MAX_FILES = 20
+RUN_PROGRESS_MESSAGE_LIMIT = 300
+RUN_PROGRESS_TOOL_LIMIT = 60
+
+# Called by the runner when model time crosses a progress boundary. The payload
+# is deliberately a plain dict of already-derived facts (no store or outbox
+# knowledge), so the runner stays the ReAct owner and the Reactor keeps being the
+# only writer of the owner outbox.
+RunProgressCallback = Callable[[dict[str, Any]], None]
 
 
 # Child process groups registered by tools during the current tool call. A tool
@@ -93,8 +101,8 @@ class ReActConfig:
     context_warning_ratio_high: float = 0.75
     # Model time, not wall time: the budget enforced at the top of run() and
     # before each tool call is provider latency. Without an in-band note the
-    # model only learns the budget is gone once the episode is discarded, so
-    # the budget is disclosed in band (budget-conditioned control).
+    # model only learns the budget is gone once the episode is discarded
+    # (arXiv:2604.01664: budget-conditioned control beats the budget-free form).
     time_warning_ratio: float = 0.7
     finish_threshold_ratio: float = 0.875  # protective forced Finish, not normal completion
     context_finish_reserve: int = 25_000
@@ -108,6 +116,23 @@ class ReActConfig:
     compaction_keep_messages: int = 4
     max_repeated_responses: int = 3
     tool_result_max_chars: int = 8_000
+    # An owner message that arrives mid-episode is invisible to a loop that reads
+    # the inbox only when the envelope is built. Measured on this repository: a
+    # message posted while an episode ran never entered that run's observations
+    # and was found only by querying the inbox table directly. The literature
+    # says the cooperative form is the weak one (arXiv:2606.06460v4, Exp. 4: a
+    # mid-task notice riding tool output was never acknowledged, 0/20; agents'
+    # own stop rate was 28/120 = 23% and model-dependent, while a harness-level
+    # interceptor stopped 120/120 with no false trips). Delivery is therefore the
+    # harness's job, not a tool the model must remember to call. Injected as a
+    # system message at a step boundary; one event is delivered at most once.
+    inbox_delivery_max_per_step: int = 3
+    # A two-hour run leaves the owner channel silent until Finish. Emit a short
+    # factual progress note at most once per this interval of MODEL time (0
+    # disables it). Model time, not wall time, so provider backoff is never
+    # billed as progress. The count is additionally capped at
+    # ``run budget // interval`` and stops once the Finish phase begins.
+    run_progress_seconds: float = 3600.0
 
 
 class ReActRunner:
@@ -119,6 +144,7 @@ class ReActRunner:
         config: ReActConfig | None = None,
         *,
         worktree_root: str | os.PathLike[str] | None = None,
+        on_progress: RunProgressCallback | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -129,6 +155,12 @@ class ReActRunner:
         self.worktree_root = Path(worktree_root) if worktree_root else None
         self._worktree_status_step: int | None = None
         self._worktree_status: list[str] = []
+        # Owner progress emission is opt-in: without a callback the runner is
+        # byte-for-byte as before, and the Reactor is the only outbox writer.
+        self._on_progress = on_progress
+        self._progress_next_at = 0.0
+        self._progress_sent = 0
+        self._finish_phase = False
 
     def run(self, start: StartEnvelope, system_prompt: str) -> AgentRunResult:
         messages: list[Message] = [
@@ -143,11 +175,16 @@ class ReActRunner:
         time_warning_sent = False
         compactions = 0
         phase = "initial"
+        last_tool = ""
         response_fingerprints: dict[str, int] = {}
         deferred_control: dict[str, Any] = {}
         failed_proposals: set[str] = set()
         self._worktree_status_step = None
         self._worktree_status = []
+        self._finish_phase = False
+        self._progress_sent = 0
+        progress_interval = float(self.config.run_progress_seconds)
+        self._progress_next_at = progress_interval if progress_interval > 0 else 0.0
         steps_limit = max(1, min(int(start.budget.steps), self.config.max_steps))
         time_limit = max(0.001, min(float(start.budget.seconds), self.config.timeout_seconds))
         request_limit = max(1, min(int(start.budget.tokens), self.config.max_tokens))
@@ -160,7 +197,17 @@ class ReActRunner:
         self.store.append_event("react_phase", {"phase": phase}, start.run_id)
         self.store.touch_run(start.run_id, phase)
 
+        # Only the notifications the START ENVELOPE actually carried count as
+        # already delivered; anything else in the inbox is new input. Deriving the
+        # cursor from the envelope (rather than re-reading the inbox) also closes
+        # the race where a message arrives between envelope build and this line.
+        delivered_inbox: set[str] = set()
+        for observation in start.observations:
+            if isinstance(observation, dict) and observation.get("kind") == "inbox_notification":
+                delivered_inbox.add(str(observation.get("event_id", "")))
+        self._record_envelope_delivery(delivered_inbox, start.run_id)
         for step in range(steps_limit):
+            self._deliver_new_inbox(messages, delivered_inbox, start.run_id)
             if model_seconds >= time_limit:
                 status, report, finish_usage = self._finish(messages, start.run_id, reason="time budget")
                 if status == RunStatus.NEEDS_RECOVERY:
@@ -202,10 +249,10 @@ class ReActRunner:
                     start.run_id,
                 )
                 messages.append({"role": "system", "content": "Critical context warning: finish the current task or compact the history now."})
-                context_warning_high_sent = True
-            # The time budget must be disclosed once, in band, so the model can
-            # close the episode with a real Finish Report instead of hitting a
-            # budget-exhausted error before tool execution.
+                context_warning_high_sent = True            # The time budget was enforced but never disclosed: measured live,
+            # 13 runs died at ~1800-2100s of model time with "time budget
+            # exhausted before tool execution". Tell the model once, in band, so
+            # it can close the episode with a real Finish Report.
             if not time_warning_sent and model_seconds >= time_limit * self.config.time_warning_ratio:
                 self.store.append_transcript(
                     "time_warning",
@@ -241,6 +288,10 @@ class ReActRunner:
                     start.run_id,
                 )
                 continue
+            # Emitted after every finish-triggering guard above, so a run that is
+            # about to close never sends a "still running" note, and never after
+            # the Finish phase has begun.
+            self._emit_run_progress(start.run_id, step, model_seconds, last_tool, time_limit)
             log.info("run=%s step=%d requesting model turn", start.run_id, step + 1)
             self.store.touch_run(start.run_id, phase, progress=True)
             try:
@@ -261,6 +312,10 @@ class ReActRunner:
                 return AgentRunResult(RunStatus.NEEDS_RECOVERY, f"Provider unavailable: {str(exc)[:500]}", step, used_tokens, str(exc))
             model_seconds += turn_seconds
             used_tokens += turn.total_tokens
+            # Persist the running totals each turn: the in-memory counters are
+            # lost on a SIGTERM/watchdog kill, which used to leave the run's
+            # ledger row at steps=0, tokens=0.
+            self.store.touch_run(start.run_id, phase, steps=step + 1, usage_tokens=used_tokens)
             # The fingerprint covers the tool calls too: many providers send no
             # preamble text, so a text-only fingerprint would treat unrelated
             # calls (or none at all) as the same response.
@@ -291,6 +346,7 @@ class ReActRunner:
                 turn.usage_tokens,
             )
             if not turn.tool_calls:
+                self._finish_phase = True
                 log.info(
                     "run=%s step=%d model final response=%s",
                     start.run_id,
@@ -301,6 +357,18 @@ class ReActRunner:
                 self._record_history(start.run_id, messages)
                 self.store.append_event("finish_report", {"step": step + 1, "text": turn.text, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens}, start.run_id)
                 report = turn.text.strip()
+                parsed_report = self._read_finish_report(report, start.run_id)
+                if parsed_report is not None:
+                    status, report = parsed_report
+                    return AgentRunResult(status, report, step + 1, used_tokens)
+                # The reply is unreadable, but this episode already executed tools.
+                # Ask once more before discarding that work: a zero-length or prose
+                # closing turn must not be the only chance to report it.
+                repaired = self._repair_finish_report(report, start.run_id, messages, step=step)
+                if repaired is not None:
+                    status, report, repair_usage = repaired
+                    self.store.append_event("finish_report", {"step": step + 1, "text": report, "usage_tokens": repair_usage, "repaired": True}, start.run_id)
+                    return AgentRunResult(status, report, step + 1, used_tokens + repair_usage)
                 status, report = self._parse_finish_report(report, start.run_id)
                 return AgentRunResult(status, report, step + 1, used_tokens)
 
@@ -348,8 +416,10 @@ class ReActRunner:
                 tool = self.tools.get(call.tool_name)
                 if tool is None:
                     result = {"ok": False, "error": f"unknown tool: {call.tool_name}"}
+                    result_address = ""
                 else:
                     effect_key = f"{start.run_id}:{step}:{call.call_id}"
+                    result_address = effect_key
                     arguments_hash = hashlib.sha256(json.dumps(call.arguments, sort_keys=True).encode()).hexdigest()
                     result = self.store.effect(effect_key)
                     if result is None:
@@ -360,8 +430,61 @@ class ReActRunner:
                             start.run_id,
                             step,
                         )
-                        self.store.record_effect(effect_key, call.tool_name, arguments_hash, result, "applied" if result.get("ok") else "failed")
-                        if call.tool_name == "propose_self_improvement" and not result.get("ok"):
+                        self.store.record_effect(effect_key, call.tool_name, arguments_hash, result, self.store.effect_status(result))
+                        previous_runs = self.store.effect_reapplied_runs(call.tool_name, arguments_hash, exclude_run_id=start.run_id)
+                        # `previous_runs` is run-scoped by construction, so a call
+                        # re-issued inside this run with a regenerated call_id was
+                        # invisible: 15 of the live ledger's 58 repeated
+                        # identities repeat only inside one run (2026-09-22),
+                        # 15/15 with differing results, and no event named any of
+                        # them. The run-agnostic count is what makes that cell of
+                        # the effect-exactly-once violation (arXiv:2608.03836v3)
+                        # visible without serving a recorded result.
+                        prior_application_count = self.store.effect_identity_prior_count(
+                            call.tool_name, arguments_hash, exclude_effect_key=effect_key
+                        )
+                        # `previous_runs` grows with every later re-application, so
+                        # `if previous_runs:` re-emitted this event for each repeat
+                        # and reported one fact 2, 3, ... times (measured: three
+                        # identical executions produced two events for one
+                        # identity). The announcement is once per identity: a
+                        # non-empty list alone is not enough (an identity that had
+                        # already repeated twice before this signal existed would
+                        # never announce), so it is paired with the durable
+                        # `effect_reapplied` pointer, which is a protected event
+                        # kind and therefore survives retention. This event is a
+                        # pointer, not a running total: its `previous_run_count` is
+                        # the number of other runs at announcement time, 1 for the
+                        # common transition and more for a late-announced identity,
+                        # so a reader that needs the current number of other runs
+                        # re-derives it from `effect_reapplied_runs` with the
+                        # payload's `arguments_hash` (measured on the live ledger
+                        # 2026-09-20: 12 identities repeat across runs, and the
+                        # one-time event understates the worst of them, a `db` query
+                        # applied by 10 runs, as 1).
+                        if (previous_runs or prior_application_count) and not self.store.effect_reapplied_announced(call.tool_name, arguments_hash):
+                            self.store.append_event(
+                                "effect_reapplied",
+                                {
+                                    "step": step + 1,
+                                    "tool": call.tool_name,
+                                    "capability_kind": getattr(tool, "capability_kind", "read"),
+                                    "arguments_hash": arguments_hash,
+                                    "previous_run_ids": previous_runs[:3],
+                                    "previous_run_count": len(previous_runs),
+                                    # Zero here means the repeat is inside this
+                                    # run, not across runs: the two are different
+                                    # recovery cells, so the post-mortem keeps
+                                    # them separable.
+                                    "prior_application_count": prior_application_count,
+                                    "same_run_repeat": not previous_runs and prior_application_count > 0,
+                                },
+                                start.run_id,
+                            )
+                        # A protected-path warning is not a failure: the identical
+                        # resubmission is the intended next step, so it must not
+                        # be blocked by the repeat guard.
+                        if call.tool_name == "propose_self_improvement" and not result.get("ok") and not result.get("warned"):
                             failure_key = hashlib.sha256(
                                 json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
                             ).hexdigest()
@@ -374,6 +497,7 @@ class ReActRunner:
                                 }
                             failed_proposals.add(failure_key)
                 result = self._apply_worktree_warning(result, call.tool_name, start.run_id, step)
+                last_tool = call.tool_name
                 log.info("run=%s tool=%s ok=%s", start.run_id, call.tool_name, result.get("ok"))
                 self.store.append_event(
                     "tool_result",
@@ -383,14 +507,14 @@ class ReActRunner:
                             "tool_name": call.tool_name,
                             "arguments": call.arguments,
                         },
-                        "result": self._bounded_result(result),
+                        "result": self._bounded_result(result, result_address),
                     },
                     start.run_id,
                 )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.call_id,
-                    "content": self._bounded_tool_content(result),
+                    "content": self._bounded_tool_content(result, result_address),
                 })
                 # A hard denial is checked first: a result carries only one of
                 # these today, but if a tool ever returns several flags the hard
@@ -449,6 +573,7 @@ class ReActRunner:
 
     def _finish(self, messages: list[Message], run_id: str, *, reason: str = "normal") -> tuple[RunStatus, str, int]:
         """Force a Finish turn and return the parsed status, report, and usage."""
+        self._finish_phase = True
         self._record_history(run_id, messages)
         self.store.append_event("react_phase", {"phase": "finish", "reason": reason}, run_id)
         finish_messages = self._finish_messages(messages)
@@ -463,15 +588,24 @@ class ReActRunner:
             return self._local_finish(run_id, reason, f"Provider Finish failed: {str(exc)[:300]}")
         report = turn.text.strip()
         self._record_history(run_id, [*messages, {"role": "assistant", "content": report}])
-        if not report:
-            return RunStatus.NEEDS_RECOVERY, f"Finish Report missing ({reason})", turn.total_tokens
-        status, report = self._parse_finish_report(report, run_id)
-        if status == RunStatus.NEEDS_RECOVERY:
+        parsed_report = self._read_finish_report(report, run_id)
+        if parsed_report is None:
+            # The context was just reserved for a Finish request, so the one
+            # bounded repair turn is affordable by construction.
+            repaired = self._repair_finish_report(report, run_id, finish_messages, step=-1, force=True)
+            if repaired is not None:
+                status, report, repair_usage = repaired
+                self.store.append_event("finish_report", {"text": report, "usage_tokens": repair_usage, "forced": reason != "normal", "reason": reason, "repaired": True}, run_id)
+                return status, report, turn.total_tokens + repair_usage
+            if not report:
+                return RunStatus.NEEDS_RECOVERY, f"Finish Report missing ({reason})", turn.total_tokens
+            status, report = self._parse_finish_report(report, run_id)
             return status, report, turn.total_tokens
+        status, report = parsed_report
         self.store.append_event("finish_report", {"text": report, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens, "forced": reason != "normal", "reason": reason}, run_id)
         return status, report, turn.total_tokens
 
-    def _parse_finish_report(self, report: str, run_id: str) -> tuple[RunStatus, str]:
+    def _parse_finish_report(self, report: str, run_id: str, *, record_failure: bool = True) -> tuple[RunStatus, str]:
         try:
             data = parse_json_object(report)
             # Accept the old minimal status object while providers roll forward;
@@ -480,6 +614,17 @@ class ReActRunner:
                 status = str(data["status"]).upper()
                 summary = str(data.get("summary", "")).strip()
                 data = {"status": status, "summary": summary or "legacy report", "evidence": [summary or "legacy report"], "actions": [], "changes": [], "tests": [], "blocker": summary if status == "BLOCKED" else "", "next_hypothesis": ""}
+            # An over-length summary or citation, or more citations than the
+            # contract allows, is a wording problem, not a broken report: clamp
+            # it and keep the episode's real status. Only structural violations
+            # still downgrade the run to recovery.
+            clamped = clamp_to_schema(data, FINISH_REPORT_SCHEMA)
+            if clamped:
+                self.store.append_event(
+                    "finish_clamped",
+                    {"paths": clamped, "report_chars": len(report)},
+                    run_id,
+                )
             validate_shape(data, FINISH_REPORT_SCHEMA)
             if data["status"] == "COMPLETED" and not data["evidence"]:
                 raise ValueError("COMPLETED Finish Report requires evidence")
@@ -491,12 +636,101 @@ class ReActRunner:
             # A prose reply is not a Finish Report. Accepting any non-JSON text
             # as COMPLETED marked tasks done with no durable change, so a broken
             # report must stay recoverable instead of closing the task.
+            if record_failure:
+                self.store.append_event(
+                    "finish_invalid",
+                    {"error": str(exc)[:500], "report_prefix": report[:200]},
+                    run_id,
+                )
+            return RunStatus.NEEDS_RECOVERY, f"Finish Report invalid: {exc}"
+
+    def _read_finish_report(self, report: str, run_id: str) -> tuple[RunStatus, str] | None:
+        """Parse a closing reply without recording a failure.
+
+        The caller must tell "unreadable, ask once more" from "unreadable, give
+        up", so the failure event is written by the caller, not the parser.
+        """
+        status, parsed = self._parse_finish_report(report, run_id, record_failure=False)
+        if status == RunStatus.NEEDS_RECOVERY:
+            return None
+        return status, parsed
+
+    @staticmethod
+    def _episode_has_durable_work(messages: list[Message]) -> bool:
+        """True when the episode executed at least one tool call.
+
+        Only such an episode has work that discarding its report would destroy:
+        a run that executed nothing loses nothing by being retried normally.
+        """
+        return any(message.get("role") == "tool" for message in messages)
+
+    def _repair_finish_report(
+        self,
+        report: str,
+        run_id: str,
+        messages: list[Message],
+        *,
+        step: int = -1,
+        force: bool = False,
+    ) -> tuple[RunStatus, str, int] | None:
+        """One bounded repair turn when the closing reply is not a report.
+
+        Live evidence: 4 of the 7 recorded ``finish_invalid`` events are replies
+        the parser could not read - one zero-length turn and three prose turns -
+        and each discarded an episode whose work was already durable (event_log
+        6464 sits after that run's own promotion was committed). Detection
+        without repair is the expensive half of the pair: closing detection into
+        a re-run recovered 45% of flagged failures against a 16% resampling
+        control, for about one extra model call per run (arXiv:2608.02464).
+
+        Returns None when the episode has no work at risk, when the turn is
+        unaffordable, when the provider fails, or when the retry is unreadable
+        too. The caller then reports the original failure, so this can only
+        recover a run, never close one without a valid report.
+        """
+        if not self._episode_has_durable_work(messages):
+            self.store.append_event("finish_repair_skipped", {"reason": "no tool calls in the episode"}, run_id)
+            return None
+        if not force:
+            reserve = min(self.config.context_finish_reserve, max(0, self.config.max_tokens // 8))
+            if self._request_tokens(messages, []) + reserve >= self.config.max_tokens:
+                self.store.append_event("finish_repair_skipped", {"reason": "context budget"}, run_id)
+                return None
+        unreadable = "the reply was empty" if not report.strip() else "the reply was not one JSON object"
+        repair_messages = [
+            *messages,
+            {
+                "role": "system",
+                "content": (
+                    f"Your previous closing reply was not a readable Finish Report ({unreadable}). "
+                    "Do not call tools. Return only one JSON object matching the Finish Report "
+                    "contract in the system prompt."
+                ),
+            },
+        ]
+        try:
+            turn, _turn_seconds = self._complete_with_retry(
+                repair_messages, max_tokens=self.config.output_tokens, tools=[], run_id=run_id, step=step
+            )
+        except Exception as exc:
+            self.store.append_event("finish_repair_failed", {"error": str(exc)[:500]}, run_id)
+            return None
+        retry_report = turn.text.strip()
+        parsed = self._read_finish_report(retry_report, run_id)
+        if parsed is None:
             self.store.append_event(
-                "finish_invalid",
-                {"error": str(exc)[:500], "report_prefix": report[:200]},
+                "finish_repair_failed",
+                {"error": "retry reply was not a Finish Report", "report_chars": len(retry_report)},
                 run_id,
             )
-            return RunStatus.NEEDS_RECOVERY, f"Finish Report invalid: {exc}"
+            return None
+        status, parsed_report = parsed
+        self.store.append_event(
+            "finish_repair",
+            {"usage_tokens": turn.total_tokens, "report_chars": len(retry_report)},
+            run_id,
+        )
+        return status, parsed_report, turn.total_tokens
 
     def _local_finish(self, run_id: str, reason: str, detail: str) -> tuple[RunStatus, str, int]:
         report = f"Finish Report (harness): cycle stopped safely. Reason: {reason}. {detail}. Full evidence remains in the durable event log."
@@ -564,6 +798,12 @@ class ReActRunner:
                         "usage_tokens": turn.total_tokens,
                         "prompt_tokens": turn.prompt_tokens,
                         "completion_tokens": turn.completion_tokens,
+                        "finish_reason": turn.finish_reason,
+                        # An empty text with a non-zero completion count is
+                        # otherwise unreadable: reasoning_chars>0 means the
+                        # provider spent the tokens on the reasoning channel,
+                        # 0 means it really returned nothing.
+                        "reasoning_chars": len(turn.reasoning_content),
                     },
                     run_id=run_id,
                 )
@@ -587,10 +827,14 @@ class ReActRunner:
                 )
                 return turn, turn_seconds
             except Exception as exc:
-                self.store.runtime_log.write(
+                # A provider call that raised is a cycle-level deviation, not a
+                # high-frequency attempt trace: keep it durable so a failed run
+                # can be post-mortem'd after retention. append_event mirrors it
+                # into the runtime projection under kind "event".
+                self.store.append_event(
                     "provider_error",
                     {"step": step + 1, "attempt": attempt + 1, "error": str(exc)[:1000]},
-                    run_id=run_id,
+                    run_id,
                 )
                 self.store.append_transcript("provider_error", {"step": step, "attempt": attempt + 1, "error": str(exc)[:1000]}, run_id)
                 retryable = not isinstance(exc, ProviderError) or exc.retryable
@@ -759,6 +1003,132 @@ class ReActRunner:
         ]
         self.store.set_transcript("react_history", {"messages": sanitized}, run_id)
 
+    def _record_envelope_delivery(self, delivered: set[str], run_id: str) -> None:
+        """Record the inbox events the START ENVELOPE itself carried.
+
+        The set is seeded from the envelope's notifications, so a message that
+        reached the model through the envelope was already delivered -- yet only
+        ``_deliver_new_inbox`` ever wrote ``inbox_delivered_in_run``. A message
+        carried by the envelope therefore left no ledger entry while the run
+        consumed it (``acknowledge_inbox`` sets ``inbox.consumed_at``), and the
+        read-receipt ledger kept waiting for a delivery event that could never
+        arrive: the owner's own chat still showed the "queued" reaction for a
+        message the organism had already read and answered. Recording the
+        envelope's ids closes that gap without delivering anything twice, because
+        the same set is the ``_deliver_new_inbox`` cursor.
+        """
+        event_ids = sorted(item for item in delivered if item)
+        if not event_ids:
+            return
+        self.store.append_event("inbox_delivered_in_run", {"count": len(event_ids), "event_ids": event_ids}, run_id)
+
+    def _deliver_new_inbox(self, messages: list[Message], delivered: set[str], run_id: str) -> list[str]:
+        """Inject owner messages that arrived after this episode started.
+
+        The inbox is read once per wake, when the START ENVELOPE is built, so
+        live input sent while the episode runs would otherwise stay invisible
+        until the next wake. Reading it again at a step boundary and appending
+        anything not already carried by the envelope is harness-level delivery:
+        it does not depend on the model choosing to call a read tool. Bounded by
+        ``inbox_delivery_max_per_step`` and failure-tolerant, because a delivery
+        that cannot be read must never kill a running episode.
+        """
+        try:
+            # Only owner messages are injected; the inbox also carries other
+            # pending kinds (answers, notifications) that are not conversation.
+            pending = [event for event in self.store.pending_inbox() if str(event.get("kind")) == "user_message"]
+        except Exception:
+            log.exception("inbox delivery read failed; continuing without it")
+            return []
+        fresh: list[dict[str, Any]] = []
+        for event in pending:
+            event_id = str(event.get("event_id", ""))
+            if not event_id or event_id in delivered:
+                continue
+            delivered.add(event_id)
+            fresh.append(event)
+            if len(fresh) >= self.config.inbox_delivery_max_per_step:
+                break
+        if not fresh:
+            return []
+        lines: list[str] = []
+        for event in fresh:
+            payload = event.get("payload")
+            text = ""
+            if isinstance(payload, dict):
+                for key in ("text", "answer", "message"):
+                    candidate = payload.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        text = candidate.strip()
+                        break
+            lines.append(f"- [{event.get('kind', 'user_message')!s}] {text[:1500]}")
+        # One inbox read per step boundary: the count is taken from the same
+        # snapshot, so the read is reused rather than issued twice. `delivered`
+        # now includes `fresh`, so the remainder is the not-yet-injected backlog.
+        unread = len(fresh) + sum(1 for event in pending if str(event.get("event_id", "")) not in delivered)
+        messages.append({
+            "role": "system",
+            "content": (
+                f"You have {unread} unread owner message(s). "
+                "New owner message(s) arrived while this episode is running. This is live input, "
+                "not an order: read it, decide whether it changes the current work, and continue. "
+                "No immediate reply is required.\n" + "\n".join(lines)
+            ),
+        })
+        event_ids = [str(event.get("event_id", "")) for event in fresh]
+        self.store.append_event("inbox_delivered_in_run", {"count": len(event_ids), "event_ids": event_ids}, run_id)
+        return event_ids
+
+    def _emit_run_progress(
+        self,
+        run_id: str,
+        step: int,
+        model_seconds: float,
+        last_tool: str,
+        time_limit: float,
+    ) -> None:
+        """Emit at most one short owner note per interval of model time.
+
+        Bounded on four axes: a positive interval, at most one note per boundary
+        crossing, a hard cap of ``time_limit // interval`` per episode, and a
+        stop once the Finish phase begins. The note carries only facts the runner
+        already owns -- completed step count, elapsed model minutes, the last
+        tool name -- never an outcome claim. It is emitted before the model turn
+        and after every finish-triggering guard, so it cannot fire from the
+        Finish phase or race the finish response.
+        """
+        interval = float(self.config.run_progress_seconds)
+        if interval <= 0 or self._on_progress is None or self._finish_phase:
+            return
+        cap = int(time_limit // interval)
+        if cap <= 0 or self._progress_sent >= cap:
+            return
+        if model_seconds < self._progress_next_at:
+            return
+        # Advance past the current model time so a single long turn that spans
+        # several boundaries still produces one note, never a burst.
+        self._progress_next_at = (int(model_seconds // interval) + 1) * interval
+        self._progress_sent += 1
+        tool = str(last_tool or "").strip()[:RUN_PROGRESS_TOOL_LIMIT]
+        minutes = int(model_seconds // 60)
+        message = (
+            f"Прогон продолжается: шаг {step}, прошло ~{minutes} мин модельного времени, "
+            f"последний инструмент: {tool or '—'}."
+        )[:RUN_PROGRESS_MESSAGE_LIMIT]
+        payload = {
+            "run_id": run_id,
+            "step": step,
+            "model_seconds": round(model_seconds, 1),
+            "last_tool": tool,
+            "message": message,
+        }
+        try:
+            self._on_progress(payload)
+        except Exception:
+            # Owner progress is observability, not part of the run's accounting:
+            # a broken callback must never kill a running episode.
+            log.exception("run progress callback failed; continuing")
+
     def _compact_messages(self, messages: list[Message]) -> list[Message]:
         """Keep the durable Start and a bounded tail; never invent a model summary."""
         keep = max(2, self.config.compaction_keep_messages)
@@ -770,11 +1140,56 @@ class ReActRunner:
             return messages
         return compacted
 
-    def _bounded_result(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _bounded_result(self, result: dict[str, Any], effect_key: str = "") -> dict[str, Any]:
+        """Bound a tool result for the context window, keeping it addressable.
+
+        A result larger than `tool_result_max_chars` is replaced by a preview,
+        which is what the model and every event-log reader see. The full result
+        is not lost -- `record_effect` persists it verbatim in
+        `capability_effects` under the run-scoped `effect_key` -- but until now
+        nothing in the bounded form said where it went, so the removal was
+        silent and the preview was the only surviving copy in the log.
+
+        Measured on the live ledger 2026-09-20 (generation 40): of 2347
+        `tool_result` events, 142 were truncated, holding 528,000 bytes of
+        preview; all 142 full results were still present in `capability_effects`
+        and would have been reachable from an emitted key.
+
+        The key embeds the `step`, and neither the `tool_call` nor the
+        `tool_result` event carries it -- yet the step is not needed to recover a
+        payload, because `call_id` is unique within a run and `record_effect`
+        stores exactly one row per `run_id:step:call_id`. Re-measured
+        2026-09-20 (generation 42) on the 33 folded events emitted before this
+        key existed: all 33 resolve by `(run_id, call_id)` alone, 0 ambiguous,
+        0 missing. The emitted key therefore buys a direct row name instead of a
+        two-column join; what it is actually required for is keeping the
+        eviction non-silent (arXiv:2608.21690, Scroll, Sec. 2.4: eviction is
+        only safe under the invariant that everything removed stays
+        addressable, with a pointer kept in place of the removed payload).
+
+        A key is emitted only when one actually exists: unknown tools never call
+        `record_effect`, so they pass an empty key and keep the old shape.
+        """
         content = json.dumps(result, ensure_ascii=False)
         if len(content) <= self.config.tool_result_max_chars:
             return result
-        return {"ok": bool(result.get("ok")), "truncated": True, "preview": content[: self.config.tool_result_max_chars]}
+        bounded: dict[str, Any] = {"ok": bool(result.get("ok")), "truncated": True, "preview": content[: self.config.tool_result_max_chars]}
+        if effect_key:
+            bounded["effect_key"] = effect_key
+            bounded["full_result_in"] = "capability_effects.idempotency_key"
+        return bounded
 
-    def _bounded_tool_content(self, result: dict[str, Any]) -> str:
-        return json.dumps(self._bounded_result(result), ensure_ascii=False)
+    def _bounded_tool_content(self, result: dict[str, Any], effect_key: str = "") -> str:
+        """The copy the model reads: bounded like the log copy, and addressed.
+
+        This is the second call site of the same bounding helper. Until now it
+        hard-coded the empty key, so a folded result reached the model as a bare
+        preview while only the `event_log` copy carried `effect_key` (measured
+        at generation 41: 34 folded `tool_result` events with 1 addressed, 33
+        folded tool messages in `react_history` with 0). The model therefore saw
+        a silent eviction it could neither detect nor undo, even though a `db`
+        SELECT against `capability_effects.idempotency_key` can return the full
+        payload. Passing the same run-scoped key keeps the two copies pointing
+        at one row; the default keeps the one-argument call site unchanged.
+        """
+        return json.dumps(self._bounded_result(result, effect_key), ensure_ascii=False)

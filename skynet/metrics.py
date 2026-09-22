@@ -3,7 +3,9 @@
 Every number the project claims about itself must be reproducible from
 ``state/skynet.sqlite3`` plus the filesystem. This module is the only reader of
 ``evaluations`` and ``planner_decisions`` in production code: before it existed
-both tables were written every cycle and never looked at.
+both tables were written every cycle and never looked at, which is why a 66%
+``needs_recovery`` rate and a memory retrieval that returned zero rows survived
+159 generations unnoticed.
 """
 
 from __future__ import annotations
@@ -31,11 +33,20 @@ DEVIATION_KINDS = (
     "restart_escalated",
     "cycle_error",
     "provider_lockout",
+    # Chain-level provider deviations: a single provider strike and the whole
+    # chain going into cooldown are both ways a cycle goes wrong. The reload and
+    # supervisor lifecycle kinds are deliberately excluded: they are ordinary
+    # operational events, not deviations.
+    "fallback_failure",
+    "fallback_all_cooling",
     "worktree_dirty_after_bash",
     "livelock_suspected",
     "memory_loop_failed",
+    "memory_degraded",
     "policy_denied",
     "policy_soft_denied",
+    "gate_protected_warned",
+    "gate_protected_soft_denied",
     "registry_corrupted",
     "mcp_server_unavailable",
 )
@@ -71,9 +82,10 @@ def outcome_mix(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
     completed = by_status.get("completed", 0)
     tokens = {str(row["status"]): int(row["tokens"]) for row in rows}
     steps = {str(row["status"]): int(row["steps"]) for row in rows}
-    # Only completed runs pay for the work they produced. Dividing the
-    # all-status token total by `completed` instead lets tokens burned by
-    # failed and needs_recovery runs inflate the per-completed number.
+    # Only completed runs pay for the work they produced. The previous formula
+    # divided the all-status token total by `completed`, so tokens burned by
+    # failed and needs_recovery runs inflated the per-completed number (a 66%
+    # needs_recovery rate made one completed run look ~3x more expensive).
     completed_tokens = tokens.get("completed", 0)
     wasted_tokens = sum(value for status, value in tokens.items() if status != "completed")
     return {
@@ -149,10 +161,11 @@ def provider_failures(connection: sqlite3.Connection, since: str) -> dict[str, A
 def livelock_streaks(connection: sqlite3.Connection, since: str, *, threshold: int = 3) -> list[dict[str, Any]]:
     """Longest consecutive run of selections per task inside the window.
 
-    Grouping by ``selected_task_id`` with ``COUNT(*)`` measures the total number
-    of selections, so a task picked repeatedly with work interleaved looks like
-    one long streak. The streak is the maximum run of adjacent decisions for the
-    same task in insertion order, which is what the Reactor guard acts on.
+    Grouping by ``selected_task_id`` with ``COUNT(*)`` measured the total number
+    of selections, so a task picked 90 times with work interleaved looked like a
+    90-in-a-row livelock. The streak is the maximum run of adjacent decisions
+    for the same task in insertion order, which is what the Reactor guard acts
+    on.
     """
     rows = _rows(
         connection,
@@ -323,7 +336,7 @@ def _median(values: list[int]) -> float | None:
 
 
 def delivery_health(connection: sqlite3.Connection) -> dict[str, Any]:
-    """The outbound channel: an outbox nobody drains is a silent organism."""
+    """The owner channel: an outbox nobody drains is a silent organism."""
     outbox = {
         str(row["delivery_state"]): int(row["n"])
         for row in _rows(connection, "SELECT delivery_state, COUNT(*) AS n FROM outbox GROUP BY delivery_state")
@@ -446,7 +459,7 @@ def _state_dir_from(connection: sqlite3.Connection) -> str:
 
 
 def format_report(data: dict[str, Any], *, max_chars: int = 3800) -> str:
-    """Render a snapshot as compact text for the notification channel."""
+    """Render a snapshot as compact text for the owner channel."""
     lines: list[str] = []
     outcomes = data.get("outcomes", {})
     agent = data.get("agent", {})

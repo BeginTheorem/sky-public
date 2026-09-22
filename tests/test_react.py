@@ -1,6 +1,8 @@
-"""ReAct runner behaviour tests."""
+"""Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -9,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from helpers import FakeProvider, FixtureTool, commit_all, git_repo
 
@@ -141,6 +143,40 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(records[1]["payload"]["messages"][0]["content"], "input")
             self.assertEqual(records[2]["payload"]["text"], "output")
             store.close()
+    def test_react_provider_response_carries_reasoning_chars_and_finish_reason(self) -> None:
+        class ShapeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(
+                        tool_calls=[ToolCall("fixture_tool", {})],
+                        reasoning_content="think",
+                        finish_reason="tool_calls",
+                        usage_tokens=1,
+                    )
+                return ModelTurn(text=json.dumps({
+                    "status": "COMPLETED",
+                    "summary": "done",
+                    "evidence": ["fixture tool result"],
+                    "actions": [],
+                    "changes": [],
+                    "tests": [],
+                    "blocker": "",
+                    "next_hypothesis": "",
+                }), finish_reason="stop", usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            ReActRunner(ShapeProvider(), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            records = [json.loads(line) for line in (Path(directory) / "runtime.jsonl").read_text(encoding="utf-8").splitlines()]
+            response = next(record for record in records if record["kind"] == "provider_response")
+            self.assertEqual(response["payload"]["reasoning_chars"], len("think"), "an empty text with tokens spent is readable")
+            self.assertEqual(response["payload"]["finish_reason"], "tool_calls")
+            store.close()
+
     def test_react_allows_cumulative_usage_across_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             class MultiStepProvider:
@@ -737,8 +773,8 @@ class CoreTests(unittest.TestCase):
 
     def test_react_defers_promoted_restart_until_accounting(self) -> None:
         class DeferredRestartTool:
-            name = "promote_self_improvement"
-            schema = {"type": "function", "function": {"name": name, "description": "promote", "parameters": {"type": "object", "additionalProperties": False}}}  # noqa: RUF012 - Tool protocol reads schema as an instance property
+            name = "propose_self_improvement"
+            schema = {"type": "function", "function": {"name": name, "description": "propose", "parameters": {"type": "object", "additionalProperties": False}}}  # noqa: RUF012 - Tool protocol reads schema as an instance property
 
             def execute(self, arguments, *, idempotency_key):
                 return {"ok": True, "control_action": {"type": "restart_after_checkpoint", "commit": "abc1234"}}
@@ -750,12 +786,12 @@ class CoreTests(unittest.TestCase):
             def complete(self, messages, *, max_tokens, tools=()):
                 self.calls += 1
                 if self.calls == 1:
-                    return ModelTurn(tool_calls=[ToolCall("promote_self_improvement", {})], completion_tokens=1, usage_tokens=1)
+                    return ModelTurn(tool_calls=[ToolCall("propose_self_improvement", {})], completion_tokens=1, usage_tokens=1)
                 return ModelTurn(text=json.dumps({"status": "COMPLETED", "summary": "promoted", "evidence": ["promote"], "actions": [], "changes": [], "tests": [], "blocker": "", "next_hypothesis": ""}), completion_tokens=1, usage_tokens=1)
 
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
-            runner = ReActRunner(PromotingProvider(), store, {"promote_self_improvement": DeferredRestartTool()}, ReActConfig())
+            runner = ReActRunner(PromotingProvider(), store, {"propose_self_improvement": DeferredRestartTool()}, ReActConfig())
             result = runner.run(StartEnvelope("test"), "system")
             self.assertEqual(result.failure, "deferred restart")
             self.assertEqual(result.control_action["type"], "restart_after_checkpoint")
@@ -764,8 +800,8 @@ class CoreTests(unittest.TestCase):
 
     def test_blocked_finish_with_promotion_is_completed(self) -> None:
         class DeferredRestartTool:
-            name = "promote_self_improvement"
-            schema = {"type": "function", "function": {"name": name, "description": "promote", "parameters": {"type": "object", "additionalProperties": False}}}  # noqa: RUF012 - Tool protocol reads schema as an instance property
+            name = "propose_self_improvement"
+            schema = {"type": "function", "function": {"name": name, "description": "propose", "parameters": {"type": "object", "additionalProperties": False}}}  # noqa: RUF012 - Tool protocol reads schema as an instance property
 
             def execute(self, arguments, *, idempotency_key):
                 return {"ok": True, "control_action": {"type": "restart_after_checkpoint", "commit": "abc1234"}}
@@ -777,12 +813,12 @@ class CoreTests(unittest.TestCase):
             def complete(self, messages, *, max_tokens, tools=()):
                 self.calls += 1
                 if self.calls == 1:
-                    return ModelTurn(tool_calls=[ToolCall("promote_self_improvement", {})], completion_tokens=1, usage_tokens=1)
+                    return ModelTurn(tool_calls=[ToolCall("propose_self_improvement", {})], completion_tokens=1, usage_tokens=1)
                 return ModelTurn(text=json.dumps({"status": "BLOCKED", "summary": "promoted but unsure about the next step", "evidence": ["promote"], "actions": [], "changes": [], "tests": [], "blocker": "uncertain about the next bounded task", "next_hypothesis": ""}), completion_tokens=1, usage_tokens=1)
 
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
-            runner = ReActRunner(CautiousProvider(), store, {"promote_self_improvement": DeferredRestartTool()}, ReActConfig())
+            runner = ReActRunner(CautiousProvider(), store, {"propose_self_improvement": DeferredRestartTool()}, ReActConfig())
             result = runner.run(StartEnvelope("test"), "system")
             self.assertEqual(result.failure, "deferred restart")
             self.assertEqual(result.status, RunStatus.COMPLETED)
@@ -836,6 +872,279 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(result.status, RunStatus.NEEDS_RECOVERY)
             self.assertIn("Finish Report invalid", result.report)
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_invalid'").fetchone()[0], 1)
+            skipped = json.loads(store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_repair_skipped'").fetchone()[0])
+            self.assertEqual(skipped["reason"], "no tool calls in the episode")
+            store.close()
+
+    def test_finish_report_over_length_summary_is_clamped_not_recovered(self) -> None:
+        def report(summary: str) -> str:
+            return json.dumps({
+                "status": "COMPLETED",
+                "summary": summary,
+                "evidence": ["done"],
+                "actions": [],
+                "changes": [],
+                "tests": [],
+                "blocker": "",
+                "next_hypothesis": "",
+            })
+
+        class ClampingProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                return ModelTurn(text=report("x" * 2000), usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(ClampingProvider(), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            clamped = json.loads(store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_clamped'").fetchone()[0])
+            self.assertIn("response.summary", clamped["paths"])
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_invalid'").fetchone()[0], 0)
+            store.close()
+
+    def test_prose_finish_report_is_repaired_by_one_bounded_turn(self) -> None:
+        class RepairingProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                if self.calls == 2:
+                    return ModelTurn(text="I have finished thinking about it.", usage_tokens=1)
+                return ModelTurn(text=json.dumps({
+                    "status": "COMPLETED",
+                    "summary": "repaired report",
+                    "evidence": ["fixture tool result"],
+                    "actions": [],
+                    "changes": [],
+                    "tests": [],
+                    "blocker": "",
+                    "next_hypothesis": "",
+                }), usage_tokens=2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(RepairingProvider(), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            repair = store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_repair'").fetchone()
+            self.assertIsNotNone(repair)
+            self.assertEqual(json.loads(repair[0])["usage_tokens"], 2)
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_invalid'").fetchone()[0], 0)
+            store.close()
+
+    def test_inbox_is_read_once_per_step_boundary(self) -> None:
+        # `_deliver_new_inbox` runs at every step boundary and used to issue
+        # `pending_inbox` twice per step (once for delivery, once for the unread
+        # count), i.e. up to 800 queries per 400-step episode.
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.add_inbox_event("evt-live", "user_message", {"text": "hello"})
+            runner = ReActRunner(FakeProvider(), store, {"fixture_tool": FixtureTool()})
+            with patch.object(store, "pending_inbox", wraps=store.pending_inbox) as pending:
+                runner.run(StartEnvelope("timer", run_id="run-inbox"), "system")
+            # FakeProvider produces a tool step and a finish step: two boundaries.
+            self.assertEqual(pending.call_count, 2)
+            store.close()
+
+    def test_a_new_owner_message_is_injected_exactly_once_mid_episode(self) -> None:
+        # A message that arrives while a tool runs must reach the model at the
+        # next step boundary, and must not be resurfaced on later boundaries.
+        class ArrivingMessageTool:
+            name = "fixture_tool"
+            schema = {"type": "function", "function": {"name": name, "description": "test fixture", "parameters": {"type": "object", "additionalProperties": False}}}  # noqa: RUF012 - Tool protocol reads schema as an instance property
+
+            def __init__(self, store: StateStore) -> None:
+                self.store = store
+                self.added = False
+
+            def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
+                if not self.added:
+                    self.added = True
+                    self.store.add_inbox_event("evt-mid", "user_message", {"text": "hello from the owner"})
+                return {"ok": True}
+
+        class CapturingProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.snapshots: list[list[dict[str, object]]] = []
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                self.snapshots.append([dict(message) for message in messages])
+                if self.calls <= 2:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                return ModelTurn(text=FINISH_OK, usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            provider = CapturingProvider()
+            runner = ReActRunner(provider, store, {"fixture_tool": ArrivingMessageTool(store)}, ReActConfig(provider_retries=0))
+            runner.run(StartEnvelope("timer", run_id="run-inject"), "system")
+            marker = "hello from the owner"
+            # The message arrives during the first tool call, so it is first seen
+            # at the boundary before the second model turn.
+            first = [m for m in provider.snapshots[1] if marker in str(m.get("content", ""))]
+            self.assertEqual(len(first), 1, "the message must be injected at the next step boundary")
+            self.assertIn("live input", str(first[0].get("content", "")))
+            # The third turn must still carry exactly one copy, never a resurface.
+            later = [m for m in provider.snapshots[2] if marker in str(m.get("content", ""))]
+            self.assertEqual(len(later), 1, "the same message must not be resurfaced on a later step")
+            # Exactly one delivery ledger entry, and the message stays pending:
+            # injection is not acknowledgement.
+            events = store.connection.execute("SELECT payload FROM event_log WHERE kind='inbox_delivered_in_run'").fetchall()
+            delivered = [json.loads(row[0]) for row in events if "evt-mid" in json.loads(row[0]).get("event_ids", [])]
+            self.assertEqual(len(delivered), 1)
+            pending = store.connection.execute("SELECT event_id FROM inbox WHERE consumed_at IS NULL").fetchall()
+            self.assertEqual([row[0] for row in pending], ["evt-mid"])
+            store.close()
+
+    def test_effect_reapplied_is_announced_once_even_when_already_repeated(self) -> None:
+        # `len(previous_runs) == 1` tied "once per identity" to "exactly one
+        # prior run"; an identity that had already repeated twice before the
+        # signal existed never announced at all. The announcement is now
+        # once-only via the durable protected `effect_reapplied` pointer.
+        arguments_hash = hashlib.sha256(json.dumps({}, sort_keys=True).encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.record_effect("prior-a:0:x", "fixture_tool", arguments_hash, {"ok": True}, "applied")
+            store.record_effect("prior-b:0:y", "fixture_tool", arguments_hash, {"ok": True}, "applied")
+            ReActRunner(FakeProvider(), store, {"fixture_tool": FixtureTool()}).run(StartEnvelope("timer", run_id="run-new"), "system")
+            events = store.connection.execute("SELECT payload FROM event_log WHERE kind='effect_reapplied'").fetchall()
+            self.assertEqual(len(events), 1, "an already-repeated identity must still announce once")
+            # A second run must not re-announce the same identity.
+            ReActRunner(FakeProvider(), store, {"fixture_tool": FixtureTool()}).run(StartEnvelope("timer", run_id="run-newer"), "system")
+            events = store.connection.execute("SELECT payload FROM event_log WHERE kind='effect_reapplied'").fetchall()
+            self.assertEqual(len(events), 1, "the announcement is once-only per identity")
+            store.close()
+
+
+class _ProgressProvider:
+    """Tool turns with a fixed model time, then a readable Finish Report."""
+
+    def __init__(self, per_turn: float, tool_turns: int, finish_seconds: float = 0.0) -> None:
+        self.per_turn = per_turn
+        self.tool_turns = tool_turns
+        self.finish_seconds = finish_seconds
+        self.calls = 0
+
+    def complete(self, messages, *, max_tokens, tools=()):
+        self.calls += 1
+        # The main loop always offers tool schemas; the Finish turn and the
+        # Memory Loop do not. That is what distinguishes a tool turn here.
+        if tools and self.calls <= self.tool_turns:
+            # Vary the arguments so repeated tool turns are not collapsed by the
+            # identical-response doom-loop guard.
+            return ModelTurn(tool_calls=[ToolCall("fixture_tool", {"i": self.calls})], usage_tokens=1, model_seconds=self.per_turn)
+        return ModelTurn(text=FINISH_OK, usage_tokens=1, model_seconds=self.finish_seconds)
+
+
+class RunProgressTests(unittest.TestCase):
+    """Mid-run owner notes: bounded, once per interval, never from Finish."""
+
+    def _runner(
+        self,
+        directory: str,
+        provider,
+        *,
+        interval: float = 3600.0,
+        callback=None,
+    ) -> tuple[StateStore, ReActRunner]:
+        store = StateStore(Path(directory) / "state.sqlite3")
+        runner = ReActRunner(
+            provider,
+            store,
+            {"fixture_tool": FixtureTool()},
+            ReActConfig(run_progress_seconds=interval, timeout_seconds=7200.0, provider_retries=0),
+            on_progress=callback,
+        )
+        return store, runner
+
+    @staticmethod
+    def _budget() -> Budget:
+        return Budget(steps=100, tokens=200_000, seconds=7200.0, output_tokens=8192)
+
+    def test_crossing_the_interval_emits_one_bounded_note(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            seen: list[dict[str, object]] = []
+            store, runner = self._runner(
+                directory,
+                _ProgressProvider(per_turn=4000.0, tool_turns=2, finish_seconds=100_000.0),
+                callback=seen.append,
+            )
+            runner.run(StartEnvelope("timer", run_id="run-progress", budget=self._budget()), "system")
+            self.assertEqual(len(seen), 1, "one crossing must produce exactly one note")
+            note = seen[0]
+            self.assertEqual(note["run_id"], "run-progress")
+            self.assertEqual(note["last_tool"], "fixture_tool")
+            message = str(note["message"])
+            self.assertIn("Прогон продолжается", message)
+            self.assertIn("последний инструмент: fixture_tool", message)
+            self.assertLessEqual(len(message), 300)
+            store.close()
+
+    def test_no_note_before_the_interval_or_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            seen: list[dict[str, object]] = []
+            store, runner = self._runner(directory, _ProgressProvider(per_turn=10.0, tool_turns=2), callback=seen.append)
+            runner.run(StartEnvelope("timer", run_id="run-below", budget=self._budget()), "system")
+            self.assertEqual(seen, [], "a run below one interval must stay silent")
+            store.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            seen = []
+            store, runner = self._runner(
+                directory,
+                _ProgressProvider(per_turn=4000.0, tool_turns=2),
+                interval=0.0,
+                callback=seen.append,
+            )
+            runner.run(StartEnvelope("timer", run_id="run-off", budget=self._budget()), "system")
+            self.assertEqual(seen, [], "SKYNET_RUN_PROGRESS_SECONDS=0 disables the note")
+            store.close()
+
+    def test_notes_are_capped_by_the_run_budget_over_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            seen: list[dict[str, object]] = []
+            # 500s turns over a 7200s budget at a 1000s interval: seven crossings.
+            store, runner = self._runner(
+                directory,
+                _ProgressProvider(per_turn=500.0, tool_turns=40),
+                interval=1000.0,
+                callback=seen.append,
+            )
+            runner.run(StartEnvelope("timer", run_id="run-cap", budget=self._budget()), "system")
+            self.assertEqual(len(seen), 7200 // 1000)
+            store.close()
+
+    def test_finish_turn_does_not_emit_a_note(self) -> None:
+        # A closing turn may report a huge model time; crossing the interval
+        # during Finish must not send a "still running" note.
+        with tempfile.TemporaryDirectory() as directory:
+            seen: list[dict[str, object]] = []
+            store, runner = self._runner(
+                directory,
+                _ProgressProvider(per_turn=10.0, tool_turns=1, finish_seconds=100_000.0),
+                callback=seen.append,
+            )
+            runner.run(StartEnvelope("timer", run_id="run-finish", budget=self._budget()), "system")
+            self.assertEqual(seen, [], "the Finish phase must not emit progress")
+            store.close()
+
+    def test_finish_phase_guard_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            seen: list[dict[str, object]] = []
+            store, runner = self._runner(directory, MagicMock(), callback=seen.append)
+            runner._finish_phase = True
+            runner._emit_run_progress("run", 5, 4000.0, "bash", 7200.0)
+            self.assertEqual(seen, [])
             store.close()
 
 

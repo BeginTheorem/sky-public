@@ -1,4 +1,5 @@
 """Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import contextlib
@@ -12,7 +13,6 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import UTC
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
@@ -22,11 +22,6 @@ from skynet.cli import _window_days, build_parser, main
 from skynet.lock import ProcessLock
 from skynet.store import StateStore
 
-
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 class CoreTests(unittest.TestCase):
     def test_cli_exposes_checkpoint_and_rollback(self) -> None:
@@ -89,7 +84,7 @@ class CoreTests(unittest.TestCase):
             store = StateStore(state)
             goal_id = store.add_goal("keep me", priority=1.0)
             store.add_task("pending work", goal_id=goal_id)
-            store.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES('m1','fact','durable memory',1.0,NULL,?)", (_iso(86400.0),))
+            store.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES('m1','fact','durable memory',1.0,NULL,?)", ("2026-01-01T00:00:00Z",))
             store.connection.commit()
             store.close()
             with patch.object(sys, "argv", ["skynet", "--state", str(state), "reset-dispatcher"]):
@@ -238,7 +233,8 @@ class CoreTests(unittest.TestCase):
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             signal.signal(signal.SIGALRM, signal.SIG_DFL)
         self.assertEqual(code, 0)
-        self.assertIn("watchdog_timeout", interruptions)
+        # A SIGTERM is a clean owner stop, not a stale-run watchdog timeout.
+        self.assertIn("owner_stop", interruptions)
         self.assertLess(time.monotonic() - started, 3.0)
 
     def test_mcp_servers_are_discovered_from_the_environment(self) -> None:
@@ -406,6 +402,40 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(code, 0)
         config = captured["config"]
         self.assertEqual(cast(Any, config).wake_interval_seconds, 300.0)
+
+    def test_cli_planner_output_tokens_reaches_reactor_config(self) -> None:
+        captured: dict[str, object] = {}
+        supervisor = self._fake_supervisor([], [], captured=captured)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            sys, "argv", ["skynet", "--state", str(Path(directory) / "state.sqlite3"), "--once", "run"]
+        ), patch("skynet.cli.build_provider", return_value=object()), patch(
+            "skynet.cli.default_tools", return_value={}
+        ), patch("skynet.cli.Supervisor", supervisor), patch(
+            "skynet.cli.heartbeat_wake", return_value=None
+        ), patch("skynet.cli.StaleRunWatchdog", MagicMock()), patch.dict(
+            os.environ, {"SKYNET_PLANNER_OUTPUT_TOKENS": "12345"}
+        ):
+            code = main()
+        self.assertEqual(code, 0)
+        config = captured["config"]
+        self.assertEqual(cast(Any, config).planner_output_tokens, 12_345)
+
+    def test_cli_memory_loop_timeout_reaches_reactor_config(self) -> None:
+        captured: dict[str, object] = {}
+        supervisor = self._fake_supervisor([], [], captured=captured)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            sys, "argv", ["skynet", "--state", str(Path(directory) / "state.sqlite3"), "--once", "run"]
+        ), patch("skynet.cli.build_provider", return_value=object()), patch(
+            "skynet.cli.default_tools", return_value={}
+        ), patch("skynet.cli.Supervisor", supervisor), patch(
+            "skynet.cli.heartbeat_wake", return_value=None
+        ), patch("skynet.cli.StaleRunWatchdog", MagicMock()), patch.dict(
+            os.environ, {"SKYNET_MEMORY_LOOP_TIMEOUT": "450"}
+        ):
+            code = main()
+        self.assertEqual(code, 0)
+        config = captured["config"]
+        self.assertEqual(cast(Any, config).memory_loop_timeout_seconds, 450.0)
 
     def test_cli_installs_signal_handlers_before_supervisor_start(self) -> None:
         captured: dict[str, object] = {}
@@ -583,8 +613,8 @@ class CoreTests(unittest.TestCase):
 
         formatter = UTCLogFormatter("%(message)s", "%Y-%m-%dT%H:%M:%S", "Asia/Tokyo")
         record = logging_module.LogRecord("t", logging_module.INFO, "p", 1, "m", (), None)
-        record.created = 0  # the epoch is 09:00 in Tokyo.
-        self.assertEqual(formatter.formatTime(record, "%Y-%m-%dT%H:%M:%S"), _iso(32400.0)[:19])
+        record.created = 0  # 1970-01-01T00:00:00Z is 09:00 in Tokyo.
+        self.assertEqual(formatter.formatTime(record, "%Y-%m-%dT%H:%M:%S"), "1970-01-01T09:00:00")
 
     def _stub_reporting(self, renderer):
         # reporting.py is created in parallel; injecting a stub keeps this test

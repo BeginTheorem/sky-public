@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT="${SKYNET_ROOT:-/opt/skynet}"
+ROOT="${SKYNET_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 REQUEST="$ROOT/state/reboot-request.json"
 GUARD="$ROOT/state/reboot-guard.json"
 SERVICE="${SKYNET_SERVICE:-skynet.service}"
@@ -65,8 +65,8 @@ print(marker.get("rollback_commit", "") if isinstance(marker, dict) else "")
 PY
 )"
 
-# No usable rollback commit means the working tree must not be modified: a
-# runtime-backup fallback could quarantine .git/, .venv/ and tests/.
+# No usable rollback commit means the working tree must not be modified: the
+# old runtime-backup fallback could quarantine .git/, .venv/ and tests/ (P0-2).
 if [[ ! "$ROLLBACK_COMMIT" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
     echo "no usable rollback commit: '$ROLLBACK_COMMIT' is empty or malformed; refusing to modify the working tree" >&2
     exit 1

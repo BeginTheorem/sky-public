@@ -1,0 +1,62 @@
+import json
+
+from skynet.proposal_registry import (
+    EXHAUSTED_FAILURE_CLASS,
+    resolve_exhausted_environment_blocks,
+    sweep_environment_blocks,
+)
+
+
+def test_blocked_record_with_terminal_sibling_is_closed():
+    """The retry guard refuses a fingerprint with ANY terminal sibling.
+
+    A rejected/validated/awaiting_reboot/accepted sibling already makes
+    ``propose_files`` throw for the identical patch, so a blocked sibling must
+    not stay ``blocked_by_environment`` forever.
+    """
+    proposals = {
+        "a": {"status": "rejected", "change_fingerprint": "F", "failure_class": "regression_failure"},
+        "b": {"status": "blocked_by_environment", "change_fingerprint": "F", "environment_attempts": 1},
+    }
+    _, resolved = resolve_exhausted_environment_blocks(proposals, max_attempts=3)
+    assert [item["proposal_id"] for item in resolved] == ["b"]
+    assert proposals["b"]["status"] == "rejected"
+    assert proposals["b"]["failure_class"] == EXHAUSTED_FAILURE_CLASS
+    assert resolved[0]["spent_by_own_attempts"] is False
+
+
+def test_terminal_sibling_statuses_all_close_the_group():
+    for status in ("rejected", "validated", "awaiting_reboot", "accepted"):
+        proposals = {
+            "a": {"status": status, "change_fingerprint": "F"},
+            "b": {"status": "blocked_by_environment", "change_fingerprint": "F", "environment_attempts": 1},
+        }
+        _, resolved = resolve_exhausted_environment_blocks(proposals, max_attempts=3)
+        assert [item["proposal_id"] for item in resolved] == ["b"], status
+        assert proposals["b"]["status"] == "rejected"
+
+
+def test_retryable_blocked_record_without_terminal_sibling_is_untouched():
+    proposals = {
+        "b": {"status": "blocked_by_environment", "change_fingerprint": "F", "environment_attempts": 1},
+    }
+    _, resolved = resolve_exhausted_environment_blocks(proposals, max_attempts=3)
+    assert resolved == []
+    assert proposals["b"]["status"] == "blocked_by_environment"
+
+
+def test_sweep_preserves_non_dict_top_level_records(tmp_path):
+    """A rewrite must not discard records it does not understand."""
+    path = tmp_path / "proposals.json"
+    path.write_text(json.dumps({
+        "a": {"status": "rejected", "change_fingerprint": "F"},
+        "b": {"status": "blocked_by_environment", "change_fingerprint": "F", "environment_attempts": 1},
+        "meta": "not-a-record",
+        "count": 7,
+    }))
+    resolved = sweep_environment_blocks(path)
+    assert [item["proposal_id"] for item in resolved] == ["b"]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["meta"] == "not-a-record"
+    assert data["count"] == 7
+    assert data["b"]["status"] == "rejected"

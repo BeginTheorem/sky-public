@@ -1,4 +1,5 @@
 """Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import json
@@ -7,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import UTC
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -18,7 +18,6 @@ from skynet.recovery import RebootGuard, RecoveryError
 from skynet.self_improvement import (
     DEFAULT_TEST_COMMAND,
     ImprovementProposal,
-    PromoteSelfImprovementTool,
     SelfImprovementError,
     SelfImprovementManager,
     SelfImprovementTool,
@@ -28,18 +27,15 @@ from skynet.self_improvement import (
 from skynet.time import utc_now
 
 
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
-
 def _manager(root: Path) -> SelfImprovementManager:
     """A manager whose worktrees live inside the test root.
 
-    An isolated worktree root keeps tests independent of any shared
-    collection directory left behind by a prior run.
+    The default for a repository under /tmp is the shared
+    /tmp/.skynet-improvements, which a root-run organism leaves root-owned; that
+    made these tests fail on the server while passing locally.
     """
     return SelfImprovementManager(root, root / "worktrees")
+
 
 class CoreTests(unittest.TestCase):
     def test_self_improvement_rejects_untracked_source_from_prior_cycle(self) -> None:
@@ -156,6 +152,31 @@ class CoreTests(unittest.TestCase):
             (proposal.worktree / "module.py").write_text("value = 2\nvalue = 2\n", encoding="utf-8")
             with self.assertRaisesRegex(SelfImprovementError, "match exactly once"):
                 manager.apply_changes(proposal, [{"path": "module.py", "operation": "replace", "old": "value", "new": "x"}])
+            manager.discard(proposal)
+    def test_self_improvement_replace_keeps_line_boundaries(self) -> None:
+        # The 2026-09-22 proposal_failed rows carried store.py with the import
+        # line concatenated with itself ("utc_nowfrom .time import ..."). The
+        # applier is an exact single-match string replace, so a replacement must
+        # never splice the anchor into its neighbours: pin that boundary here.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            source = root / "module.py"
+            source.write_text("from .time import utc_now\n\nvalue = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "module.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+            manager = SelfImprovementManager(root, root.parent / "worktrees")
+            proposal = manager.propose()
+            manager.apply_changes(
+                proposal,
+                [{"path": "module.py", "operation": "replace", "old": "from .time import utc_now", "new": "from .time import utc_datetime_now, utc_now"}],
+            )
+            text = (proposal.worktree / "module.py").read_text(encoding="utf-8")
+            self.assertEqual(text, "from .time import utc_datetime_now, utc_now\n\nvalue = 1\n")
+            self.assertNotIn("utc_nowfrom", text)
+            compile(text, "module.py", "exec")
             manager.discard(proposal)
     def test_self_improvement_distinguishes_missing_anchor_from_ambiguous_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -316,7 +337,11 @@ class CoreTests(unittest.TestCase):
             persisted = json.loads((root / "reboot-guard.json").read_text(encoding="utf-8"))
             self.assertTrue(persisted["failed"])
             self.assertFalse(persisted.get("rolled_back", False))
-    def test_self_improvement_promotion_tool_promotes_and_requests_restart(self) -> None:
+    def test_identical_reproposal_resumes_promotion_of_a_validated_change(self) -> None:
+        # A change that passed the full gate but whose promotion failed (health
+        # gate, or a restart before promotion) must not be trapped by the
+        # duplicate guard: re-proposing it identically resumes promotion with the
+        # stored commit instead of raising "already attempted".
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
@@ -329,15 +354,20 @@ class CoreTests(unittest.TestCase):
             subprocess.run(["git", "add", "README.md", "tests"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
             manager = SelfImprovementManager(root, root.parent / "worktrees")
-            proposal = manager.propose()
-            manager.apply_files(proposal, {"notes.txt": "proposal\n"})
-            commit = manager.validate_and_commit(proposal, ("python", "-c", "pass"))
-            manager._record_validated(proposal, commit, ("python", "-c", "pass"))
-            tool = PromoteSelfImprovementTool(manager, lambda: {"ok": True})
-            result = tool.execute({"proposal_id": proposal.proposal_id}, idempotency_key="promote-1")
-            self.assertTrue(result["ok"])
-            self.assertEqual(json.loads((root / "state" / "self-improvement-proposals.json").read_text())[proposal.proposal_id]["status"], "awaiting_reboot")
-            manager.discard(proposal)
+            hypothesis = {"problem": "missing note", "expected_behavior": "note is present", "evidence": "test fixture", "validation": "run smoke test", "rollback_condition": "smoke test fails"}
+            first = manager.propose_files({}, ("python", "-c", "pass"), changes=[{"path": "notes.txt", "operation": "create", "content": "proposal\n"}], metadata={"hypothesis": hypothesis})
+            self.assertTrue(first["ok"], first)
+            self.assertTrue(first["promotion_required"])
+            proposal_id = str(first["proposal_id"])
+            again = manager.propose_files({}, ("python", "-c", "pass"), changes=[{"path": "notes.txt", "operation": "create", "content": "proposal\n"}], metadata={"hypothesis": hypothesis})
+            self.assertTrue(again["ok"], again)
+            self.assertTrue(again.get("resumed_validation"), again)
+            self.assertTrue(again["promotion_required"], again)
+            self.assertEqual(str(again["proposal_id"]), proposal_id)
+            record = manager._read_proposals()[proposal_id]
+            self.assertEqual(record["status"], "validated")
+            manager.discard(ImprovementProposal(proposal_id, Path(str(record["worktree"])), str(record["base_commit"])))
+
     def test_self_improvement_proposal_automatically_promotes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -424,7 +454,7 @@ class CoreTests(unittest.TestCase):
             (state / "reboot-guard.json").write_text(json.dumps({
                 "commit": commit, "rollback_commit": commit, "proposal_id": "p1",
                 "healthy_cycles": 3, "failed": False, "active": False,
-                "completed_at": _iso(86400.0),
+                "completed_at": "2026-09-17T17:21:56.496362Z",
             }), encoding="utf-8")
             manager = _manager(root)
             resolved = manager.reconcile_awaiting_reboot()
@@ -521,8 +551,10 @@ class CoreTests(unittest.TestCase):
     def test_empty_anchor_is_a_payload_error_not_a_stale_anchor(self) -> None:
         """A missing/empty old or anchor is malformed payload, not a stale anchor.
 
-        Text matching alone must not route a 'patch requires a non-empty old
-        or anchor value' failure into the stale-anchor bucket and inflate the
+        Registry replay: 10 records carry failure_class='patch_mismatch'; 9 are
+        genuine zero-match anchor failures and 1 (fa1aee89ca9e4a168620e892fc0f4b7c)
+        is 'patch requires a non-empty old or anchor value'. Text matching alone
+        routed that record into the stale-anchor bucket and inflated the
         anchor-failure signal it is meant to measure.
         """
         with tempfile.TemporaryDirectory() as directory:
@@ -670,8 +702,9 @@ class CoreTests(unittest.TestCase):
             git_repo(root)
             (root / "marker.txt").write_text("main\n", encoding="utf-8")
             commit = commit_all(root, "base")
-            # An isolated worktree root keeps this test independent of any
-            # shared collection directory it does not own.
+            # An isolated worktree root: the default for a repository under /tmp
+            # is the shared /tmp/.skynet-improvements, which is root-owned on the
+            # server after a root-run organism and made this test fail there.
             manager = SelfImprovementManager(root, root / "worktrees")
             proposal = manager.propose()
             try:
@@ -976,9 +1009,9 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(record["status"], "rejected")
 
     def test_a_weak_test_command_cannot_replace_the_harness_suite(self) -> None:
-        # A proposal may declare `grep -q`, a `python3 -c` mock or an import
-        # as its "test". The harness suite must still run: a model-chosen
-        # command can only add a bounded stage.
+        # The registry showed proposals declaring `grep -q`, a `python3 -c` mock
+        # or an import as their "test". The harness suite must still run: a
+        # model-chosen command can only add a bounded stage.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             git_repo(root)
@@ -1054,14 +1087,14 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(manager._diff_size("0" * 40), {})
             # The streak counts consecutive tiny diffs, newest first.
             manager._write_proposals({
-                "p1": {"proposal_id": "p1", "status": "validated", "validated_at": _iso(86400.0), "lines_changed": 1},
-                "p2": {"proposal_id": "p2", "status": "validated", "validated_at": _iso(172800.0), "lines_changed": 2},
-                "p3": {"proposal_id": "p3", "status": "validated", "validated_at": _iso(259200.0), "lines_changed": 1},
+                "p1": {"proposal_id": "p1", "status": "validated", "validated_at": "2026-01-01T00:00:00Z", "lines_changed": 1},
+                "p2": {"proposal_id": "p2", "status": "validated", "validated_at": "2026-01-02T00:00:00Z", "lines_changed": 2},
+                "p3": {"proposal_id": "p3", "status": "validated", "validated_at": "2026-01-03T00:00:00Z", "lines_changed": 1},
             })
             self.assertEqual(manager.cosmetic_streak()["streak"], 3)
             # A substantial change breaks the streak.
             manager._write_proposals({
-                "p4": {"proposal_id": "p4", "status": "validated", "validated_at": _iso(345600.0), "lines_changed": 40},
+                "p4": {"proposal_id": "p4", "status": "validated", "validated_at": "2026-01-04T00:00:00Z", "lines_changed": 40},
                 **manager._read_proposals(),
             })
             self.assertEqual(manager.cosmetic_streak()["streak"], 0)
@@ -1095,7 +1128,7 @@ class CoreTests(unittest.TestCase):
             stale = manager.propose()
             fresh = manager.propose()
             manager._write_proposals({
-                stale.proposal_id: {"proposal_id": stale.proposal_id, "status": "validated", "worktree": str(stale.worktree), "validated_at": _iso(0.0)},
+                stale.proposal_id: {"proposal_id": stale.proposal_id, "status": "validated", "worktree": str(stale.worktree), "validated_at": "2020-01-01T00:00:00Z"},
                 fresh.proposal_id: {"proposal_id": fresh.proposal_id, "status": "validated", "worktree": str(fresh.worktree), "validated_at": utc_now()},
             })
             swept = manager.sweep_stale_proposals()
@@ -1220,9 +1253,9 @@ class CoreTests(unittest.TestCase):
 
     def test_proposal_cannot_edit_the_gate_inputs(self) -> None:
         # The gate runs the suite from the worktree the proposal edits, so a
-        # proposal that rewrites tests/, conftest.py, the pytest config or this
-        # module could neuter the gate and validate itself. Those paths are
-        # rejected before a single stage runs.
+        # proposal that rewrites tests/, conftest.py, the pytest config or the
+        # meta-loop is warned on first submission: it is NOT applied to the main
+        # worktree and the model must re-submit the identical change to proceed.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             git_repo(root)
@@ -1233,16 +1266,93 @@ class CoreTests(unittest.TestCase):
             manager = SelfImprovementManager(root, root.parent / "worktrees")
             metadata = self._proposal_metadata()
             for path in ("conftest.py", "tests/test_new.py", "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "skynet/self_improvement.py"):
-                with self.assertRaisesRegex(SelfImprovementError, "gate-protected"):
-                    manager.propose_files(
-                        {},
-                        (sys.executable, "-c", "pass"),
-                        changes=[{"path": path, "operation": "create", "content": "x\n"}],
-                        metadata=metadata,
-                    )
-                record = list(manager._read_proposals().values())[-1]
-                self.assertEqual(record["status"], "rejected", path)
-                self.assertEqual(record["failure_class"], "protected_path", path)
+                result = manager.propose_files(
+                    {},
+                    (sys.executable, "-c", "pass"),
+                    changes=[{"path": path, "operation": "create", "content": "x\n"}],
+                    metadata=metadata,
+                )
+                self.assertFalse(result["ok"], path)
+                self.assertTrue(result["warned"], path)
+                self.assertTrue(result["awaiting_resubmission"], path)
+                self.assertEqual(result["status"], "warned_protected", path)
+                protected = result["protected_paths"]
+                if not isinstance(protected, list):
+                    self.fail(f"protected_paths is not a list: {protected!r}")
+                self.assertIn(path, protected, path)
+            # Every warning keeps its worktree and carries no failure verdict.
+            for record in manager._read_proposals().values():
+                self.assertEqual(record["status"], "warned_protected")
+                self.assertEqual(record["failure_class"], "")
+            # A warning still denies: nothing was applied to the main worktree.
+            self.assertFalse((root / "conftest.py").exists())
+            self.assertFalse((root / "tests" / "test_new.py").exists())
+            self.assertEqual((root / "module.py").read_text(encoding="utf-8"), "value = 1\n")
+
+    def _protected_repo(self, directory: str) -> tuple[SelfImprovementManager, dict[str, object]]:
+        root = Path(directory)
+        git_repo(root)
+        (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+        (root / "tests").mkdir()
+        (root / "tests" / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        commit_all(root, "base")
+        return SelfImprovementManager(root, root.parent / "worktrees"), self._proposal_metadata()
+
+    def test_warned_proposal_is_validated_on_identical_resubmission(self) -> None:
+        # The release half of the warning. The first submission only warns; the
+        # identical fingerprint is then acknowledged, the full gate runs and the
+        # proposal validates. Without this the warning would be a dead end again.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, metadata = self._protected_repo(directory)
+            change = {"path": "tests/test_new.py", "operation": "create", "content": "def test_new():\n    assert True\n"}
+            warned = manager.propose_files({}, (sys.executable, "-c", "pass"), changes=[change], metadata=metadata)
+            self.assertTrue(warned["warned"], warned)
+            self.assertFalse(warned["ok"], warned)
+            fingerprint = str(warned["change_fingerprint"])
+
+            released = manager.propose_files({}, (sys.executable, "-c", "pass"), changes=[change], metadata=metadata)
+            self.assertFalse(released.get("warned", False), released)
+            self.assertTrue(released.get("ok"), released)
+            self.assertTrue(released.get("promotion_required"), released)
+            record = manager._read_proposals()[str(released["proposal_id"])]
+            self.assertEqual(record["status"], "validated")
+            self.assertEqual(record["change_fingerprint"], fingerprint)
+
+    def test_different_fingerprint_gets_a_fresh_warning(self) -> None:
+        # A warning is bound to the exact diff: a different change must never
+        # ride on another proposal's acknowledgement.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, metadata = self._protected_repo(directory)
+            first = {"path": "tests/test_a.py", "operation": "create", "content": "def test_a():\n    assert True\n"}
+            second = {"path": "tests/test_b.py", "operation": "create", "content": "def test_b():\n    assert True\n"}
+            warned_a = manager.propose_files({}, (sys.executable, "-c", "pass"), changes=[first], metadata=metadata)
+            self.assertTrue(warned_a["warned"], warned_a)
+            warned_b = manager.propose_files({}, (sys.executable, "-c", "pass"), changes=[second], metadata=metadata)
+            self.assertTrue(warned_b["warned"], warned_b)
+            self.assertFalse(warned_b["ok"], warned_b)
+            self.assertNotEqual(warned_a["change_fingerprint"], warned_b["change_fingerprint"])
+            fingerprints = {str(record.get("change_fingerprint")) for record in manager._read_proposals().values()}
+            self.assertIn(str(warned_a["change_fingerprint"]), fingerprints)
+            self.assertIn(str(warned_b["change_fingerprint"]), fingerprints)
+
+    def test_warned_worktrees_are_reclaimed_before_the_quota_wedges(self) -> None:
+        # With the gate's own inputs warn-only, a run can warn on many distinct
+        # protected diffs. Each warning holds a worktree; if those counted
+        # against the quota forever, a handful of them would wedge
+        # self-improvement for the life of the process. The quota must reclaim
+        # old warnings instead of refusing new work, and a reclaimed warning
+        # must be re-issuable rather than refused as already attempted.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, metadata = self._protected_repo(directory)
+            with patch.dict(os.environ, {"SKYNET_MAX_WORKTREES": "2"}):
+                for index in range(5):
+                    change = {"path": f"tests/test_{index}.py", "operation": "create", "content": f"def test_{index}():\n    assert True\n"}
+                    result = manager.propose_files({}, (sys.executable, "-c", "pass"), changes=[change], metadata=metadata)
+                    self.assertTrue(result.get("warned"), result)
+                active = [record for record in manager._read_proposals().values() if record.get("worktree")]
+                self.assertLessEqual(len(active), 2)
+                repeat = manager.propose_files({}, (sys.executable, "-c", "pass"), changes=[{"path": "tests/test_0.py", "operation": "create", "content": "def test_0():\n    assert True\n"}], metadata=metadata)
+                self.assertTrue(repeat.get("warned"), repeat)
 
     def test_an_unreadable_worktree_is_refused_not_assumed_safe(self) -> None:
         # A git failure used to yield an empty change set, which silently

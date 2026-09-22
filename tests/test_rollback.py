@@ -1,4 +1,5 @@
 """The organism's own rollback request."""
+
 from __future__ import annotations
 
 import json

@@ -1,10 +1,10 @@
-"""Deterministic user-facing render of finished runs."""
+"""Deterministic owner-facing render of finished runs."""
+
 from __future__ import annotations
 
 import json
 import tempfile
 import unittest
-from datetime import UTC
 from pathlib import Path
 
 from skynet.models import Budget, RunRecord, RunStatus
@@ -12,11 +12,6 @@ from skynet.planner import PlannerCandidate
 from skynet.reporting import recent_run_pairs, render_pairs, render_recent
 from skynet.store import StateStore
 
-
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 def _candidate(workstream_id: str, task_id: str, title: str, score: float) -> PlannerCandidate:
     return PlannerCandidate(
@@ -29,6 +24,7 @@ def _candidate(workstream_id: str, task_id: str, title: str, score: float) -> Pl
         repetition_penalty=0.0,
         reason="highest novelty-adjusted criticality",
     )
+
 
 def _seed_run(
     store: StateStore,
@@ -60,7 +56,7 @@ def _seed_run(
     )
     store.append_event(
         "run_started",
-        {"observations": [{"kind": "durable_state", "generation": 3}]},
+        {"observations": [{"kind": "durable_state", "generation": 164}]},
         run_id,
     )
     store.append_event(
@@ -97,6 +93,7 @@ def _seed_run(
         summary,
     )
 
+
 class ReportingTests(unittest.TestCase):
     def test_recent_run_pairs_are_newest_first_with_both_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -108,8 +105,8 @@ class ReportingTests(unittest.TestCase):
             _seed_run(
                 store,
                 run_id="run-1",
-                started_at=_iso(50520.0),
-                finished_at=_iso(50820.0),
+                started_at="2026-09-18T14:02:00+00:00",
+                finished_at="2026-09-18T14:07:00+00:00",
                 task_id=first_task,
                 title="Fix the reporting pipeline",
                 summary="Replaced the prose wall with structured blocks.",
@@ -119,8 +116,8 @@ class ReportingTests(unittest.TestCase):
             _seed_run(
                 store,
                 run_id="run-2",
-                started_at=_iso(54000.0),
-                finished_at=_iso(54300.0),
+                started_at="2026-09-18T15:00:00+00:00",
+                finished_at="2026-09-18T15:05:00+00:00",
                 task_id=second_task,
                 title="Second task",
                 summary="Second run finished cleanly.",
@@ -134,7 +131,7 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(pairs[0]["scheduler"]["candidate_count"], 2)
             self.assertFalse(pairs[0]["scheduler"]["exploration"])
             self.assertTrue(pairs[1]["scheduler"]["exploration"])
-            self.assertEqual(pairs[1]["scheduler"]["generation"], 3)
+            self.assertEqual(pairs[1]["scheduler"]["generation"], 164)
             self.assertEqual(pairs[0]["report"]["status"], "COMPLETED")
             self.assertEqual(pairs[0]["report"]["steps"], 12)
             self.assertEqual(pairs[0]["report"]["tokens"], 84500)
@@ -154,8 +151,8 @@ class ReportingTests(unittest.TestCase):
             _seed_run(
                 store,
                 run_id="run-1",
-                started_at=_iso(50520.0),
-                finished_at=_iso(50820.0),
+                started_at="2026-09-18T14:02:00+00:00",
+                finished_at="2026-09-18T14:07:00+00:00",
                 task_id=task_id,
                 title="Fix the reporting pipeline",
                 summary="Replaced the prose wall with structured blocks.",
@@ -177,8 +174,8 @@ class ReportingTests(unittest.TestCase):
 
     def test_render_pairs_preserves_order(self) -> None:
         pairs = [
-            {"scheduler": {"found": False, "started_at": _iso(54000.0)}, "report": {"status": "BLOCKED", "finished_at": _iso(54300.0)}},
-            {"scheduler": {"found": False, "started_at": _iso(50400.0)}, "report": {"status": "FAILED", "finished_at": _iso(50700.0)}},
+            {"scheduler": {"found": False, "started_at": "2026-09-18T15:00:00+00:00"}, "report": {"status": "BLOCKED", "finished_at": "2026-09-18T15:05:00+00:00"}},
+            {"scheduler": {"found": False, "started_at": "2026-09-18T14:00:00+00:00"}, "report": {"status": "FAILED", "finished_at": "2026-09-18T14:05:00+00:00"}},
         ]
         rendered = render_pairs(pairs)
         self.assertEqual(len(rendered), 4)
@@ -195,9 +192,9 @@ class ReportingTests(unittest.TestCase):
                     "lonely-run",
                     1,
                     RunStatus.NEEDS_RECOVERY,
-                    _iso(50520.0),
+                    "2026-09-18T14:02:00+00:00",
                     Budget(),
-                    finished_at=_iso(50820.0),
+                    finished_at="2026-09-18T14:07:00+00:00",
                 )
             )
             store.append_event("run_started", {"observations": []}, "lonely-run")
@@ -209,6 +206,35 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("no planner decision", rendered[0])
             self.assertIn("status: NEEDS_RECOVERY", rendered[1])
             store.close()
+
+
+    def test_completed_run_does_not_render_a_control_label_as_blocker(self) -> None:
+        # The deferred-restart path stores "deferred restart" in `run_results.failure`
+        # while the run is COMPLETED; printing that as the blocker put a fault
+        # label under "status: COMPLETED" on the owner-facing report.
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.create_run(RunRecord("run-1", 1, RunStatus.COMPLETED, utc_now(), Budget(), finished_at=utc_now()))
+            store.commit_run_result("run-1", RunStatus.COMPLETED, "promoted", 2, 5, "deferred restart")
+            report = recent_run_pairs(store, 5)[0]["report"]
+            self.assertEqual(report["status"], "COMPLETED")
+            self.assertEqual(report["blocker"], "")
+            store.close()
+
+    def test_non_completed_run_keeps_the_failure_as_blocker(self) -> None:
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.create_run(RunRecord("run-1", 1, RunStatus.FAILED, utc_now(), Budget(), finished_at=utc_now()))
+            store.commit_run_result("run-1", RunStatus.FAILED, "provider down", 1, 1, "provider down")
+            report = recent_run_pairs(store, 5)[0]["report"]
+            self.assertEqual(report["status"], "FAILED")
+            self.assertEqual(report["blocker"], "provider down")
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

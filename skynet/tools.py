@@ -29,6 +29,7 @@ from .policy import (
     workspace_escape,
 )
 from .react import register_process_group
+from .structure import StructureTool
 
 log = logging.getLogger("skynet.tools")
 
@@ -63,6 +64,31 @@ def _bounded(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n[output truncated at {limit} characters]"
+
+
+def _describe_command_failure(returncode: int, stdout: str, stderr: str) -> str:
+    """Name a non-zero exit so an empty payload is never the only evidence.
+
+    The success test is the numeric return code, so a command killed by a
+    signal (negative code) and a command that exited quietly both used to
+    arrive as `{"ok": false, "returncode": N}` with blank streams. Measured on
+    the live ledger (arXiv:2608.02645v1): 108 of 2787 `bash` results are
+    ok:false without an `error` key, and 8 of them carry no stdout and no
+    stderr at all, so neither the model at the time nor a later reader could
+    tell "the instrument died" from "the command legitimately found nothing".
+    Every other failing tool already supplies `error`; this derives the same
+    field here without changing ok, returncode, stdout or stderr.
+    """
+    if returncode < 0:
+        try:
+            reason = f"terminated by {signal.Signals(-returncode).name}"
+        except ValueError:
+            reason = f"terminated by signal {-returncode}"
+    else:
+        reason = f"exit status {returncode}"
+    if not stdout.strip() and not stderr.strip():
+        reason += " with no output"
+    return f"command failed: {reason}"
 
 
 def _finalize_output(data: bytes, was_truncated: bool) -> str:
@@ -174,9 +200,11 @@ class BashTool:
             # Report an absent directory before the workspace boundary. The
             # boundary is only meaningful for a directory that exists, and a
             # caller who mistyped a path deserves that message rather than a
-            # sandbox complaint. Ordering the checks the other way would also
-            # make the check cwd-dependent, since a missing path may be built
-            # relative to the current working directory.
+            # sandbox complaint. Ordering the checks the other way also made the
+            # suite cwd-dependent: tests/test_tools.py builds the missing path
+            # from Path.cwd(), so it failed in every proposal worktree, which
+            # lives outside SKYNET_SANDBOX_WORKSPACE, and no proposal could pass
+            # the gate.
             return {"ok": False, "error": f"cwd does not exist or is not a directory: {cwd}", "suggested_cwd": default_cwd}
         try:
             cwd = str(self.policy.check_cwd(cwd))
@@ -256,12 +284,16 @@ class BashTool:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         process.wait(timeout=min(remaining, 0.1))
             process.wait(timeout=5)
+            stdout = _finalize_output(bytes(output["stdout"]), truncated["stdout"])
+            stderr = _finalize_output(bytes(output["stderr"]), truncated["stderr"])
             result = {
                 "ok": process.returncode == 0,
                 "returncode": process.returncode,
-                "stdout": _finalize_output(bytes(output["stdout"]), truncated["stdout"]),
-                "stderr": _finalize_output(bytes(output["stderr"]), truncated["stderr"]),
+                "stdout": stdout,
+                "stderr": stderr,
             }
+            if process.returncode != 0:
+                result["error"] = _describe_command_failure(process.returncode, stdout, stderr)
             if override:
                 result["policy_override"] = True
             return result
@@ -590,6 +622,7 @@ class DbTool:
                     "memories(memory_id, kind, content, confidence, source_run, updated_at, pinned, status, superseded_by, valid_from, valid_to, evidence, decayed_at); "
                     "idea_archive(idea_id, parent_id, lineage_depth, subsystem, change_type, evidence_source, cell_key, title, problem_description, hypothesis, expected_new_fact, validation, inspiration_ref, quality, novelty, status, superseded_by, children, task_id, proposal_id, created_at, updated_at); "
                     "agent_state(id, lifecycle, generation, next_wake_at, active_run_id, next_plan, retry_count); "
+                    "capability_effects(idempotency_key, capability, arguments_hash, result, status, created_at); "
                     "schema_migrations(version, name, checksum, applied_at). "
                     "A failure, a summary or a step count is never on `runs`: it is on `run_results`. An event's type is `event_log.kind`, never `event_type`. "
                     "Call PRAGMA table_info(<table>) before referencing a column you have not confirmed, and prefer `SELECT *` with a small limit when unsure."
@@ -918,5 +951,5 @@ class _ReadableHTMLParser(HTMLParser):
 
 def default_tools() -> dict[str, Any]:
     policy = ExecutionPolicy.from_environment()
-    tools = [BashTool(policy), WebFetchTool(policy), ReadTool(policy), GrepTool(policy), DbTool(policy)]
+    tools = [BashTool(policy), WebFetchTool(policy), ReadTool(policy), GrepTool(policy), DbTool(policy), StructureTool()]
     return {tool.name: tool for tool in tools}

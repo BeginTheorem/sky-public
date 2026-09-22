@@ -1,11 +1,11 @@
 """Liveness accounting: real attempts, model-side give-up and provider neutrality."""
+
 from __future__ import annotations
 
 import json
 import subprocess
 import tempfile
 import unittest
-from datetime import UTC
 from pathlib import Path
 from typing import cast
 
@@ -16,12 +16,6 @@ from skynet.models import ModelTurn, RunStatus, ToolCall
 from skynet.planner import PortfolioPlanner
 from skynet.reactor import Reactor, ReactorConfig
 from skynet.time import parse_timestamp, utc_datetime_now
-
-
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 FINISH_JSON = json.dumps({
     "status": "COMPLETED",
@@ -42,8 +36,10 @@ MEMORY_JSON = json.dumps({
     "evaluation": {},
 })
 
+
 def _is_memory_request(messages) -> bool:
     return "memory_candidates" in messages[1]["content"]
+
 
 def _classify(messages) -> str:
     if any("Finish phase" in str(message.get("content", "")) for message in messages):
@@ -53,6 +49,7 @@ def _classify(messages) -> str:
     if "Generate at most 3 bounded proposals" in messages[1]["content"]:
         return "planner"
     return "react"
+
 
 class InboxProvider:
     """Empty planner, verified ReAct completion; used to drive inbox accounting."""
@@ -69,10 +66,12 @@ class InboxProvider:
             return ModelTurn(text=FINISH_JSON, usage_tokens=1)
         return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
 
+
 class GoalClosingProvider(InboxProvider):
     """Completes the selected goal through the Memory Loop on the first run.
 
-    Lets a pending operator message be observed after the last goal closes.
+    Used to reproduce the loss of the last active goal while an operator
+    message is still pending.
     """
 
     def __init__(self) -> None:
@@ -88,6 +87,7 @@ class GoalClosingProvider(InboxProvider):
             return ModelTurn(text=json.dumps({**json.loads(MEMORY_JSON), "goal_updates": goal_updates}), usage_tokens=1)
         return super().complete(messages, max_tokens=max_tokens, tools=tools)
 
+
 class ProseProvider:
     """Always answers the ReAct phase with prose, so the Finish Report is invalid."""
 
@@ -96,11 +96,13 @@ class ProseProvider:
             return ModelTurn(text=MEMORY_JSON, usage_tokens=1)
         return ModelTurn(text="I inspected the state but did not produce a report.", usage_tokens=1)
 
+
 class DownProvider:
     """Every provider call fails, as during a full provider outage."""
 
     def complete(self, messages, *, max_tokens, tools=()):
         raise RuntimeError("all providers failed")
+
 
 class RecoveringProvider:
     """Fails once, then produces a verified COMPLETED run."""
@@ -117,6 +119,7 @@ class RecoveringProvider:
         if self.react_calls == 2:
             return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
         return ModelTurn(text=FINISH_JSON, usage_tokens=1)
+
 
 class RetryableBlockedProvider:
     """Always reports a retryable environment blocker, so the task stays pending."""
@@ -137,6 +140,7 @@ class RetryableBlockedProvider:
             }),
             usage_tokens=1,
         )
+
 
 class LivenessTests(unittest.TestCase):
     def _reactor(self, directory: str, provider, *, tools=None, **kwargs) -> Reactor:
@@ -179,9 +183,10 @@ class LivenessTests(unittest.TestCase):
     def test_only_a_fatal_provider_outage_exempts_the_giveup_budget(self) -> None:
         """A budget failure after provider retries is still a model-side failure.
 
-        A run that only retried a provider along the way must not be treated as
-        an outage; otherwise the give-up budget never moves and the task keeps
-        winning the ranking.
+        On the live server a task kept being retried because its runs had some
+        provider retries along the way, so `_run_had_provider_failure` reported
+        an outage and the give-up budget never moved: attempts grew to three
+        while the task stayed pending and kept winning the ranking.
         """
         with tempfile.TemporaryDirectory() as directory:
             reactor = self._reactor(directory, ProseProvider())
@@ -272,8 +277,8 @@ class LivenessTests(unittest.TestCase):
             self.assertGreater(pending, 0)
             reactor.close()
 
-    def test_operator_message_is_not_auto_consumed_when_the_last_goal_closes(self) -> None:
-        """Closing the last goal must not swallow a pending operator message.
+    def test_owner_message_is_not_auto_consumed_when_the_last_goal_closes(self) -> None:
+        """Closing the last goal must not swallow a pending owner message.
 
         The message is a notification the organism decides about; it stays
         pending across the goal's closure until acknowledge_inbox is called.
@@ -284,10 +289,10 @@ class LivenessTests(unittest.TestCase):
             goal_id = reactor.store.add_goal("the last goal", priority=1.0)
             provider.goal_id = goal_id
             reactor.store.add_task("bounded diagnostic", goal_id)
-            reactor.store.add_inbox_event("evt-operator", "user_message", {"text": "operator note"})
+            reactor.store.add_inbox_event("evt-owner", "user_message", {"text": "operator note"})
             self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
             self.assertEqual(reactor.store.connection.execute("SELECT status FROM goals").fetchone()[0], "completed")
-            self.assertEqual([event["event_id"] for event in reactor.store.pending_inbox()], ["evt-operator"])
+            self.assertEqual([event["event_id"] for event in reactor.store.pending_inbox()], ["evt-owner"])
             reactor.close()
 
     def test_no_active_goal_event_is_deduplicated_by_generation(self) -> None:
@@ -319,8 +324,8 @@ class LivenessTests(unittest.TestCase):
             self.assertIsNotNone(row)
             payload = json.loads(row[0])
             # fixture_tool plus the always-injected ask_user/send_message/memory/
-            # acknowledge_inbox tools.
-            self.assertEqual(payload["tool_count"], 5)
+            # acknowledge_inbox/read_inbox/record_plan tools.
+            self.assertEqual(payload["tool_count"], 7)
             self.assertIsInstance(payload["request_chars"], int)
             self.assertTrue(payload["model"])
             reactor.close()
@@ -347,11 +352,11 @@ class LivenessTests(unittest.TestCase):
             reactor.close()
 
     def test_retryable_blocked_task_is_retired_after_the_cap(self) -> None:
-        """A retryable environment blocker is retired after the cap.
+        """A retryable environment blocker used to be retried with no limit.
 
-        The task must not return to pending forever when it is the only
-        candidate; it is retired like any other repeated failure so replacement
-        planning can run.
+        The task returned to pending on every cycle and, when it was the only
+        candidate, was selected forever. It must now be retired like any other
+        repeated failure so replacement planning can run.
         """
         with tempfile.TemporaryDirectory() as directory:
             reactor = self._reactor(directory, RetryableBlockedProvider())
@@ -418,10 +423,10 @@ class LivenessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             reactor = self._reactor(directory, ProseProvider())
             rows = (
-                ("needs_recovery", "all providers failed: ollama[x]: exhausted", _iso(1.0)),
-                ("needs_recovery", "all providers failed: ollama[x]: exhausted", _iso(2.0)),
-                ("completed", "", _iso(3.0)),
-                ("needs_recovery", "all providers failed: ollama[x]: exhausted", _iso(4.0)),
+                ("needs_recovery", "all providers failed: ollama[x]: exhausted", "2026-09-18T00:00:01Z"),
+                ("needs_recovery", "all providers failed: ollama[x]: exhausted", "2026-09-18T00:00:02Z"),
+                ("completed", "", "2026-09-18T00:00:03Z"),
+                ("needs_recovery", "all providers failed: ollama[x]: exhausted", "2026-09-18T00:00:04Z"),
             )
             for status, failure, created_at in rows:
                 reactor.store.connection.execute(
@@ -452,12 +457,12 @@ class LivenessTests(unittest.TestCase):
             self.assertIn("runtime_facts", observations)
             facts = observations["runtime_facts"]
             self.assertIn("test_command", facts)
-            # ask_user, send_message_to_user, memory and acknowledge_inbox are
-            # always injected, so the runtime surface is never empty even with no
-            # operator tools.
-            self.assertEqual(facts["tool_count"], 4)
-            # The schema is injected so the model does not have to guess table
-            # names.
+            # ask_user, send_message_to_user, memory, acknowledge_inbox,
+            # read_inbox and record_plan are always injected, so the runtime
+            # surface is never empty even with no operator tools.
+            self.assertEqual(facts["tool_count"], 6)
+            # The model used to query tables that do not exist (`events` instead
+            # of `event_log`); the schema is injected so it stops guessing.
             self.assertIn("event_log", facts["tables"])
             self.assertIn("memories", facts["tables"])
             self.assertTrue(facts["scratch_directory"].endswith("skynet-scratch"))
@@ -477,7 +482,7 @@ class LivenessTests(unittest.TestCase):
             (root / "tracked.py").write_text("two\n", encoding="utf-8")
             # The guard lives next to the state database (state_path's parent).
             (root / "reboot-guard.json").write_text(
-                json.dumps({"proposal_id": "p1", "commit": "abc1234", "completed_at": _iso(0.0), "healthy_cycles": 3}),
+                json.dumps({"proposal_id": "p1", "commit": "abc1234", "completed_at": "2026-09-18T00:00:00Z", "healthy_cycles": 3}),
                 encoding="utf-8",
             )
             reactor = self._reactor(directory, ProseProvider())
@@ -498,7 +503,8 @@ class LivenessTests(unittest.TestCase):
             reactor.close()
 
     def test_planner_memory_query_is_derived_from_the_situation(self) -> None:
-        # The query must reflect the actual goal and the previous outcome.
+        # The planner used to search a fixed phrase that recalled nothing about
+        # the actual goal or the previous outcome.
         with tempfile.TemporaryDirectory() as directory:
             reactor = self._reactor(directory, ProseProvider())
             state = reactor.store.state()
@@ -511,8 +517,8 @@ class LivenessTests(unittest.TestCase):
             reactor.close()
 
     def test_memory_query_is_built_from_the_task_envelope(self) -> None:
-        # `selected_work` is task_work()'s envelope, so the title must be read
-        # from the nested task, not the top-level work dict.
+        # `selected_work` is task_work()'s envelope; reading `selected_work["title"]`
+        # returned "" for every task and made recall silently empty.
         with tempfile.TemporaryDirectory() as directory:
             reactor = self._reactor(directory, ProseProvider())
             work = {
@@ -549,6 +555,7 @@ class LivenessTests(unittest.TestCase):
             "SELECT status, attempts, consecutive_model_failures FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()
+
 
 if __name__ == "__main__":
     unittest.main()

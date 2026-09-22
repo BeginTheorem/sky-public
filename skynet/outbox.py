@@ -4,7 +4,7 @@ import json
 import logging
 from collections.abc import Callable
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Any, Protocol
 from urllib import error, request
 
@@ -19,6 +19,7 @@ DEFAULT_BACKLOG_LIMIT = 20
 DEFAULT_RATE_LIMIT_CAP = 60.0
 RATE_LIMIT_RETRIES = 1
 BACKLOG_SUPPRESS_ERROR = "suppressed: backlog limit"
+DEFERRED_ERROR = "deferred: rate-limit window"
 JSON_RENDER_LIMIT = 8000
 AGENT_RESPONSE_SUMMARY_LIMIT = 400
 AGENT_RESPONSE_LOGS_HINT = "Полный отчёт доступен командой /logs"
@@ -30,13 +31,16 @@ class OutboxRateLimitError(RuntimeError):
         super().__init__(f"transport rate limit; retry after {self.retry_after:g}s")
 
 
+class OutboxDeferredError(RuntimeError):
+    """A rate limit deferred a message instead of failing it."""
+
+    def __init__(self, retry_after: float) -> None:
+        self.retry_after = max(1.0, float(retry_after))
+        super().__init__(f"deferred by rate limit; retry after {self.retry_after:g}s")
+
+
 class Transport(Protocol):
     def send(self, text: str) -> None: ...
-
-
-def chunk_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    text = text or "(empty)"
-    return [text[index:index + limit] for index in range(0, len(text), limit)] or ["(empty)"]
 
 
 def _compact_json(value: Any, limit: int = JSON_RENDER_LIMIT) -> str:
@@ -118,11 +122,14 @@ class TelegramTransport:
         self.limit = limit
 
     def send(self, text: str) -> None:
-        from .telegram_bot import redact
+        from .telegram_bot import chunk_html, redact
 
-        for part in chunk_text(text, self.limit):
+        for part in chunk_html(redact(text), self.limit):
             try:
-                self.api.call("sendMessage", {"chat_id": self.chat_id, "text": redact(part)})
+                self.api.call(
+                    "sendMessage",
+                    {"chat_id": self.chat_id, "text": part, "parse_mode": "HTML"},
+                )
             except Exception as exc:
                 retry_after = getattr(exc, "retry_after", None)
                 if retry_after is not None:
@@ -148,6 +155,7 @@ class OutboxDrainer:
         enabled: bool = True,
         sleep: Callable[[float], None] = sleep,
         rate_limit_cap: float = DEFAULT_RATE_LIMIT_CAP,
+        block_on_rate_limit: bool = True,
     ) -> None:
         self.store = store
         self.transport = transport
@@ -157,11 +165,18 @@ class OutboxDrainer:
         self.enabled = enabled
         self._sleep = sleep
         self.rate_limit_cap = max(0.0, rate_limit_cap)
+        # A 429 describes the channel, not the message, and drain() is called
+        # synchronously from the single-threaded poll loop. Sleeping here stalls
+        # the owner's next command for the whole flood window while the queue it
+        # waits for is already paused; the deferral path below and the post-window
+        # probe deliver the same messages without holding the caller.
+        self.block_on_rate_limit = bool(block_on_rate_limit)
         self._backlog_checked = False
+        self._rate_limited_until = 0.0
 
     def drain(self) -> int:
-        # Reconcile any alert whose message already left the queue before
-        # sending anything new.
+        # Two consumers used to race for the same lease; reconcile any alert
+        # whose message already left the queue before sending anything new.
         try:
             self.store.reconcile_delivered_alerts()
         except Exception:
@@ -171,11 +186,107 @@ class OutboxDrainer:
         if not self._backlog_checked:
             self._backlog_checked = True
             self._suppress_backlog()
+        if not self._rate_limit_window_open():
+            # The flood-wait window is still running. Sending anything now only
+            # deepens the refusal, so the queue is left untouched and a drain
+            # costs zero requests; the probe below runs once the window expires.
+            return 0
+        if self._rate_limited_until > 0:
+            return self._probe_after_rate_limit()
         delivered = 0
-        for message in self.store.claim_outbox(limit=self.batch):
+        claimed = self.store.claim_outbox(limit=self.batch)
+        for position, message in enumerate(claimed):
+            if position and not self._rate_limit_window_open():
+                # The channel met this batch with an unannounced flood wait.
+                # The message that discovered it already paused the queue for
+                # the whole window; attempting the rest would spend one request
+                # each to learn the same refusal and leave them claimed in
+                # `delivering` for a lease. Return the untouched tail instead.
+                for leftover in claimed[position:]:
+                    self._defer(str(leftover.get("message_id", "")))
+                break
             if self._deliver(message):
                 delivered += 1
         return delivered
+
+    def _rate_limit_window_open(self) -> bool:
+        """True when sending may be attempted at all."""
+        return monotonic() >= self._rate_limited_until
+
+    def _rate_limit_pause(self, retry_after: float) -> None:
+        """Postpone the whole queue for one Telegram flood-wait window.
+
+        Telegram's `retry_after` describes the channel, not the message that
+        happened to hit it. Treating it as a per-message failure burned one unit
+        of every queued message's attempt budget per drain cycle, so a sustained
+        flood wait dead-lettered the owner's alerts although nothing was wrong
+        with them. Meanwhile the window is remembered and every send is skipped;
+        a single probe request per window measures when the refusal has passed,
+        so a long refusal costs one request per window instead of one per message
+        per poll.
+        """
+        delay = min(max(float(retry_after), 1.0), self.rate_limit_cap)
+        self._rate_limited_until = max(self._rate_limited_until, monotonic() + delay)
+
+    def _probe_after_rate_limit(self) -> int:
+        """Try exactly one queued message once the flood-wait window has expired."""
+        if self._rate_limited_until <= 0:
+            return 0
+        for message in self.store.claim_outbox(limit=1):
+            message_id = str(message.get("message_id", ""))
+            kind = str(message.get("kind", "unknown"))
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                payload = {"raw": payload}
+            try:
+                self._send_with_rate_limit(render_outbox_message(kind, payload), consume_attempt=False)
+            except OutboxDeferredError:
+                self._defer(message_id)
+                return 0
+            except Exception as exc:
+                state = self.store.mark_outbox_failed(message_id, str(exc), max_attempts=self.max_attempts)
+                log.warning("outbox probe failed id=%s state=%s error=%s", message_id, state, exc)
+                if state == "dead":
+                    self._dead_letter(message_id, kind, str(exc))
+                return 0
+            self._mark_delivered(message_id, kind, payload)
+            # The channel accepted a send again: leave the flood-wait state so the
+            # next drain returns to full batch delivery instead of probing.
+            self._rate_limited_until = 0.0
+            return 1
+        return 0
+
+    def _mark_delivered(self, message_id: str, kind: str, payload: dict[str, Any]) -> None:
+        try:
+            self.store.mark_outbox_delivered(message_id)
+        except Exception:
+            log.exception("outbox mark-delivered failed id=%s", message_id)
+            return
+        if kind == "alert":
+            alert_id = payload.get("alert_id")
+            if isinstance(alert_id, str) and alert_id:
+                try:
+                    self.store.mark_alert_delivered(alert_id, "telegram")
+                except Exception:
+                    log.exception("alert mark-delivered failed id=%s", alert_id)
+
+    def _defer(self, message_id: str) -> None:
+        """Return a claimed message to `pending` without spending an attempt.
+
+        ``claim`` increments ``attempts``; a message Telegram refused for a
+        channel-wide reason must not pay for that, or the dead-letter cap expires
+        while the message itself is still perfectly deliverable.
+        """
+        try:
+            with self.store.transaction():
+                self.store.connection.execute(
+                    "UPDATE outbox SET delivery_state='pending', claimed_at=NULL, last_error=?, "
+                    "attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END "
+                    "WHERE message_id=? AND delivery_state='delivering'",
+                    (DEFERRED_ERROR, message_id),
+                )
+        except Exception:
+            log.warning("outbox defer failed id=%s", message_id, exc_info=True)
 
     def _suppress_backlog(self) -> None:
         if self.backlog_limit <= 0:
@@ -212,32 +323,31 @@ class OutboxDrainer:
             payload = {"raw": payload}
         try:
             self._send_with_rate_limit(render_outbox_message(kind, payload))
+        except OutboxDeferredError:
+            self._defer(message_id)
+            return False
         except Exception as exc:
             state = self.store.mark_outbox_failed(message_id, str(exc), max_attempts=self.max_attempts)
             log.warning("outbox delivery failed id=%s kind=%s state=%s error=%s", message_id, kind, state, exc)
             if state == "dead":
                 self._dead_letter(message_id, kind, str(exc))
             return False
-        try:
-            self.store.mark_outbox_delivered(message_id)
-        except Exception:
-            log.exception("outbox mark-delivered failed id=%s", message_id)
-            return False
-        if kind == "alert":
-            alert_id = payload.get("alert_id")
-            if isinstance(alert_id, str) and alert_id:
-                try:
-                    self.store.mark_alert_delivered(alert_id, "telegram")
-                except Exception:
-                    log.exception("alert mark-delivered failed id=%s", alert_id)
+        self._mark_delivered(message_id, kind, payload)
         return True
 
-    def _send_with_rate_limit(self, text: str) -> None:
+    def _send_with_rate_limit(self, text: str, *, consume_attempt: bool = True) -> None:
         for attempt in range(RATE_LIMIT_RETRIES + 1):
             try:
                 self.transport.send(text)
                 return
             except OutboxRateLimitError as exc:
+                self._rate_limit_pause(exc.retry_after)
+                if not consume_attempt or not self.block_on_rate_limit:
+                    # The probe measures the window with a single request; the
+                    # configured non-blocking mode hands the whole penalty to the
+                    # window plus that probe. Either way a blocking sleep here
+                    # would stall the poll loop for the length of the flood wait.
+                    raise OutboxDeferredError(exc.retry_after) from exc
                 if attempt >= RATE_LIMIT_RETRIES:
                     raise
                 delay = min(max(float(exc.retry_after), 1.0), self.rate_limit_cap)

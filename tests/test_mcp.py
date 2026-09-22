@@ -1,4 +1,5 @@
-"""Tests for the MCP stdio client and server startup."""
+"""Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import os
@@ -112,7 +113,7 @@ class CoreTests(unittest.TestCase):
                     client.start()
                 elapsed = time.monotonic() - started
                 # Exactly one process spawn proves start() never re-entered
-                # itself.
+                # itself; the old code spawned one subprocess per recursion level.
                 self.assertEqual(len(spawns), 1)
                 self.assertLessEqual(client.restart_count, client.restart_attempts)
                 self.assertIsNone(client.process)

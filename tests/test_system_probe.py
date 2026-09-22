@@ -1,4 +1,5 @@
 """Bounded system probe: schema, degradation and log rotation."""
+
 from __future__ import annotations
 
 import json

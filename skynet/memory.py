@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .model_contracts import MEMORY_RESPONSE_SCHEMA, parse_json_object, validate_shape
+from .model_contracts import MEMORY_RESPONSE_SCHEMA, drop_unknown_fields, parse_json_object, validate_shape
 from .models import AgentRunResult, Budget, ModelTurn
 from .provider import LLMProvider, Message
 from .runtime_log import verbose_enabled, verbose_write
@@ -35,6 +35,11 @@ class MemoryResult:
     goal_updates: list[dict[str, Any]] = field(default_factory=list)
     task_updates: list[dict[str, Any]] = field(default_factory=list)
     evaluation: dict[str, Any] = field(default_factory=dict)
+    # A reply that carried undeclared keys (:func:`drop_unknown_fields`) or a
+    # section that failed its own contract is salvaged rather than discarded, so
+    # the harness records what it had to tolerate for post-mortem.
+    dropped_fields: list[str] = field(default_factory=list)
+    rejected_sections: list[str] = field(default_factory=list)
 
 
 def _runtime_log_path(runtime_log: Callable[..., None] | None) -> Path | None:
@@ -147,7 +152,7 @@ class MemoryLoop:
         if runtime_log is not None:
             runtime_log(
                 "provider_response",
-                {"phase": "memory", "text_preview": turn.text[:1000], "text_chars": len(turn.text), "tool_call_count": 0, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens},
+                {"phase": "memory", "text_preview": turn.text[:1000], "text_chars": len(turn.text), "tool_call_count": 0, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens, "finish_reason": turn.finish_reason},
                 run_id=None,
             )
         if verbose_path is not None and verbose_enabled(verbose_path):
@@ -196,18 +201,39 @@ class MemoryLoop:
         if not text:
             raise ValueError("memory loop returned an empty response")
         data = parse_json_object(text)
-        validate_shape(data, MEMORY_RESPONSE_SCHEMA)
-        candidates = data.get("memory_candidates", [])
-        plan = data.get("next_plan", {})
-        initial_prompt = data.get("initial_prompt", "")
-        goal_updates = data.get("goal_updates", [])
-        task_updates = data.get("task_updates", [])
-        evaluation = data.get("evaluation", {})
+        # A single undeclared key used to fail the whole consolidation
+        # (`initial_prompt_note` beside `initial_prompt`, 2026-09-22). Drop the
+        # extras and validate each section on its own so one malformed section
+        # cannot discard the candidates and plan that were perfectly good.
+        dropped = drop_unknown_fields(data, MEMORY_RESPONSE_SCHEMA)
+        properties = MEMORY_RESPONSE_SCHEMA["properties"]
+        rejected: list[str] = []
+
+        def section(key: str) -> Any:
+            if key not in data:
+                return None
+            try:
+                validate_shape(data[key], properties[key], path=f"response.{key}")
+            except ValueError:
+                rejected.append(f"response.{key}")
+                return None
+            return data[key]
+
+        candidates = section("memory_candidates")
+        plan = section("next_plan")
+        initial_prompt = section("initial_prompt")
+        goal_updates = section("goal_updates")
+        task_updates = section("task_updates")
+        evaluation = section("evaluation")
+        if all(value is None for value in (candidates, plan, initial_prompt, goal_updates, task_updates, evaluation)):
+            raise ValueError("memory response carried no usable section")
         return MemoryResult(
             memory_candidates=candidates if isinstance(candidates, list) else [],
             next_plan=plan if isinstance(plan, dict) else {},
-            initial_prompt=str(initial_prompt) if initial_prompt else "",
+            initial_prompt=str(initial_prompt) if isinstance(initial_prompt, str) and initial_prompt else "",
             goal_updates=goal_updates if isinstance(goal_updates, list) else [],
             task_updates=task_updates if isinstance(task_updates, list) else [],
             evaluation=evaluation if isinstance(evaluation, dict) else {},
+            dropped_fields=dropped,
+            rejected_sections=rejected,
         )

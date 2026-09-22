@@ -91,6 +91,12 @@ class ModelTurn:
     usage_tokens: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # The provider's own stop reason ("stop", "length", "tool_calls", ...).
+    # A completion cut off at the output ceiling is otherwise indistinguishable
+    # from a short one: the reply is valid JSON-prefix text either way, and the
+    # token counts alone do not say whether the model finished. None means the
+    # provider did not report one.
+    finish_reason: str | None = None
     reasoning_content: str = ""
     # Time actually spent waiting on the model, excluding provider backoff and
     # fallback delays. A provider that leaves it at zero lets the caller fall

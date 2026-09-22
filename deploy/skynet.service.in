@@ -10,14 +10,14 @@ StartLimitBurst=5
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/skynet
-EnvironmentFile=/opt/skynet/config/skynet.env
+WorkingDirectory=@ROOT@
+EnvironmentFile=@ROOT@/config/skynet.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=TZ=UTC
-ExecStart=/opt/skynet/.venv/bin/python -m skynet --interval 60
+ExecStart=@ROOT@/.venv/bin/python -m skynet --interval 60
 Restart=on-failure
 RestartSec=10
-TimeoutStopSec=600
+TimeoutStopSec=1200
 KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal

@@ -1,4 +1,5 @@
-"""Recovery and watchdog behaviour tests."""
+"""Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import json
@@ -19,11 +20,6 @@ from skynet.recovery import RebootGuard
 from skynet.store import StateStore
 
 
-def _iso(seconds: float) -> str:
-    from datetime import UTC, datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
-
 class CoreTests(unittest.TestCase):
     def test_interrupt_stale_run_marks_active_run_interrupted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -39,11 +35,17 @@ class CoreTests(unittest.TestCase):
                 state.active_run_id = "interrupted-run"
                 store.transition(state, LifecycleState.REACT, run_id="interrupted-run", reason="test")
                 store.set_state(state)
+            # The in-memory ReAct counters are gone once the process is killed;
+            # the durable running totals must survive into the ledger row.
+            with store.transaction():
+                store.touch_run("interrupted-run", "react", steps=7, usage_tokens=4242)
             self.assertIsNone(reactor.interrupt_stale_run(reason="watchdog_timeout"))
             result = reactor.interrupt_stale_run(reason="watchdog_timeout", force=True)
             self.assertEqual(result, RunStatus.INTERRUPTED)
             status = store.connection.execute("SELECT status FROM runs WHERE run_id=?", ("interrupted-run",)).fetchone()[0]
             self.assertEqual(status, "interrupted")
+            ledger = store.connection.execute("SELECT steps, usage_tokens FROM run_results WHERE run_id=?", ("interrupted-run",)).fetchone()
+            self.assertEqual((ledger[0], ledger[1]), (7, 4242))
             self.assertIsNone(store.state().active_run_id)
             self.assertEqual(store.state().lifecycle, LifecycleState.RECOVERING)
             store.close()
@@ -193,7 +195,7 @@ class CoreTests(unittest.TestCase):
                 from skynet.time import utc_now
                 reactor.store.create_run(RunRecord("stale-orphan", 1, RunStatus.RUNNING, utc_now(), Budget()))
                 reactor.store.create_run(RunRecord("fresh-active", 1, RunStatus.RUNNING, utc_now(), Budget()))
-                reactor.store.connection.execute("UPDATE runs SET heartbeat_at=? WHERE run_id=?", (_iso(0.0), "stale-orphan"))
+                reactor.store.connection.execute("UPDATE runs SET heartbeat_at=? WHERE run_id=?", ("2000-01-01T00:00:00+00:00", "stale-orphan"))
                 state = reactor.store.state()
                 state.active_run_id = "fresh-active"
                 reactor.store.set_state(state)
@@ -209,7 +211,7 @@ class CoreTests(unittest.TestCase):
                 from skynet.models import Budget, RunRecord
                 from skynet.time import utc_now
                 reactor.store.create_run(RunRecord(run_id, 1, RunStatus.RUNNING, utc_now(), Budget()))
-                reactor.store.connection.execute("UPDATE runs SET heartbeat_at=? WHERE run_id=?", (_iso(0.0), run_id))
+                reactor.store.connection.execute("UPDATE runs SET heartbeat_at=? WHERE run_id=?", ("2000-01-01T00:00:00+00:00", run_id))
                 state = reactor.store.state()
                 state.active_run_id = run_id
                 reactor.store.set_state(state)
@@ -275,7 +277,7 @@ class CoreTests(unittest.TestCase):
             reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=path))
             with reactor.store.transaction():
                 reactor.store.create_run(RunRecord("stale-run", 1, RunStatus.RUNNING, utc_now(), Budget()))
-                reactor.store.connection.execute("UPDATE runs SET heartbeat_at=? WHERE run_id=?", (_iso(0.0), "stale-run"))
+                reactor.store.connection.execute("UPDATE runs SET heartbeat_at=? WHERE run_id=?", ("2000-01-01T00:00:00+00:00", "stale-run"))
                 state = reactor.store.state()
                 state.active_run_id = "stale-run"
                 reactor.store.set_state(state)
@@ -335,8 +337,8 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             store.connection.execute(
-                "INSERT INTO runs(run_id, attempt, status, started_at, budget) VALUES (?, 1, 'interrupted', ?, '{}')",
-                ("run-x", _iso(0.0)),
+                "INSERT INTO runs(run_id, attempt, status, started_at, budget) VALUES (?, 1, 'interrupted', '2026-01-01T00:00:00Z', '{}')",
+                ("run-x",),
             )
             store.connection.commit()
             self.assertEqual(store.backfill_missing_run_results(), 1)
@@ -395,6 +397,7 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(result["active"])
             self.assertEqual(result["healthy_cycles"], 1)
             self.assertFalse(result.get("quarantined", False))
+
 
 class RollbackFailureTests(unittest.TestCase):
     def _guard_with_failed_health(self, state: Path, rollback):

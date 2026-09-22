@@ -1,4 +1,5 @@
-"""Reactor lifecycle and tick behaviour tests."""
+"""Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import json
@@ -8,17 +9,17 @@ import threading
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 from unittest.mock import Mock, patch
 
-from helpers import FakeProvider, FixtureTool
+from helpers import FakeProvider, FixtureTool, commit_all, git_repo
 
 from skynet import metrics
 from skynet.heartbeat import wake as heartbeat_wake
-from skynet.models import Budget, LifecycleState, ModelTurn, RunStatus, ToolCall
+from skynet.models import AgentRunResult, Budget, LifecycleState, ModelTurn, RunStatus, ToolCall
 from skynet.outbox import deliver_to_jsonl
 from skynet.planner import PortfolioPlanner
-from skynet.reactor import SYSTEM, SYSTEM_MEMORY, SYSTEM_REACT, Reactor, ReactorConfig
+from skynet.reactor import SYSTEM, SYSTEM_MEMORY, SYSTEM_REACT, Reactor, ReactorConfig, TurnShapeRecorder, mcp_senses_line
 from skynet.store import StateStore
 
 
@@ -48,6 +49,25 @@ class CoreTests(unittest.TestCase):
             self.assertEqual((config.max_steps, config.max_tokens, config.timeout_seconds, config.output_tokens), (7, 1_234, 12.5, 321))
             reactor.close()
 
+    def test_planner_output_budget_comes_from_its_own_setting(self) -> None:
+        # A min(4096, ...) clamp at the planner seam meant raising
+        # SKYNET_OUTPUT_TOKENS never reached the planner. The ReAct cap stays
+        # small here while the planner keeps its own, larger ceiling.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reactor = Reactor(
+                FakeProvider(),
+                {},
+                ReactorConfig(
+                    state_path=root / "state.sqlite3",
+                    budget=Budget(steps=7, tokens=1_234, seconds=12.5, output_tokens=100),
+                    planner_output_tokens=16_384,
+                ),
+            )
+            self.assertEqual(reactor.runner.config.output_tokens, 100)
+            self.assertEqual(reactor.autonomous_planner.output_tokens, 16_384)
+            reactor.close()
+
     def test_soul_loading_does_not_depend_on_prompt_substring(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -59,6 +79,38 @@ class CoreTests(unittest.TestCase):
             self.assertIn("[SKYNET SOUL BEGIN]", reactor.config.system_prompt)
             self.assertIn("# SOUL.md", reactor.config.system_prompt)
             reactor.close()
+
+    def test_system_prompt_carries_workspace_and_senses_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=root / "state.sqlite3"))
+            prompt = reactor.config.system_prompt
+            self.assertIn("[SKYNET WORKSPACE BEGIN]", prompt)
+            self.assertIn("WORKSPACE: ", prompt)
+            self.assertIn("SENSES: none configured", prompt)
+            reactor.close()
+
+    def test_mcp_senses_line_groups_tools_by_server(self) -> None:
+        arxiv_client = Mock()
+        arxiv_client.server_name = "arxiv"
+        search = Mock()
+        search.client = arxiv_client
+        search.remote_name = "search_papers"
+        abstract = Mock()
+        abstract.client = arxiv_client
+        abstract.remote_name = "get_abstract"
+        web = Mock()
+        web.client = Mock(server_name="ddg")
+        web.remote_name = "search"
+        tools = cast(Any, {"search_papers": search, "get_abstract": abstract, "search": web, "bash": Mock(spec=[])})
+        self.assertEqual(mcp_senses_line(tools), "SENSES: arxiv (get_abstract, search_papers); ddg (search)")
+
+    def test_system_has_no_hardcoded_workspace_or_senses(self) -> None:
+        self.assertNotIn("/home/", SYSTEM)
+        self.assertIn("SENSES line", SYSTEM)
+        self.assertIn("WORKSPACE line", SYSTEM)
+        for leaked in ("search_papers", "search_code", "browser_", "playwright", "arxiv-mcp"):
+            self.assertNotIn(leaked, SYSTEM)
     def test_blocked_goal_does_not_trigger_bootstrap_genesis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             from skynet.store import StateStore
@@ -126,7 +178,7 @@ class CoreTests(unittest.TestCase):
         from skynet.tools import default_tools
 
         tools = default_tools()
-        self.assertEqual(set(tools), {"bash", "webfetch", "read", "grep", "db"})
+        self.assertEqual(set(tools), {"bash", "webfetch", "read", "grep", "db", "structure"})
         description = cast(str, tools["bash"].schema["function"]["description"])
         self.assertIn("system bash", description)
         self.assertIn("webfetch", tools)
@@ -145,7 +197,7 @@ class CoreTests(unittest.TestCase):
             # Ordered explicitly: an index on event_log(kind, sequence) can make
             # the planner return rows in index order instead of insertion order.
             events = reactor.store.connection.execute("SELECT kind FROM event_log ORDER BY sequence").fetchall()
-            self.assertEqual([row[0] for row in events], ["planner_decision", "memory_retrieval", "run_started", "decision_record", "react_phase", "react_phase", "tool_call", "tool_result", "finish_report", "run_result_committed", "provider_request", "memory_loop_started", "scheduler_decision", "memory_loop_finished", "memory_event", "memory_consolidated", "run_finished", "task_progress", "checkpoint", "metrics_snapshot"])
+            self.assertEqual([row[0] for row in events], ["planner_decision", "memory_retrieval", "run_started", "decision_record", "react_phase", "react_phase", "tool_call", "tool_result", "finish_report", "run_result_committed", "provider_request", "memory_loop_started", "scheduler_decision", "memory_loop_finished", "memory_event", "memory_consolidated", "run_finished", "plan_observation", "task_progress", "checkpoint", "metrics_snapshot"])
             response = reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_report'").fetchone()[0]
             self.assertIn('"text":', response)
             self.assertEqual(reactor.store.connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 1)
@@ -166,7 +218,66 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(deliver_to_jsonl(reactor.store, Path(directory) / "outbox.jsonl"), 1)
             self.assertEqual(len(reactor.store.pending_outbox()), 0)
             reactor.close()
-    def test_uncaptured_prototype_changes_keep_the_task_pending(self) -> None:
+    def test_mid_run_progress_reaches_the_owner_outbox_as_agent_message(self) -> None:
+        from skynet.outbox import render_outbox_message
+
+        class SlowProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1, model_seconds=4000.0)
+                if self.calls == 2:
+                    return ModelTurn(text=json.dumps({
+                        "status": "COMPLETED",
+                        "summary": "bounded episode with a mid-run note",
+                        "evidence": ["fixture tool result"],
+                        "actions": [],
+                        "changes": [],
+                        "tests": [],
+                        "blocker": "",
+                        "next_hypothesis": "",
+                    }), usage_tokens=1)
+                return ModelTurn(text=json.dumps({
+                    "memory_candidates": [],
+                    "next_plan": {"next": "continue"},
+                    "initial_prompt": "continue",
+                    "goal_updates": [],
+                    "task_updates": [],
+                    "evaluation": {},
+                }), usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reactor = Reactor(
+                SlowProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(
+                    state_path=root / "state.sqlite3",
+                    budget=Budget(steps=100, tokens=200_000, seconds=7200.0, output_tokens=8192),
+                    run_progress_seconds=3600.0,
+                ),
+            )
+            self.assertEqual(reactor.tick("timer"), RunStatus.COMPLETED)
+            pending = reactor.store.pending_outbox()
+            progress = [message for message in pending if message["kind"] == "agent_message"]
+            finish = [message for message in pending if message["kind"] == "agent_response"]
+            self.assertEqual(len(progress), 1, "exactly one mid-run note")
+            self.assertEqual(len(finish), 1, "the finish report is still delivered untouched")
+            message = progress[0]["payload"]["message"]
+            self.assertIn("Прогон продолжается", message)
+            self.assertLessEqual(len(message), 300)
+            # The bot's drain renders this kind through the shared renderer.
+            self.assertIn("Прогон продолжается", render_outbox_message("agent_message", progress[0]["payload"]))
+            # The note is durable, not only in the queue.
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='run_progress_reported'").fetchone()[0],
+                1,
+            )
+            reactor.close()
+    def test_path_like_claim_in_a_clean_worktree_does_not_reopen_the_task(self) -> None:
         class PrototypeProvider:
             def __init__(self) -> None:
                 self.calls = 0
@@ -194,8 +305,86 @@ class CoreTests(unittest.TestCase):
                 ReactorConfig(state_path=root / "state.sqlite3", self_improvement_root=root),
             )
             self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
+            # The claim is not verifiable here (the root is not even a git
+            # repository, so nothing is dirty), so the finished task stays
+            # completed and no uncaptured-changes signal is raised.
+            self.assertEqual(reactor.store.connection.execute("SELECT status FROM tasks").fetchone()[0], "completed")
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='uncaptured_changes'").fetchone()[0],
+                0,
+            )
+            reactor.close()
+
+    def test_dirty_worktree_with_uncaptured_changes_reopens_the_task(self) -> None:
+        class PrototypeProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                return ModelTurn(text=json.dumps({
+                    "status": "COMPLETED",
+                    "summary": "edited the repository directly instead of proposing",
+                    "evidence": ["fixture tool result"],
+                    "actions": [],
+                    "changes": ["skynet/foo.py: bounded change"],
+                    "tests": [],
+                    "blocker": "",
+                    "next_hypothesis": "",
+                }), usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            commit_all(root, "base")
+            # A direct edit through bash leaves the main worktree dirty; the
+            # work is real and not captured, so the task must stay in the queue.
+            (root / "module.py").write_text("value = 2\n", encoding="utf-8")
+            reactor = Reactor(
+                PrototypeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=root / "state.sqlite3", self_improvement_root=root),
+            )
+            self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
             self.assertEqual(reactor.store.connection.execute("SELECT status FROM tasks").fetchone()[0], "pending")
-            self.assertEqual(reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='uncaptured_changes'").fetchone()[0], 1)
+            row = reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='uncaptured_changes'").fetchone()
+            self.assertIsNotNone(row)
+            self.assertIs(json.loads(row[0])["dirty_worktree"], True)
+            reactor.close()
+
+    def test_prose_denial_in_changes_does_not_reopen_the_task(self) -> None:
+        class DenialProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                return ModelTurn(text=json.dumps({
+                    "status": "COMPLETED",
+                    "summary": "read-only investigation, nothing durable changed",
+                    "evidence": ["fixture tool result"],
+                    "actions": [],
+                    "changes": ["No durable code change: propose_self_improvement was not called this episode."],
+                    "tests": [],
+                    "blocker": "",
+                    "next_hypothesis": "",
+                }), usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reactor = Reactor(
+                DenialProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=root / "state.sqlite3", self_improvement_root=root),
+            )
+            self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
+            self.assertEqual(reactor.store.connection.execute("SELECT status FROM tasks").fetchone()[0], "completed")
+            self.assertEqual(reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='uncaptured_changes'").fetchone()[0], 0)
             reactor.close()
 
     def test_captured_changes_complete_the_task(self) -> None:
@@ -480,7 +669,9 @@ class CoreTests(unittest.TestCase):
             )
             try:
                 self.assertIn("propose_self_improvement", reactor.runner.tools)
-                self.assertIn("promote_self_improvement", reactor.runner.tools)
+                # Promotion is folded into propose_self_improvement; the separate
+                # promote tool was removed.
+                self.assertNotIn("promote_self_improvement", reactor.runner.tools)
             finally:
                 reactor.close()
 
@@ -555,6 +746,48 @@ class CoreTests(unittest.TestCase):
             )
             reactor.close()
 
+    def test_daily_maintenance_compacts_legacy_snapshots_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=root / "state.sqlite3", metrics_snapshot_enabled=False),
+            )
+            store = reactor.store
+            store.append_transcript("provider_request", {"messages": []}, "run-legacy")
+            rebuilt = store._snapshot_transcript("run-legacy")
+            events = [{"sequence": 1, "kind": "tool_result", "payload": {"ok": True}}]
+            legacy = json.dumps({"events": events, "transcript": rebuilt}, ensure_ascii=False, sort_keys=True)
+            store.connection.execute(
+                "INSERT INTO episode_snapshots(snapshot_id, run_id, first_sequence, last_sequence, payload_hash, payload, created_at) "
+                "VALUES ('legacy', 'run-legacy', 1, 1, 'old', ?, '2026-01-01T00:00:00Z')",
+                (legacy,),
+            )
+            store.connection.commit()
+
+            def compact_events() -> int:
+                return store.connection.execute(
+                    "SELECT COUNT(*) FROM event_log WHERE kind='history_compacted'"
+                ).fetchone()[0]
+
+            reactor._run_daily_maintenance()
+            stored = json.loads(
+                store.connection.execute(
+                    "SELECT payload FROM episode_snapshots WHERE run_id='run-legacy'"
+                ).fetchone()[0]
+            )
+            self.assertEqual(stored["transcript"], {"rebuilt_from": "transcript", "rows_at_freeze": len(rebuilt)})
+            self.assertEqual(stored["events"], events, "events are not rebuildable and must be untouched")
+            # The read path rebuilds the same projection the legacy row froze.
+            self.assertEqual(store.snapshot_episode("run-legacy")["transcript"], rebuilt)
+            self.assertEqual(compact_events(), 1)
+
+            reactor._run_daily_maintenance()
+            self.assertEqual(compact_events(), 1, "a second maintenance pass rewrites nothing and logs nothing")
+            self.assertEqual(store.snapshot_episode("run-legacy")["transcript"], rebuilt)
+            reactor.close()
+
     def test_memory_injection_respects_configured_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             class CaptureProvider(FakeProvider):
@@ -586,6 +819,71 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(memory[0]["items"]), 3)
             reactor.close()
 
+    def test_degraded_memory_loop_appends_a_durable_event(self) -> None:
+        class DegradedMemoryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                if self.calls == 2:
+                    return ModelTurn(
+                        text=json.dumps({"status": "COMPLETED", "summary": "finished the bounded episode", "evidence": ["fixture tool result"], "actions": [], "changes": [], "tests": [], "blocker": "", "next_hypothesis": ""}),
+                        usage_tokens=1,
+                    )
+                return ModelTurn(text="not valid json", usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                DegradedMemoryProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            self.assertEqual(reactor.tick("degraded-memory-test"), RunStatus.COMPLETED)
+            degraded = reactor.store.connection.execute(
+                "SELECT run_id, payload FROM event_log WHERE kind='memory_degraded'"
+            ).fetchone()
+            self.assertIsNotNone(degraded)
+            started = reactor.store.connection.execute("SELECT run_id FROM event_log WHERE kind='run_started' LIMIT 1").fetchone()
+            self.assertEqual(degraded["run_id"], started["run_id"])
+            self.assertTrue(json.loads(degraded["payload"])["error"])
+            finished = json.loads(
+                reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='memory_loop_finished'").fetchone()["payload"]
+            )
+            self.assertTrue(finished["degraded"])
+            reactor.close()
+
+    def test_healthy_memory_loop_has_no_degraded_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            self.assertEqual(reactor.tick("healthy-memory-test"), RunStatus.COMPLETED)
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='memory_degraded'").fetchone()[0],
+                0,
+            )
+            finished = json.loads(
+                reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='memory_loop_finished'").fetchone()["payload"]
+            )
+            self.assertFalse(finished["degraded"])
+            reactor.close()
+
+    def test_configured_memory_loop_timeout_reaches_the_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3", memory_loop_timeout_seconds=42.5),
+            )
+            self.assertEqual(reactor.memory_loop.timeout_seconds, 42.5)
+            self.assertEqual(reactor.memory_loop.budget.seconds, 42.5)
+            reactor.close()
+
     def test_memory_tool_is_registered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             reactor = Reactor(
@@ -594,4 +892,71 @@ class CoreTests(unittest.TestCase):
                 ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
             )
             self.assertIn("memory", reactor.runner.tools)
+            reactor.close()
+
+    def test_turn_shape_recorder_captures_scalars_not_reasoning_text(self) -> None:
+        class ShapeProvider:
+            name = "shape"
+            accepts_timeout_override = True
+
+            def __init__(self) -> None:
+                self.turn = ModelTurn(text="abc", reasoning_content="private thoughts", completion_tokens=9, finish_reason="length")
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                return self.turn
+
+        inner = ShapeProvider()
+        recorder = TurnShapeRecorder(inner)
+        self.assertIsNone(recorder.last_shape)
+        self.assertIs(recorder.complete([], max_tokens=1), inner.turn, "the wrapper is a pass-through")
+        self.assertEqual(
+            recorder.last_shape,
+            {"text_chars": 3, "reasoning_chars": len("private thoughts"), "completion_tokens": 9, "finish_reason": "length"},
+        )
+        self.assertNotIn("private thoughts", str(recorder.last_shape), "reasoning text is never captured")
+        # Unknown attributes keep the wrapped provider's capability contract.
+        self.assertTrue(recorder.accepts_timeout_override)
+        recorder.reset()
+        self.assertIsNone(recorder.last_shape)
+
+    def test_deferred_restart_is_not_persisted_as_a_provider_failure(self) -> None:
+        # `run_results.failure` is the fault ledger metrics read verbatim; a
+        # deferred restart is a control label on a COMPLETED run, not a fault.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reactor = Reactor(FakeProvider(), {"fixture_tool": FixtureTool()}, ReactorConfig(state_path=root / "state.sqlite3"))
+            crafted = AgentRunResult(
+                status=RunStatus.COMPLETED,
+                report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                steps=2,
+                usage_tokens=5,
+                failure="deferred restart",
+                control_action={"type": "restart_after_checkpoint", "commit": "abc1234"},
+            )
+            with patch.object(Reactor, "_success_criteria", return_value=[]), patch.object(reactor.runner, "run", return_value=crafted):
+                self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
+            failure = reactor.store.connection.execute("SELECT failure FROM run_results").fetchone()[0]
+            self.assertEqual(failure, "", "a COMPLETED deferred restart must not enter the fault ledger")
+            committed = json.loads(
+                reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='run_result_committed'").fetchone()[0]
+            )
+            self.assertEqual(committed["failure"], "deferred restart", "the event keeps the control label")
+            reactor.close()
+
+    def test_unverified_action_claims_need_an_instrument_phrase_and_no_ledger_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3"))
+            report = json.dumps({"summary": "sent the update", "actions": ["Sent the update via send_message_to_user."]})
+            findings = reactor._unverified_action_claims("run-1", report)
+            self.assertEqual([finding["tool"] for finding in findings], ["send_message_to_user"])
+            self.assertEqual(findings[0]["run_id"], "run-1")
+            # A ledger row for the tool clears the finding.
+            reactor.store.record_effect("run-1:0:call-send", "send_message_to_user", "h", {"ok": True}, "applied")
+            self.assertEqual(reactor._unverified_action_claims("run-1", report), [])
+            # A bare mention is not a claim; only the instrument phrase counts.
+            bare = json.dumps({"summary": "s", "actions": ["Consider send_message_to_user."]})
+            self.assertEqual(reactor._unverified_action_claims("run-2", bare), [])
+            # A malformed or non-report payload is not a claim.
+            self.assertEqual(reactor._unverified_action_claims("run-2", "not json"), [])
+            self.assertEqual(reactor._unverified_action_claims("run-2", json.dumps([1, 2])), [])
             reactor.close()

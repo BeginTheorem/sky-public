@@ -118,8 +118,14 @@ class FallbackProvider:
 
     def _log(self, event: str, payload: dict[str, object]) -> None:
         log.info("%s %s", event, payload)
-        if self.event_logger is not None:
+        if self.event_logger is None:
+            return
+        try:
             self.event_logger(event, payload)
+        except Exception:
+            # A diagnostic sink must never abort the provider ladder: the store
+            # can be momentarily unwritable or reached from a worker thread.
+            log.warning("provider event logger failed for %s", event, exc_info=True)
 
     def set_event_logger(self, logger: Callable[[str, dict[str, object]], None]) -> None:
         self.event_logger = logger
@@ -200,11 +206,13 @@ class FallbackProvider:
                 provider = candidate
                 break
             if provider is None:
-                # Every candidate is inside its cooldown. Name the blocked
-                # providers and the earliest recovery point, so the reason
-                # stays diagnosable and the caller backs off until the chain
-                # can answer again. The "all providers failed" substring is
-                # load-bearing for failure classification, so it stays.
+                # Every candidate is inside its cooldown. Breaking here used to
+                # raise "all providers failed after 0 strikes: " with an empty
+                # reason and the LATEST cooldown; name the blocked providers and
+                # the earliest recovery point instead, so the reason stays
+                # diagnosable and the caller backs off until the chain can
+                # actually answer again. The "all providers failed" substring is
+                # load-bearing for reactor failure classification, so it stays.
                 blocked = self._blocked_remaining()
                 cooling = "; ".join(f"{name}={seconds}s" for name, seconds in sorted(blocked.items()))
                 message = (
@@ -231,7 +239,18 @@ class FallbackProvider:
                 result = self._strike(provider, messages, max_tokens=max_tokens, tools=tools, timeout_seconds=rung)
                 model_seconds += max(0.0, time.monotonic() - strike_started)
                 result.model_seconds = model_seconds
-                self._log("fallback_selected", {"provider": name, "attempt": strike + 1})
+                # The planner's provider call passes through here and nowhere
+                # else, so its stop reason has to be recorded on this line: a
+                # reply cut off at the output ceiling leaves no other trace.
+                self._log(
+                    "fallback_selected",
+                    {
+                        "provider": name,
+                        "attempt": strike + 1,
+                        "completion_tokens": result.completion_tokens,
+                        "finish_reason": result.finish_reason,
+                    },
+                )
                 return result
             except ProviderError as exc:
                 failures.append(f"{name}[{exc.category}]: {exc}")
@@ -245,8 +264,23 @@ class FallbackProvider:
                     self._save_state()
                 else:
                     cooldown = 0.0
+                if exc.category == "invalid_response":
+                    # A malformed response is produced by ONE provider, so it is
+                    # provider-local, not chain-fatal: measured live, a single
+                    # "malformed streamed tool call" aborted an episode
+                    # whose other providers were never struck. Cool this
+                    # provider and keep the ladder going; if every provider
+                    # answers malformed, the loop still ends in the aggregate
+                    # "all providers failed" error below instead of retrying
+                    # forever. invalid_request and configuration stay fatal
+                    # because those describe a broken request, not a broken
+                    # provider.
+                    cooldown = max(cooldown, MIN_PROVIDER_COOLDOWN_SECONDS)
+                    blocked = self._blocked_until if self._blocked_until is not None else {}
+                    blocked[name] = time.time() + cooldown
+                    self._save_state()
                 self._log("fallback_failure", {"provider": name, "category": exc.category, "retryable": exc.retryable, "cooldown_seconds": cooldown, "attempt": strike + 1, "error": str(exc)[:500]})
-                if exc.category in {"invalid_request", "invalid_response", "configuration"} or not exc.retryable:
+                if exc.category in {"invalid_request", "configuration"} or (not exc.retryable and exc.category != "invalid_response"):
                     raise
             except Exception as exc:
                 failures.append(f"{name}[unexpected]: {exc}")

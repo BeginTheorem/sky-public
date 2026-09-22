@@ -1,4 +1,5 @@
 """Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import subprocess
@@ -61,7 +62,7 @@ class CoreTests(unittest.TestCase):
     def test_checkpoint_ignores_runtime_artifacts(self) -> None:
         cases = (
             {".deployed-commit": "abc123\n", ".deployment-refresh": "\n"},
-            {"inspirations/example-harness/.pytest-cache/marker": "generated\n"},
+            {"inspirations/agentos-mcp/.pytest-cache/marker": "generated\n"},
         )
         for artifacts in cases:
             with tempfile.TemporaryDirectory() as directory:

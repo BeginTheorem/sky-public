@@ -1,4 +1,5 @@
 """The on-demand memory tool: search, remember, forget, pin/unpin, correct."""
+
 from __future__ import annotations
 
 import tempfile
@@ -58,6 +59,60 @@ class MemoryToolTests(unittest.TestCase):
             found = tool.execute({"action": "search", "query": "reactor lifecycle"}, idempotency_key="s1")
             self.assertTrue(found["ok"], found)
             self.assertIn("the reactor owns lifecycle", [item["content"] for item in found["memories"]])
+            store.close()
+
+    def test_remember_attributes_the_run_from_the_effect_key(self) -> None:
+        """An in-run remember must not write source_run=NULL.
+
+        react.py builds the effect key as {run_id}:{step}:{call_id} and passes
+        it as idempotency_key; before this fix the tool dropped it and 51 of 53
+        live remember calls left a memory with no attributable run.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            if not _has(store, "remember_memory"):
+                self.skipTest("store.remember_memory not present yet")
+            tool = MemoryTool(store)
+            run_id = "11111111-2222-3333-4444-555555555555"
+            remembered = tool.execute(
+                {"action": "remember", "content": "attributed in-run memory", "kind": "fact"},
+                idempotency_key=f"{run_id}:7:abcdef",
+            )
+            self.assertTrue(remembered["ok"], remembered)
+            row = store.connection.execute(
+                "SELECT source_run FROM memories WHERE memory_id=?", (remembered["memory_id"],)
+            ).fetchone()
+            self.assertEqual(row["source_run"], run_id)
+            store.close()
+
+    def test_remember_falls_back_to_the_active_run_and_never_invents_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            if not _has(store, "remember_memory"):
+                self.skipTest("store.remember_memory not present yet")
+            tool = MemoryTool(store)
+            # No active run and an unparseable key: NULL, not an invented id.
+            injected = tool.execute(
+                {"action": "remember", "content": "unattributable memory", "kind": "fact"},
+                idempotency_key="not-a-run-key",
+            )
+            self.assertTrue(injected["ok"], injected)
+            row = store.connection.execute(
+                "SELECT source_run FROM memories WHERE memory_id=?", (injected["memory_id"],)
+            ).fetchone()
+            self.assertIsNone(row["source_run"])
+            # With an active run, the same unparseable key attributes to it.
+            store.connection.execute("UPDATE agent_state SET active_run_id='fallback-run'")
+            store.connection.commit()
+            fell_back = tool.execute(
+                {"action": "remember", "content": "fallback attributed memory", "kind": "fact"},
+                idempotency_key="not-a-run-key",
+            )
+            self.assertTrue(fell_back["ok"], fell_back)
+            row = store.connection.execute(
+                "SELECT source_run FROM memories WHERE memory_id=?", (fell_back["memory_id"],)
+            ).fetchone()
+            self.assertEqual(row["source_run"], "fallback-run")
             store.close()
 
     def test_search_limit_and_empty_query(self) -> None:

@@ -68,8 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _systemctl_action(action: str, services: list[str]) -> subprocess.CompletedProcess[str]:
-    # SKYNET_SYSTEMCTL is a test/ops override; when set the binary is invoked
-    # directly (no sudo) so a fake executable can be substituted.
+    # SKYNET_SYSTEMCTL is the same test/ops override the startup rollback script
+    # uses; when set it is invoked directly (no sudo) so a fake binary works.
     executable = os.getenv("SKYNET_SYSTEMCTL") or "systemctl"
     command = [executable, action, *services]
     if os.geteuid() != 0 and not os.getenv("SKYNET_SYSTEMCTL"):
@@ -308,7 +308,8 @@ def _stop_event() -> threading.Event:
 def _mcp_config() -> dict[str, list[str]]:
     """Build the MCP server map from SKYNET_MCP_<NAME>_COMMAND.
 
-    Any SKYNET_MCP_<NAME>_COMMAND registers a server, and
+    The four sensors used to be hardcoded keys, so adding one required editing
+    this file. Any SKYNET_MCP_<NAME>_COMMAND now registers a server, and
     SKYNET_MCP_<NAME>_DISABLED=1 removes one without touching the command.
     """
     prefix, suffix = "SKYNET_MCP_", "_COMMAND"
@@ -331,10 +332,10 @@ def _jsonl_drain_enabled() -> bool:
     """Whether the loop drains the outbox to a local jsonl file.
 
     Off by default: the Telegram drainer owns the queue, and two consumers
-    racing for the same lease can leave an alert written to the jsonl file
-    without ever being marked delivered, so it may go unseen. Operators can
-    still opt in with SKYNET_OUTBOX_JSONL=1, or use the explicit `skynet
-    deliver` command.
+    racing for the same lease meant an alert could be written to the jsonl file
+    and never marked delivered, so the owner never saw it and `alerts_pending`
+    lied. Operators can still opt in with SKYNET_OUTBOX_JSONL=1, or use the
+    explicit `skynet deliver` command.
     """
     return os.getenv("SKYNET_OUTBOX_JSONL", "false").strip().casefold() in {"1", "true", "yes", "on"}
 
@@ -593,6 +594,9 @@ def main() -> int:
         seconds=float(os.getenv("SKYNET_MAX_SECONDS", "3600")),
         output_tokens=int(os.getenv("SKYNET_OUTPUT_TOKENS", "8192")),
     ), memory_input_tokens=int(os.getenv("SKYNET_MEMORY_INPUT_TOKENS", "50000")),
+        memory_loop_timeout_seconds=float(os.getenv("SKYNET_MEMORY_LOOP_TIMEOUT", "300")),
+        planner_output_tokens=int(os.getenv("SKYNET_PLANNER_OUTPUT_TOKENS", "16384")),
+        run_progress_seconds=float(os.getenv("SKYNET_RUN_PROGRESS_SECONDS", "3600")),
         transcript_retention_runs=int(os.getenv("SKYNET_TRANSCRIPT_RETENTION_RUNS", "200")),
         task_giveup_failures=int(os.getenv("SKYNET_TASK_GIVEUP_FAILURES", "3")),
         restart_failure_limit=int(os.getenv("SKYNET_RESTART_FAILURE_LIMIT", "3")),
@@ -610,12 +614,14 @@ def main() -> int:
         external_seek_enabled=os.getenv("SKYNET_EXTERNAL_SEEK", "true").strip().casefold() not in {"0", "false", "no", "off"},
         external_seek_every_generations=int(os.getenv("SKYNET_EXTERNAL_SEEK_EVERY", "4")),
         external_seek_cooldown_seconds=float(os.getenv("SKYNET_EXTERNAL_SEEK_COOLDOWN", "3600")),
+        fallback_repeat_generations=int(os.getenv("SKYNET_FALLBACK_REPEAT_GENERATIONS", "4")),
         criterion_epoch_generations=int(os.getenv("SKYNET_CRITERION_EPOCH_GENERATIONS", "100")),
         archive_parent_k=int(os.getenv("SKYNET_ARCHIVE_PARENT_K", "2")),
         archive_parent_lambda=float(os.getenv("SKYNET_ARCHIVE_PARENT_LAMBDA", "10")),
         archive_parent_alpha0=float(os.getenv("SKYNET_ARCHIVE_PARENT_ALPHA0", "0.5")),
         max_active_goals=int(os.getenv("SKYNET_MAX_ACTIVE_GOALS", "8")),
-        event_retention_days=int(os.getenv("SKYNET_EVENT_RETENTION_DAYS", "30")))
+        event_retention_days=int(os.getenv("SKYNET_EVENT_RETENTION_DAYS", "30")),
+        effect_retention_days=int(os.getenv("SKYNET_EFFECT_RETENTION_DAYS", "30")))
     tools = cast(dict[str, Tool], default_tools())
     mcp_clients: list[MCPStdioClient] = []
     mcp_config = _mcp_config()
@@ -655,8 +661,22 @@ def main() -> int:
             except (OSError, sqlite3.OperationalError) as exc:
                 logging.getLogger("skynet.cli").warning("could not record MCP startup state: %s", exc)
     supervisor = Supervisor(provider, tools, config, root=args.root)
-    supervisor.reactor.set_self_improvement_restart(lambda: supervisor.restart_service(args.service))
-    supervisor.set_restart_callback(lambda: supervisor.restart_service(args.service))
+    # A promotion must restart every unit that imports this tree: the reactor
+    # and the Telegram control bot. Restarting only the reactor left the bot
+    # running stale code indefinitely.
+    #
+    # The reactor goes LAST, and that ordering is load-bearing. This callback
+    # runs inside the reactor's own process, so `systemctl restart` starts a
+    # stop job for whichever unit is named first: naming the reactor first
+    # killed the client before systemd handled the remaining jobs of the same
+    # transaction, and the bot was never restarted at all - it stayed the
+    # process started at 01:50:10 while the tree moved on to f0fb0486 at
+    # 02:09:39. Verified on throwaway transient units: reactor-first restarted
+    # the reactor three times and left the other unit untouched in three of
+    # three trials; other-unit-first restarted both units in three of three.
+    restart_units = [args.telegram_service, args.service]
+    supervisor.reactor.set_self_improvement_restart(lambda: supervisor.restart_service(restart_units))
+    supervisor.set_restart_callback(lambda: supervisor.restart_service(restart_units))
     supervisor.reactor.set_self_improvement_health(supervisor.health_check)
 
     # Install signal handling before startup recovery: a systemd stop during
@@ -733,7 +753,11 @@ def main() -> int:
                             # handler instead of unwinding the whole loop.
                             signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
                             try:
-                                status = supervisor.reactor.interrupt_stale_run(reason="watchdog_timeout", force=True)
+                                # A set stop event means SIGTERM/SIGINT, not the
+                                # SIGALRM stale-run watchdog: record the clean
+                                # owner stop and keep it out of the deviation mix.
+                                reason = "owner_stop" if stop_event.is_set() else "watchdog_timeout"
+                                status = supervisor.reactor.interrupt_stale_run(reason=reason, force=True)
                             finally:
                                 signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
                         finally:

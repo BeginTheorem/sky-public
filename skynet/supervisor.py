@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
@@ -10,13 +13,101 @@ from typing import cast
 from .checkpoints import CheckpointError, CheckpointManager
 from .lock import ProcessLock
 from .models import LifecycleState
+from .proposal_registry import sweep_environment_blocks
 from .provider import LLMProvider, Tool
-from .reactor import HEALTHY_LIFECYCLES, Reactor, ReactorConfig
+from .reactor import HEALTHY_LIFECYCLES, SAFETY_NET_FINGERPRINTS, Reactor, ReactorConfig
 from .recovery import RebootGuard
 from .rollback import consume_request
 from .self_improvement import SelfImprovementManager
 
 log = logging.getLogger("skynet.supervisor")
+
+
+def _client_first(services: list[str]) -> list[str]:
+    """Order units so the Telegram client is restarted before the reactor.
+
+    ``SKYNET_TELEGRAM_SERVICE`` is authoritative when set: the named unit is
+    moved first even if it does not contain ``telegram``. With the env var unset
+    the name match is the fallback, and an ambiguous candidate set (no unit looks
+    like a client, or several do) is logged rather than raised -- a restart must
+    still happen, and silently returning the reactor first is the stale-client
+    bug this ordering exists to prevent. Every other unit keeps its relative
+    order.
+    """
+    configured = os.getenv("SKYNET_TELEGRAM_SERVICE", "").strip()
+    if configured:
+        clients = [unit for unit in services if unit == configured]
+        if not clients:
+            log.warning(
+                "configured telegram service %s is not in the restart set %s; client-first ordering skipped",
+                configured,
+                services,
+            )
+    else:
+        clients = [unit for unit in services if "telegram" in unit.lower()]
+        if not clients:
+            log.warning(
+                "no telegram unit in the restart set %s and SKYNET_TELEGRAM_SERVICE is unset; "
+                "client-first ordering skipped",
+                services,
+            )
+        elif len(clients) > 1:
+            log.warning("ambiguous telegram client set %s; keeping the given order", clients)
+            return list(services)
+    others = [unit for unit in services if unit not in clients]
+    return clients + others
+
+
+def sync_deployed_commit(root: str | Path) -> bool:
+    """Point ``.deployed-commit`` at the commit the worktree is actually on.
+
+    ``scripts/deploy.sh`` and ``scripts/rollback.sh`` are the only writers, so
+    every other way HEAD moves -- an in-place self-improvement restart, a manual
+    pull, a checkout -- leaves the marker naming the last deployed commit while
+    the tree has moved on. The marker is observability, not a control input: it
+    is excluded from the checkpoint hash (``checkpoints.is_clean``) and nothing
+    reads it to decide behaviour, so repairing it at startup only makes "what is
+    deployed?" answerable from the tree itself.
+
+    Best-effort by construction: a non-git root, a git failure, or an
+    unwritable marker is logged and ignored, never fatal. Returns ``True`` when
+    the marker was rewritten, ``False`` when it was already current or could not
+    be read/written.
+    """
+    root_path = Path(root)
+    marker = root_path / ".deployed-commit"
+    if not (root_path / ".git").exists():
+        return False
+    try:
+        current = CheckpointManager(root_path).current_commit()
+    except CheckpointError as exc:
+        log.warning("deployed-commit sync skipped: %s", exc)
+        return False
+    if not current:
+        return False
+    try:
+        recorded = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        recorded = ""
+    if recorded == current:
+        return False
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=f".{marker.name}.", dir=root_path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(current + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, marker)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
+    except OSError as exc:
+        log.warning("deployed-commit sync failed: %s", exc)
+        return False
+    log.info("deployed-commit synced to %s", current)
+    return True
 
 
 class Supervisor:
@@ -38,9 +129,14 @@ class Supervisor:
 
         `seed` is idempotent and is the only writer of `area='roadmap'`, so it is
         the only place that can retire a task whose entry was deleted from
-        `ROADMAP_TASKS`. Seeding here converges the live state on the curated
-        list without an operator step, and a failure is logged rather than fatal
-        because the roadmap is scaffolding, not a precondition for running.
+        `ROADMAP_TASKS`. It used to run only from the manual `skynet handoff`
+        command, so a database that predates a curation change kept selecting
+        dropped work: at generation 172 the live table held 18 area='roadmap'
+        rows against 4 curated entries, and the planner selected a task whose
+        acceptance criterion was already met. Seeding here converges the live
+        state on the curated list without an operator step, and a failure is
+        logged rather than fatal because the roadmap is scaffolding, not a
+        precondition for running.
         """
         from .handoff import seed
 
@@ -61,11 +157,17 @@ class Supervisor:
             return
         self.lock.acquire()
         try:
-            self.reactor.store.runtime_log.write("supervisor_start", {"state_path": str(self.config.state_path)})
+            self.reactor.store.append_event("supervisor_start", {"state_path": str(self.config.state_path)})
             log.info("supervisor starting; recovering durable state")
-            # Startup performs no destructive filesystem work; a rollback
-            # request is executed by consume_request, which already refuses a
-            # commit that is not an ancestor of HEAD.
+            # The deployed marker is written only by deploy.sh/rollback.sh, so a
+            # tree that moved without them would report a stale commit. Repair
+            # it before any lifecycle work; it is best-effort and never fatal.
+            sync_deployed_commit(self.root)
+            # The runtime backup/release subsystem is gone: deploy shares one
+            # git history, and its restore could quarantine .git/, .venv/ and
+            # tests/ (P0-2). Startup performs no destructive filesystem work;
+            # a rollback request is executed by consume_request, which already
+            # refuses a commit that is not an ancestor of HEAD.
             rollback = consume_request(self.root)
             if rollback is not None:
                 self.reactor.store.append_event("rollback_request_executed", rollback)
@@ -81,21 +183,43 @@ class Supervisor:
                     if self._restart_callback is not None:
                         self._restart_callback()
             self.reactor.recover()
-            repaired = self.reactor.store.repair_status_consistency()
+            repaired = self.reactor.store.repair_status_consistency(exclude_fingerprints=SAFETY_NET_FINGERPRINTS)
             if repaired["hypotheses"] or repaired["tasks"]:
                 log.warning("repaired inconsistent task/hypothesis statuses: %s", repaired)
             backfilled = self.reactor.store.backfill_missing_run_results()
             if backfilled:
                 log.warning("backfilled %d run result rows", backfilled)
             self.reboot_guard.begin(Path(self.config.state_path).parent / "reboot-request.json")
-            reconciled = self.self_improvement.reconcile_awaiting_reboot()
-            if reconciled:
-                log.warning("reconciled previous self-improvement proposals: %s", reconciled)
-                self.reactor.store.append_event("improvement_proposals_reconciled", {"resolved": reconciled})
-            orphans = self.self_improvement.prune_orphan_worktrees()
-            if orphans:
-                log.warning("removed %d orphaned self-improvement worktrees", len(orphans))
-                self.reactor.store.append_event("improvement_worktrees_pruned", {"removed": orphans})
+            # Housekeeping below is best-effort. Each call touches an external
+            # file or git worktree, so an unwritable/corrupt proposals file or a
+            # broken worktree must not prevent the organism from starting at all;
+            # a failure is logged and startup continues.
+            try:
+                reconciled = self.self_improvement.reconcile_awaiting_reboot()
+                if reconciled:
+                    log.warning("reconciled previous self-improvement proposals: %s", reconciled)
+                    self.reactor.store.append_event("improvement_proposals_reconciled", {"resolved": reconciled})
+            except Exception:
+                log.exception("awaiting-reboot reconciliation failed; continuing")
+            # The retry guard stops retrying an environment-blocked change once
+            # its bounded ceiling is spent, but nothing wrote that outcome back:
+            # the record stayed blocked_by_environment, which is terminal to
+            # every other sweep, while the guard still read it as pending
+            # repair. Close those records at startup so the two agree.
+            try:
+                closed = sweep_environment_blocks(self.self_improvement.proposals_path)
+                if closed:
+                    log.warning("closed environment-blocked proposals: %s", closed)
+                    self.reactor.store.append_event("improvement_environment_blocks_resolved", {"resolved": closed})
+            except Exception:
+                log.exception("environment-block sweep failed; continuing")
+            try:
+                orphans = self.self_improvement.prune_orphan_worktrees()
+                if orphans:
+                    log.warning("removed %d orphaned self-improvement worktrees", len(orphans))
+                    self.reactor.store.append_event("improvement_worktrees_pruned", {"removed": orphans})
+            except Exception:
+                log.exception("orphan worktree pruning failed; continuing")
             self._started = True
         except BaseException:
             self.lock.release()
@@ -105,7 +229,8 @@ class Supervisor:
         request_path = Path(self.config.state_path).parent / "reboot-request.json"
         state = self.reactor.store.state()
         if request_path.exists() and not self.reboot_guard.path.exists() and state.active_run_id is None:
-            # A deferred restart may be missed. The request file is durable
+            # A deferred restart was missed (for example the watchdog killed the
+            # cycle after the promotion was merged). The request file is durable
             # and unconsumed, so the restart is retried here instead of waiting
             # for an unrelated future reboot.
             proposal_id, commit = self._read_request_identity(request_path)
@@ -145,8 +270,9 @@ class Supervisor:
             rollback_action = rollback
         elif self.reboot_guard.path.exists():
             def refuse_without_git(commit: str) -> None:
-                # No git worktree means no usable rollback commit. The refusal
-                # is recorded and nothing on disk is moved.
+                # No git worktree means no usable rollback commit. The runtime
+                # backup fallback used to quarantine unrelated files (P0-2);
+                # now the refusal is recorded and nothing on disk is moved.
                 self.reactor.store.append_event(
                     "rollback_refused",
                     {"commit": commit, "reason": "no git worktree to roll back"},
@@ -181,7 +307,7 @@ class Supervisor:
                         source="supervisor_reboot_rollback",
                     )
         if result.get("changed"):
-            self.reactor.store.runtime_log.write("reboot_observation", {"health": health, "result": result})
+            self.reactor.store.append_event("reboot_observation", {"health": health, "result": result})
             if result.get("completed") and isinstance(request, str):
                 self.reactor.store.reset_planning_context(
                     reason="self_improvement_accepted",
@@ -201,7 +327,7 @@ class Supervisor:
             return
         log.info("supervisor stopping")
         try:
-            self.reactor.store.runtime_log.write("supervisor_stop", {})
+            self.reactor.store.append_event("supervisor_stop", {})
         finally:
             self.reactor.close()
             self.lock.release()
@@ -220,11 +346,54 @@ class Supervisor:
             return "", ""
         return str(payload.get("proposal_id", "")), str(payload.get("commit", ""))
 
-    def restart_service(self, service: str) -> None:
-        """Request a restart of this service without invoking a shell."""
-        if not service or service != Path(service).name:
-            raise ValueError("service must be a unit name")
-        subprocess.Popen(["systemctl", "restart", service], close_fds=True)
+    def restart_service(self, service: str | list[str]) -> None:
+        """Request a restart of the given unit(s) without invoking a shell.
+
+        The Telegram control bot is a separate systemd unit that imports the
+        same tree, so a promotion only takes effect after *both* units restart.
+        Restarting one unit left the bot serving a stale module in memory: a
+        promoted POLL_TIMEOUT change was committed at 22:40 while the bot
+        process was still the one started at 17:33. Accepting a list keeps the
+        reboot path aligned with the CLI's own ``start``/``stop``/``reboot``,
+        which already act on the pair.
+
+        The client is ordered before the reactor inside this method, not at the
+        call site: ``systemctl restart a b`` starts the stop job for ``a`` first,
+        and this callback runs inside the reactor process, so naming the reactor
+        first killed the client before systemd handled the rest of the
+        transaction. The order was previously encoded only in ``cli.py``, so any
+        other caller could reintroduce the stale-client bug.
+        """
+        services = [service] if isinstance(service, str) else list(service)
+        if not services:
+            raise ValueError("at least one unit name is required")
+        for unit in services:
+            if not unit or unit != Path(unit).name:
+                raise ValueError("service must be a unit name")
+        services = _client_first(services)
+        self._record_restart_requested(services)
+        subprocess.Popen(["systemctl", "restart", *services], close_fds=True)
+
+    def _record_restart_requested(self, units: list[str]) -> None:
+        """Make a requested restart observable in the durable event log.
+
+        The failure path already wrote ``restart_failed``/``restart_escalated``,
+        but the success path wrote nothing, so "did the restart actually fire?"
+        had no answer in state: event_log held zero restart or promotion rows
+        across generations 9-10, and two episodes could not verify that a
+        promoted change had reached the Telegram bot process. Recording the
+        request here - at the single choke point every restart path goes
+        through - makes the answer a row instead of an inference. The write is
+        failure-tolerant: observability must never prevent the restart itself.
+        """
+        try:
+            with self.reactor.store.transaction():
+                self.reactor.store.append_event(
+                    "restart_requested",
+                    {"units": list(units), "pid": os.getpid(), "source": "supervisor"},
+                )
+        except Exception:
+            log.exception("could not record restart request for units=%s", units)
 
     def health_check(self, *, include_provider: bool = True) -> dict[str, object]:
         """Run cheap, side-effect-free checks at the process boundary.

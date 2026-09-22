@@ -208,6 +208,79 @@ class AcknowledgeInboxTool(Tool):
         return {"ok": True, "state": "closed", "decision": decision}
 
 
+class ReadInboxTool(Tool):
+    """Re-read the pending owner messages without closing anything.
+
+    ``acknowledge_inbox`` only closes a notification; a message carried by the
+    START ENVELOPE or delivered mid-episode scrolls out of context once the
+    transcript is compacted, and the model then has no way to re-read what the
+    owner asked. This tool is the read-only half of the pair: it returns the
+    currently pending ``user_message`` rows, oldest first, and never consumes
+    them. Closing stays an explicit, separate decision.
+    """
+
+    name = "read_inbox"
+    capability_kind = "read"
+
+    DEFAULT_LIMIT = 10
+    MAX_LIMIT = 20
+    MAX_TEXT_CHARS = 2_000
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+
+    @property
+    def schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": (
+                    "Read the owner messages that are still pending in the inbox (oldest first). "
+                    "Read-only: it never acknowledges or consumes a message, so the queue is unchanged. "
+                    "Use it to re-check what the owner asked and answer explicitly; close a message "
+                    "with acknowledge_inbox(event_id, decision) once you are done with it."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                            "description": "Maximum number of messages to return (default 10).",
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def execute(self, arguments: dict[str, Any], *, idempotency_key: str) -> dict[str, Any]:
+        del idempotency_key
+        try:
+            limit = int(arguments.get("limit", self.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIMIT
+        limit = max(1, min(limit, self.MAX_LIMIT))
+        messages: list[dict[str, Any]] = []
+        for event in self.store.pending_owner_messages(limit=limit):
+            payload = event.get("payload")
+            text = ""
+            if isinstance(payload, dict):
+                for key in ("text", "answer", "message"):
+                    candidate = payload.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        text = candidate.strip()
+                        break
+            messages.append({
+                "event_id": str(event.get("event_id", "")),
+                "text": text[: self.MAX_TEXT_CHARS],
+            })
+        return {"ok": True, "count": len(messages), "messages": messages}
+
+
 class SendMessageToUserTool(Tool):
     """Send the owner a message without expecting a reply."""
 

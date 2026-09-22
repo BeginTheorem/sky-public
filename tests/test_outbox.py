@@ -1,4 +1,3 @@
-
 import json
 import subprocess
 import tempfile
@@ -15,11 +14,6 @@ from skynet.outbox import (
 )
 from skynet.store import StateStore
 
-
-def _iso(seconds: float) -> str:
-    from datetime import UTC, datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 class FakeTransport:
     def __init__(self, *, failures=None, fail_always=False, rate_limit_once=None, error=None):
@@ -38,6 +32,7 @@ class FakeTransport:
             raise self.error
         self.sent.append(text)
 
+
 class FakeHTTP:
     def __init__(self, fail_call=None):
         self.calls = []
@@ -49,16 +44,18 @@ class FakeHTTP:
             raise RuntimeError("boom")
         return {"ok": True, "result": True}
 
+
 def _seed_ordered(store, count, kind="agent_response"):
     ids = []
     for index in range(count):
         message_id = store.add_outbox(kind, {"run_id": f"r{index}", "status": "completed", "report": "{}"})
         store.connection.execute(
             "UPDATE outbox SET created_at=? WHERE message_id=?",
-            (_iso(float(index)), message_id),
+            (f"2020-01-01T00:00:{index:02d}Z", message_id),
         )
         ids.append(message_id)
     return ids
+
 
 class OutboxDrainerTests(unittest.TestCase):
     def test_agent_response_is_rendered_delivered_and_marked(self):
@@ -222,6 +219,7 @@ class OutboxDrainerTests(unittest.TestCase):
         self.assertLessEqual(len(raw), 600)
         self.assertIn("/logs", raw)
 
+
 class AlertScriptTests(unittest.TestCase):
     SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "alert.sh"
 
@@ -253,8 +251,8 @@ class AlertScriptTests(unittest.TestCase):
             curl.chmod(0o755)
             env = {
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
-                "SKYNET_TELEGRAM_BOT_TOKEN": "0:test-token",
-                "SKYNET_TELEGRAM_CHAT_ID": "0",
+                "SKYNET_TELEGRAM_BOT_TOKEN": "123:secret",
+                "SKYNET_TELEGRAM_CHAT_ID": "42",
             }
             result = subprocess.run(["bash", str(self.SCRIPT), "skynet.service", "unit failed"], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0)
@@ -263,12 +261,12 @@ class AlertScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             env, record = self._fake_curl_env(
                 Path(directory),
-                {"SKYNET_TELEGRAM_BOT_TOKEN": "0:test-token", "SKYNET_TELEGRAM_CHAT_ID": "0"},
+                {"SKYNET_TELEGRAM_BOT_TOKEN": "123456:SUPERSECRETTOKEN", "SKYNET_TELEGRAM_CHAT_ID": "42"},
             )
             result = subprocess.run(["bash", str(self.SCRIPT), "skynet.service", "unit failed"], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0)
             argv = record.read_text(encoding="utf-8") if record.exists() else ""
-            self.assertNotIn("test-token", argv)
+            self.assertNotIn("SUPERSECRETTOKEN", argv)
 
     def test_script_has_no_home_default_and_parses(self):
         text = self.SCRIPT.read_text(encoding="utf-8")
@@ -276,16 +274,18 @@ class AlertScriptTests(unittest.TestCase):
         result = subprocess.run(["bash", "-n", str(self.SCRIPT)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
 
+
 class SystemdUnitsTests(unittest.TestCase):
     ROOT = Path(__file__).resolve().parent.parent
 
     def test_failure_alert_is_wired_and_oneshot(self):
-        for name in ("skynet.service", "skynet-telegram.service"):
+        for name in ("skynet.service.in", "skynet-telegram.service.in"):
             text = (self.ROOT / "deploy" / name).read_text(encoding="utf-8")
             self.assertIn("OnFailure=skynet-alert@%n.service", text)
-        alert = (self.ROOT / "deploy" / "skynet-alert@.service").read_text(encoding="utf-8")
+        alert = (self.ROOT / "deploy" / "skynet-alert@.service.in").read_text(encoding="utf-8")
         self.assertIn("Type=oneshot", alert)
         self.assertIn("scripts/alert.sh %i", alert)
+
 
 if __name__ == "__main__":
     unittest.main()

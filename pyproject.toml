@@ -16,15 +16,19 @@ skynet = "skynet.cli:main"
 skynet-telegram = "skynet.telegram_bot:main"
 
 [project.optional-dependencies]
-# The self-improvement gate runs these; pyright is pinned so all consumers of
-# the gate use the same version. mypy is deliberately absent: pyright is the
-# single type authority, and keeping two checkers meant two baselines to
-# maintain.
+# The self-improvement gate runs these; pyright is pinned to the version the
+# editor's language server uses so a proposal cannot pass the gate and fail the
+# editor (or the reverse). mypy is deliberately absent: pyright is the single
+# type authority, and keeping two checkers meant two baselines to maintain.
 dev = [
     "pyright==1.1.413",
     "ruff>=0.16",
     "pytest>=8",
     "coverage>=7",
+    # Structural mirror exposed to the model as the read-only `structure` tool:
+    # clones, cyclomatic complexity, dead code and coupling that ruff/pyright/
+    # pytest do not see. MIT; ships a platform wheel and runs on 3.13 and 3.14.
+    "pyscn>=1.32",
 ]
 
 [tool.setuptools.packages.find]
@@ -59,7 +63,7 @@ ignore = [
     "TRY003",   # rich exception messages are the provider/gate contract
     "TRY300",   # moving the last statement into an else block is a style call
     "TRY301",   # hoisting a validation raise into a helper hurts readability here
-    "RUF001",   # Russian text in user-facing strings is intentional
+    "RUF001",   # Russian text in owner-facing strings is intentional
 ]
 
 [tool.ruff.lint.per-file-ignores]

@@ -80,12 +80,11 @@ class MemoryTool(Tool):
         }
 
     def execute(self, arguments: dict[str, Any], *, idempotency_key: str) -> dict[str, Any]:
-        del idempotency_key
         action = str(arguments.get("action", "")).strip()
         if action == "search":
             return self._search(arguments)
         if action == "remember":
-            return self._remember(arguments)
+            return self._remember(arguments, idempotency_key=idempotency_key)
         if action == "forget":
             return self._forget(arguments)
         if action in {"pin", "unpin"}:
@@ -118,7 +117,7 @@ class MemoryTool(Tool):
             return {"ok": False, "error": f"search_memories failed: {exc}"}
         return {"ok": True, "memories": list(memories)}
 
-    def _remember(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _remember(self, arguments: dict[str, Any], *, idempotency_key: str = "") -> dict[str, Any]:
         content = str(arguments.get("content", "")).strip()
         if not content:
             return {"ok": False, "error": "content must not be empty"}
@@ -133,9 +132,14 @@ class MemoryTool(Tool):
             high=1.0,
         )
         pinned = self._as_bool(arguments.get("pinned", False))
+        run_id, _step = _run_context_from_effect_key(self.store, idempotency_key)
+        if not self._supports_source_run():
+            # Mid-integration: the store cannot attribute the run yet, so the
+            # memory is written unattributed rather than failing the call.
+            run_id = None
         try:
             memory_id = self.store.remember_memory(
-                content[: self.MAX_CONTENT_CHARS], kind=kind, confidence=confidence, pinned=pinned
+                content[: self.MAX_CONTENT_CHARS], kind=kind, confidence=confidence, pinned=pinned, source_run=run_id
             )
         except Exception as exc:
             return {"ok": False, "error": f"remember_memory failed: {exc}"}
@@ -198,6 +202,16 @@ class MemoryTool(Tool):
             return True
         return any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
 
+    def _supports_source_run(self) -> bool:
+        """Whether the store's ``remember_memory`` accepts run attribution."""
+        try:
+            parameters = inspect.signature(self.store.remember_memory).parameters
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if "source_run" in parameters:
+            return True
+        return any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+
     def _missing(self, method: str) -> dict[str, Any] | None:
         """Report a store that does not expose the method instead of crashing."""
         if not callable(getattr(self.store, method, None)):
@@ -229,3 +243,27 @@ class MemoryTool(Tool):
         if value is None:
             return default
         return bool(value)
+
+def _run_context_from_effect_key(store: StateStore, idempotency_key: str) -> tuple[str | None, int | None]:
+    """Resolve the run id and ReAct step of the call owning this effect key.
+
+    ``react.py`` builds the effect key as ``{run_id}:{step}:{call_id}`` and
+    passes it as ``idempotency_key``. The prefix is the authoritative run id;
+    ``active_run_id`` is the fallback so a call made outside that exact shape
+    still attributes the memory instead of silently writing ``source_run=NULL``.
+    """
+    run_id: str | None = None
+    step_index: int | None = None
+    parts = idempotency_key.split(":")
+    if len(parts) == 3:
+        run_id = parts[0] or None
+        try:
+            step_index = int(parts[1])
+        except ValueError:
+            step_index = None
+    if run_id is None:
+        try:
+            run_id = store.state().active_run_id
+        except Exception:
+            run_id = None
+    return run_id, step_index

@@ -1,13 +1,13 @@
 """Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import json
 import tempfile
 import threading
 import unittest
-from datetime import UTC
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock
 
 from helpers import FakeProvider
@@ -18,11 +18,6 @@ from skynet.planner import PortfolioPlanner, hypothesis_fingerprint, structural_
 from skynet.reactor import Reactor, ReactorConfig
 from skynet.store import StateStore
 
-
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 class CoreTests(unittest.TestCase):
     def test_planner_bounding_preserves_valid_json(self) -> None:
@@ -109,11 +104,18 @@ class CoreTests(unittest.TestCase):
             self.assertIsNotNone(first_id)
             # A pending fallback is reused, never duplicated.
             self.assertEqual(reactor._create_planner_fallback(goals, generation=2), first_id)
-            # Once it finishes, an empty portfolio must yield a fresh fallback
-            # instead of parking the organism in sleep.
             reactor.store.connection.execute("UPDATE tasks SET status='completed' WHERE task_id=?", (first_id,))
             reactor.store.connection.commit()
-            second_id = reactor._create_planner_fallback(goals, generation=3)
+            # Inside the repeat window the same template is not recreated, so a
+            # broken planner cannot mint the same diagnostic every cycle.
+            self.assertIsNone(reactor._create_planner_fallback(goals, generation=3))
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_fallback_capped'").fetchone()[0],
+                1,
+            )
+            # Once the window elapses, an empty portfolio must yield a fresh
+            # fallback instead of parking the organism in sleep.
+            second_id = reactor._create_planner_fallback(goals, generation=5)
             self.assertIsNotNone(second_id)
             self.assertNotEqual(second_id, first_id)
             pending = reactor.store.connection.execute(
@@ -121,6 +123,16 @@ class CoreTests(unittest.TestCase):
                 (goal_id,),
             ).fetchone()[0]
             self.assertEqual(pending, 1)
+            # The display title changes, but the fingerprint is the stable
+            # template identity so the dedup can fire.
+            rows = reactor.store.connection.execute(
+                "SELECT hypothesis_fingerprint, structural_fingerprint FROM tasks "
+                "WHERE goal_id=? AND title LIKE 'Diagnose one concrete SkyNet bottleneck%' ORDER BY created_at",
+                (goal_id,),
+            ).fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["hypothesis_fingerprint"], rows[1]["hypothesis_fingerprint"])
+            self.assertEqual(rows[0]["structural_fingerprint"], rows[1]["structural_fingerprint"])
             reactor.close()
     def test_planner_limits_candidates_and_records_novelty_decision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -190,6 +202,7 @@ class CoreTests(unittest.TestCase):
             release.set()
             store.close()
 
+
 class FingerprintPlannerProvider:
     """Returns one deterministic proposal so dedup liveness is observable."""
 
@@ -218,6 +231,7 @@ class FingerprintPlannerProvider:
             "scope": list(self.scope),
             "kind": self.kind,
         }]}), usage_tokens=1)
+
 
 class DedupLivenessTests(unittest.TestCase):
     def test_cancelled_task_fingerprint_is_proposable_again(self) -> None:
@@ -317,6 +331,7 @@ class DedupLivenessTests(unittest.TestCase):
             self.assertEqual(cast(dict, selected)["task"]["task_id"], fresh)
             store.close()
 
+
 class GoalProposalProvider:
     """Returns one bounded goal proposal so the harness-owned goal path is testable."""
 
@@ -338,12 +353,14 @@ class GoalProposalProvider:
             }],
         }), usage_tokens=1)
 
+
 class InvalidGoalProposalProvider:
     def complete(self, messages, *, max_tokens, tools=()):
         return ModelTurn(text=json.dumps({
             "proposals": [],
             "goal_proposals": [{"title": "", "problem": "x", "expected_behavior": "y", "validation": "z"}],
         }), usage_tokens=1)
+
 
 class PortfolioAreaTests(unittest.TestCase):
     def _store(self, directory: str) -> StateStore:
@@ -377,7 +394,7 @@ class PortfolioAreaTests(unittest.TestCase):
             # always finds nothing.
             store.connection.execute(
                 "UPDATE hypotheses SET updated_at=? WHERE fingerprint='fp-ttl'",
-                (_iso(0.0),),
+                ("2020-01-01T00:00:00Z",),
             )
             self.assertEqual(len(PortfolioPlanner(store, hypothesis_ttl_days=30.0).rank()), 1)
             store.close()
@@ -505,3 +522,236 @@ class PortfolioAreaTests(unittest.TestCase):
         assert accepted is not None
         self.assertEqual(accepted["title"], "bounded goal")
         self.assertEqual(accepted["priority"], 0.5)
+
+
+def _valid_proposal(goal_id: str, *, kind: str = "engineering") -> dict[str, Any]:
+    return {
+        "goal_id": goal_id,
+        "title": "bounded probe",
+        "problem": "a bounded problem",
+        "hypothesis": "the probe is observable",
+        "expected_new_fact": "the probe yields one fact",
+        "validation": "run the probe and assert the recorded result",
+        "scope": ["skynet/planner.py"],
+        "kind": kind,
+    }
+
+
+class PlannerParseContractTests(unittest.TestCase):
+    """The planner must accept what the model actually emits."""
+
+    def test_bare_object_is_accepted(self) -> None:
+        self.assertEqual(AutonomousPlanner._parse(json.dumps({"proposals": []})), {"proposals": []})
+
+    def test_top_level_array_is_normalized_into_proposals(self) -> None:
+        proposal = _valid_proposal("g")
+        parsed = AutonomousPlanner._parse(json.dumps([proposal]))
+        self.assertEqual(parsed, {"proposals": [proposal]})
+
+    def test_fenced_object_with_prose_is_accepted(self) -> None:
+        text = "Here is the plan:\n```json\n" + json.dumps({"proposals": []}) + "\n```\nDone."
+        self.assertEqual(AutonomousPlanner._parse(text), {"proposals": []})
+
+    def test_fenced_array_with_prose_is_accepted(self) -> None:
+        proposal = _valid_proposal("g")
+        text = "Answer:\n```json\n" + json.dumps([proposal]) + "\n```"
+        self.assertEqual(AutonomousPlanner._parse(text), {"proposals": [proposal]})
+
+    def test_garbage_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            AutonomousPlanner._parse("I could not decide what to do.")
+
+    def test_scalar_is_rejected(self) -> None:
+        for text in ("42", '"done"', "true", "null"):
+            with self.assertRaises(ValueError):
+                AutonomousPlanner._parse(text)
+
+    def test_invalid_enum_kind_is_rejected(self) -> None:
+        proposal = _valid_proposal("g", kind="bogus")
+        with self.assertRaises(ValueError):
+            AutonomousPlanner._parse(json.dumps({"proposals": [proposal]}))
+
+    def test_third_proposal_with_invalid_kind_is_rejected(self) -> None:
+        proposals = [
+            _valid_proposal("g"),
+            _valid_proposal("g"),
+            _valid_proposal("g", kind="bogus"),
+        ]
+        with self.assertRaises(ValueError):
+            AutonomousPlanner._parse(json.dumps({"proposals": proposals}))
+
+    def test_generate_accepts_a_top_level_array_reply(self) -> None:
+        class ArrayProvider:
+            def __init__(self, goal_id: str) -> None:
+                self.goal_id = goal_id
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=json.dumps([_valid_proposal(self.goal_id)]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("array goal", priority=1.0)
+            goals, _ = store.active_work()
+            planner = AutonomousPlanner(ArrayProvider(goal_id), store, timeout_seconds=1000.0)
+            created = planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="array")
+            self.assertEqual(len(created), 1)
+            self.assertEqual(planner.last_status, "completed")
+            store.close()
+
+
+class PlannerRetryTests(unittest.TestCase):
+    """A parse failure is retried exactly once, never looped."""
+
+    def test_retry_fires_exactly_once_and_repairs(self) -> None:
+        class RepairingProvider:
+            def __init__(self, goal_id: str) -> None:
+                self.goal_id = goal_id
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(text="not json")
+                return ModelTurn(text=json.dumps({"proposals": [_valid_proposal(self.goal_id)]}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("retry goal", priority=1.0)
+            goals, _ = store.active_work()
+            provider = RepairingProvider(goal_id)
+            planner = AutonomousPlanner(provider, store, timeout_seconds=1000.0)
+            created = planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="retry")
+            self.assertEqual(provider.calls, 2)
+            self.assertEqual(len(created), 1)
+            self.assertEqual(planner.last_status, "completed")
+            self.assertEqual(store.connection.execute("SELECT failure FROM planner_attempts").fetchone()[0], "repaired_after_retry")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_retry'").fetchone()[0], 1)
+            store.close()
+
+    def test_retry_is_capped_at_one(self) -> None:
+        class GarbageProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                return ModelTurn(text="still not json")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.add_goal("retry goal", priority=1.0)
+            goals, _ = store.active_work()
+            provider = GarbageProvider()
+            planner = AutonomousPlanner(provider, store, timeout_seconds=1000.0)
+            created = planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="retry")
+            self.assertEqual(created, [])
+            self.assertEqual(provider.calls, 2)
+            self.assertEqual(planner.last_status, "invalid_response")
+            self.assertEqual(store.connection.execute("SELECT status FROM planner_attempts").fetchone()[0], "invalid_response")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_invalid_response'").fetchone()[0], 1)
+            store.close()
+
+
+class PlannerTruncationTests(unittest.TestCase):
+    """A reply cut off at the output ceiling is not a malformed reply."""
+
+    def test_truncated_reply_is_recorded_as_its_own_cause(self) -> None:
+        class TruncatedProvider:
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text="", finish_reason="length", reasoning_content="x" * 100)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.add_goal("truncated goal", priority=1.0)
+            goals, _ = store.active_work()
+            planner = AutonomousPlanner(TruncatedProvider(), store, timeout_seconds=1000.0)
+            created = planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="truncated")
+            self.assertEqual(created, [])
+            self.assertEqual(planner.last_status, "output_truncated")
+            self.assertEqual(store.connection.execute("SELECT status FROM planner_attempts").fetchone()[0], "output_truncated")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_output_truncated'").fetchone()[0], 1)
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_invalid_response'").fetchone()[0], 0)
+            store.close()
+
+    def test_retry_reuses_the_same_raised_output_budget(self) -> None:
+        class RecordingProvider:
+            def __init__(self) -> None:
+                self.limits: list[int] = []
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.limits.append(max_tokens)
+                return ModelTurn(text="not json")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.add_goal("retry goal", priority=1.0)
+            goals, _ = store.active_work()
+            provider = RecordingProvider()
+            planner = AutonomousPlanner(provider, store, output_tokens=16_384, timeout_seconds=1000.0)
+            planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="retry")
+            self.assertEqual(provider.limits, [16_384, 16_384])
+            store.close()
+
+
+class PlannerFailureVisibilityTests(unittest.TestCase):
+    """A planner crash is not the same decision as an empty portfolio."""
+
+    def test_parse_failure_records_a_distinct_decision_reason(self) -> None:
+        class GarbageProvider:
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text="not json")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = StateStore(path)
+            goal_id = store.add_goal("blocked autonomous work", priority=1.0)
+            blocked = store.add_task("blocked task", goal_id)
+            store.connection.execute("UPDATE tasks SET status='blocked' WHERE task_id=?", (blocked,))
+            store.connection.commit()
+            store.close()
+
+            reactor = Reactor(GarbageProvider(), {}, ReactorConfig(state_path=path))
+            reactor.tick("timer")
+            reasons = [row["reason"] for row in reactor.store.connection.execute("SELECT reason FROM planner_decisions").fetchall()]
+            self.assertEqual(reasons, ["planner_invalid_response"])
+            reactor.close()
+
+    def test_truncated_failure_records_a_distinct_decision_reason(self) -> None:
+        class TruncatedProvider:
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text="", finish_reason="length")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = StateStore(path)
+            goal_id = store.add_goal("blocked autonomous work", priority=1.0)
+            blocked = store.add_task("blocked task", goal_id)
+            store.connection.execute("UPDATE tasks SET status='blocked' WHERE task_id=?", (blocked,))
+            store.connection.commit()
+            store.close()
+
+            reactor = Reactor(TruncatedProvider(), {}, ReactorConfig(state_path=path))
+            reactor.tick("timer")
+            reasons = [row["reason"] for row in reactor.store.connection.execute("SELECT reason FROM planner_decisions").fetchall()]
+            self.assertEqual(reasons, ["planner_output_truncated"])
+            reactor.close()
+
+    def test_empty_proposals_records_no_novel_work(self) -> None:
+        class EmptyProvider:
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=json.dumps({"proposals": []}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = StateStore(path)
+            goal_id = store.add_goal("blocked autonomous work", priority=1.0)
+            blocked = store.add_task("blocked task", goal_id)
+            store.connection.execute("UPDATE tasks SET status='blocked' WHERE task_id=?", (blocked,))
+            store.connection.commit()
+            store.close()
+
+            reactor = Reactor(EmptyProvider(), {}, ReactorConfig(state_path=path))
+            reactor.tick("timer")
+            reasons = [row["reason"] for row in reactor.store.connection.execute("SELECT reason FROM planner_decisions").fetchall()]
+            self.assertEqual(reasons, ["no novel work"])
+            reactor.close()

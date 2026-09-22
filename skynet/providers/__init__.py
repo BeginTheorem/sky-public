@@ -168,7 +168,10 @@ def _enabled(name: str, default: bool) -> bool:
 
 # Canonical enable flag per provider, shared by build_provider() and
 # active_chain_names(). Legacy aliases are accepted so an existing
-# config/skynet.env keeps working; the canonical (first) name wins.
+# config/skynet.env keeps working; the canonical (first) name wins. Before this
+# map the constructor read DEEPSEEK_ENABLED / NVIDIA_ENABLED while the
+# hot-reload filter read NVIDIA_DEEPSEEK_ENABLED / NEMOTRON_ENABLED, so toggling
+# the documented knob at runtime did nothing.
 _ENABLE_FLAGS: dict[str, tuple[str, ...]] = {
     "ollama": ("OLLAMA_ENABLED",),
     "ollama_cloud": ("OLLAMA_ENABLED",),

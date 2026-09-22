@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -17,29 +18,160 @@ from typing import Any
 
 from . import metrics
 from .autonomous_planner import AutonomousPlanner
-from .dialogue import AcknowledgeInboxTool, AskUserTool, SendMessageToUserTool
+from .dialogue import AcknowledgeInboxTool, AskUserTool, ReadInboxTool, SendMessageToUserTool
+from .judge_health import DEFAULT_COOLDOWN_SECONDS, DEFAULT_MIN_SAMPLES, DEFAULT_THRESHOLD, DEFAULT_WINDOW, check_judge_health, restart_boundary
 from .memory import MemoryLoop, MemoryResult
+from .memory_store import MemoryStore
 from .memory_tool import MemoryTool
 from .model_contracts import SYSTEM, SYSTEM_MEMORY, SYSTEM_REACT
-from .models import AgentState, Budget, LifecycleState, RunRecord, RunStatus, StartEnvelope
-from .planner import PortfolioPlanner
-from .provider import LLMProvider, Tool
+from .models import AgentState, Budget, LifecycleState, ModelTurn, RunRecord, RunStatus, StartEnvelope
+from .plan_tool import PLAN_OBSERVATION_EVENT_KIND, RecordPlanTool, latest_recorded_plan, plan_preceded_first_mutation
+from .planner import PortfolioPlanner, hypothesis_fingerprint, structural_fingerprint
+from .provider import LLMProvider, Message, Tool, ToolSchema
 from .react import ReActConfig, ReActRunner
 from .rollback import RollbackRequestTool
-from .self_improvement import PromoteSelfImprovementTool, SelfImprovementManager, SelfImprovementTool
+from .self_improvement import SelfImprovementManager, SelfImprovementTool
 from .store import StateStore
 from .time import utc_datetime_now, utc_now
 
 log = logging.getLogger("skynet.reactor")
 
 SOUL_BLOCK_MARKER = "\n\n[SKYNET SOUL BEGIN]\n"
+SENSES_BLOCK_MARKER = "\n\n[SKYNET SENSES BEGIN]\n"
+WORKSPACE_BLOCK_MARKER = "\n\n[SKYNET WORKSPACE BEGIN]\n"
+
+
+def mcp_senses_line(tools: Mapping[str, Tool]) -> str:
+    """Name every configured MCP sense and its exact tools from the live map.
+
+    The prompt must enumerate the senses explicitly -- a generic "schemas are
+    runtime-provided" phrasing left the model ignoring them -- but a second
+    hardcoded copy drifts whenever a server's toolset changes. Building the list
+    from the discovered tools keeps the enumeration explicit and honest.
+    """
+    servers: dict[str, set[str]] = {}
+    for tool in tools.values():
+        client = getattr(tool, "client", None)
+        server = str(getattr(client, "server_name", "") or "")
+        if not server:
+            continue
+        remote = str(getattr(tool, "remote_name", "") or getattr(tool, "name", ""))
+        if remote:
+            servers.setdefault(server, set()).add(remote)
+    if not servers:
+        return ""
+    return "SENSES: " + "; ".join(
+        f"{name} ({', '.join(sorted(servers[name]))})" for name in sorted(servers)
+    )
+
 
 REACT_LOOP_ROLE_SUFFIX = "You are the bounded Agent Run. The harness owns lifecycle and durable state."
+
+# A1-lite plan artifact: the model records a brief plan before its first durable
+# change, and the next cycle's StartEnvelope carries it. This is instrumentation,
+# not enforcement -- a missing plan never blocks, fails or downgrades a run
+# (AGENTS.md: the success criterion is procedural; there is no numeric benchmark
+# to reward-hack). Kept to two sentences.
+# Tools that always leave a `capability_effects` row (`react.py:398` records one
+# per executed call). A Finish Report `actions` entry naming one of these as the
+# instrument of the action, with no row for the run, is a contradicted claim and
+# not a summary style choice -- measured on 2026-09-21: run 6c5567e5 claimed
+# send_message_to_user with zero ledger rows while every truthful claim had one.
+UNVERIFIED_CLAIM_TOOLS = frozenset({
+    "send_message_to_user",
+    "acknowledge_inbox",
+    "ask_user",
+    "propose_self_improvement",
+})
+UNVERIFIED_CLAIM_PATTERNS = {
+    tool: re.compile(rf"\b(?:via|through|using|with)\s+{re.escape(tool)}\b", re.IGNORECASE)
+    for tool in UNVERIFIED_CLAIM_TOOLS
+}
+
+# A Finish Report `changes` entry is a claim about the repository only when it
+# names a path with a slash and a file extension. The schema allows arbitrary
+# strings and the ReAct instruction tells the model NOT to list scratch
+# prototypes, so prose like "No durable code change: propose_self_improvement
+# was not called" is a denial, not a claim. Measured 2026-09-21: all four live
+# `uncaptured_changes` events were exactly such prose denials and two finished
+# tasks were reopened for them.
+_REPO_PATH_PATTERN = re.compile(r"(?:^|[\s(])(/?(?:[\w.-]+/)+[\w.-]+\.[A-Za-z0-9]+)(?::\d+)?")
+
+
+def _is_scratch_path(path: str) -> bool:
+    scratch = (os.getenv("SKYNET_SCRATCH_DIR", "/tmp/skynet-scratch").strip() or "/tmp/skynet-scratch").rstrip("/")
+    return path == scratch or path.startswith((scratch + "/", "/tmp/"))
+
+PLAN_INSTRUCTION = (
+    "\n\nPLAN ARTIFACT: Before your first change to durable state in a run (a "
+    "self-improvement proposal, a rollback, or a memory write), call `record_plan` "
+    "with a brief plan and optional intended steps. Read-only investigation needs "
+    "no plan, and a missing plan never blocks or fails the run."
+)
 
 HEALTHY_LIFECYCLES = frozenset({
     LifecycleState.BOOT, LifecycleState.RECOVER, LifecycleState.PLAN, LifecycleState.SLEEP,
     LifecycleState.START, LifecycleState.REACT, LifecycleState.CONSOLIDATE, LifecycleState.CHECKPOINT,
 })
+
+
+class TurnShapeRecorder:
+    """Record the shape of a model turn the planner is blind to.
+
+    The autonomous planner is the only model caller that kept no record of the
+    turn it received: skynet/react.py:748 writes ``reasoning_chars`` for the ReAct
+    loop and skynet/memory.py:150 writes ``text_chars``/``completion_tokens`` for
+    the memory loop, but the planner parses only ``turn.text``. Measured on the
+    live ledger 2026-09-21: attempts ff4de96e (generation 76) and 2352db7e both
+    ended in ``planner_invalid_response`` with "reply preview: '', 0 chars" for
+    the call AND its repair retry, and the post-mortem could not say whether the
+    model returned nothing or spent its tokens on the provider's reasoning
+    channel -- the exact blind spot 8c6c13fa closed for the ReAct loop.
+
+    The planner is gate-protected (``GATE_PROTECTED_PATHS``, asserted by
+    tests/test_planner_contract.py:93), so this sits at the seam it shares with
+    every other caller: the provider object. The wrapper is a pure pass-through
+    that returns the inner provider's ``ModelTurn`` untouched and captures only
+    the four scalar fields that describe its shape -- never the reasoning text.
+
+    It deliberately does NOT write to the store. The planner calls its provider
+    inside a worker thread (autonomous_planner.py:37-45) and skynet/store.py:549
+    opens sqlite3 without ``check_same_thread=False``, so a write from that
+    thread would raise; the shape is captured on the worker thread and emitted
+    by the calling thread after ``generate()`` returns, exactly as
+    skynet/memory.py already does.
+    """
+
+    def __init__(self, provider: LLMProvider) -> None:
+        self._provider = provider
+        self.last_shape: dict[str, Any] | None = None
+
+    def reset(self) -> None:
+        """Drop the previous shape so a call that never reaches the provider emits nothing."""
+        self.last_shape = None
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int,
+        tools: Sequence[ToolSchema] = (),
+    ) -> ModelTurn:
+        turn = self._provider.complete(messages, max_tokens=max_tokens, tools=tools)
+        self.last_shape = {
+            "text_chars": len(turn.text),
+            "reasoning_chars": len(turn.reasoning_content),
+            "completion_tokens": turn.completion_tokens,
+            "finish_reason": turn.finish_reason,
+        }
+        return turn
+
+    def __getattr__(self, name: str) -> Any:
+        # The fallback ladder reads optional provider capabilities
+        # (``accepts_timeout_override``, ``name``) off the object it is handed;
+        # delegating unknown attributes keeps the wrapped provider's own
+        # capability contract intact instead of silently dropping it.
+        return getattr(self._provider, name)
 
 
 class WatchdogTimeout(BaseException):
@@ -54,10 +186,34 @@ BOOTSTRAP_GOAL_TITLE = "Improve SkyNet's ability to understand, validate, and im
 
 BOOTSTRAP_TASK_TITLE = "Choose one concrete, non-repeated engineering bottleneck in SkyNet. Establish a measurable hypothesis, inspect only the relevant code and tests, and either validate a small improvement or record a justified blocker. Do not repeat unchanged administrative bootstrap checks, host reconnaissance, or a previous proposal."
 FALLBACK_TASK_TITLE = "Diagnose one concrete SkyNet bottleneck with a focused invariant or regression check, and record one verified fact or justified blocker."
+FALLBACK_EXPECTED_FACT = "A focused diagnostic establishes one verified fact or blocker"
 EXTERNAL_SEEK_TASK_TITLE = (
     "Consult one external source (arXiv, GitHub, or the open web) about a concrete SkyNet bottleneck, "
     "distil it into one bounded, testable improvement hypothesis, and record the citation."
 )
+EXTERNAL_SEEK_EXPECTED_FACT = (
+    "One memory entry cites a specific external source (arXiv id, repository URL, or page URL) "
+    "and states a bounded, testable improvement hypothesis derived from it; or the search is "
+    "recorded as yielding nothing applicable, with the queries used."
+)
+# Stable fingerprints for the two generic templates. The display title still
+# carries a generation suffix, but the fingerprint must not: a churning
+# fingerprint is why the same diagnostic could be recreated without limit.
+_FALLBACK_FINGERPRINTS = (
+    hypothesis_fingerprint(area="recovery", problem=FALLBACK_TASK_TITLE, expected_behavior=FALLBACK_EXPECTED_FACT),
+    structural_fingerprint(area="recovery", target=FALLBACK_TASK_TITLE, behavior_kind="recovery"),
+)
+_EXTERNAL_SEEK_FINGERPRINTS = (
+    hypothesis_fingerprint(area="research", problem=EXTERNAL_SEEK_TASK_TITLE, expected_behavior=EXTERNAL_SEEK_EXPECTED_FACT),
+    structural_fingerprint(area="research", target=EXTERNAL_SEEK_TASK_TITLE, behavior_kind="research"),
+)
+# Both templates are safety nets that stay pending with a terminal fingerprint
+# and are selected directly, so status repair must never cancel them. Exposed
+# publicly because the per-cycle repair (reactor) and the startup repair
+# (supervisor) both need the exclusions, and store must not import reactor.
+SAFETY_NET_FINGERPRINTS = _FALLBACK_FINGERPRINTS + _EXTERNAL_SEEK_FINGERPRINTS
+
+
 
 # An owner message is a notification the organism may act on, never an order and
 # never an auto-created task: see `_inbox_notifications` and `acknowledge_inbox`.
@@ -68,6 +224,21 @@ class ReactorConfig:
     system_prompt: str = SYSTEM
     budget: Budget = field(default_factory=Budget)
     memory_input_tokens: int = 50_000
+    # The Memory Loop runs after Finish, outside the ReAct episode budget, and a
+    # slow provider degrades it silently. 180s was hardcoded and too tight for a
+    # full episode prompt; the operator can widen it without a code change.
+    memory_loop_timeout_seconds: float = 300.0
+    # The autonomous planner's own output ceiling, deliberately separate from the
+    # ReAct ``Budget.output_tokens``. A hard ``min(4096, ...)`` at the planner
+    # construction site meant raising SKYNET_OUTPUT_TOKENS never helped it: the
+    # provider's reasoning channel consumed the whole 4096 and the reply carried
+    # no content, so decoding failed while ReAct and Memory had room to finish.
+    planner_output_tokens: int = 16_384
+    # A two-hour run leaves the owner channel silent until Finish. Emit a short
+    # factual progress note at most once per this interval of model time; 0
+    # disables it. The runner enforces the interval and the per-run cap, and this
+    # reactor is still the only writer of the owner outbox.
+    run_progress_seconds: float = 3600.0
     wake_interval_seconds: float = 60.0
     self_improvement_root: Path | str | None = None
     watchdog_timeout_seconds: float = 1800.0
@@ -99,6 +270,10 @@ class ReactorConfig:
     external_seek_enabled: bool = True
     external_seek_every_generations: int = 4
     external_seek_cooldown_seconds: float = 3600.0
+    # The bounded diagnostic fallback is a safety net, not the plan. Its title
+    # carries a generation suffix, so without a cap the same template was
+    # recreated every cycle; it may reappear only after this many generations.
+    fallback_repeat_generations: int = 4
     # A criterion epoch fixes what "good" means for a span of generations. The
     # boundary is only recorded for now: it gives a later, non-stationary
     # utility an anchor without changing the criterion itself.
@@ -109,6 +284,11 @@ class ReactorConfig:
     max_active_goals: int = 8
     # Retention and GC run once per UTC day, next to the metrics snapshot.
     event_retention_days: int = 30
+    # The tool-call idempotency ledger was the one monotone table without a
+    # retention window. The window is deliberately far wider than the 1-day
+    # reboot window it has to outlive, so pruning can only drop rows no live
+    # reconciliation can still reference.
+    effect_retention_days: int = 30
 
 
 class Reactor:
@@ -120,20 +300,29 @@ class Reactor:
         self.provider = provider
         set_event_logger = getattr(provider, "set_event_logger", None)
         if set_event_logger is not None:
-            set_event_logger(lambda kind, payload: self.store.runtime_log.write(kind, payload))
+            # Chain-level failures and reloads are promoted to the durable event
+            # log by the store; high-volume attempt/selection kinds stay in the
+            # runtime projection. The store owns that routing so the provider
+            # layer never has to learn about the database.
+            set_event_logger(self.store.record_provider_event)
         runtime_tools = dict(tools)
         improvement_root = self.config.self_improvement_root or Path.cwd()
         if (Path(improvement_root) / ".git").exists():
             improvement_manager = SelfImprovementManager(improvement_root)
+            # The manager must reach the durable store so a protected-path
+            # warning lands in the event log and the owner outbox, not only in
+            # the advanced runtime log.
+            improvement_manager.set_store(self.store)
             runtime_tools["propose_self_improvement"] = SelfImprovementTool(improvement_manager)
-            runtime_tools["promote_self_improvement"] = PromoteSelfImprovementTool(improvement_manager, self._self_improvement_health)
             runtime_tools["request_rollback"] = RollbackRequestTool(improvement_root)
         # The owner dialogue is always available: it is how the organism asks a
         # question it cannot answer and how it reports without waiting.
         runtime_tools["ask_user"] = AskUserTool(self.store)
         runtime_tools["send_message_to_user"] = SendMessageToUserTool(self.store)
         runtime_tools["acknowledge_inbox"] = AcknowledgeInboxTool(self.store)
+        runtime_tools["read_inbox"] = ReadInboxTool(self.store)
         runtime_tools["memory"] = MemoryTool(self.store)
+        runtime_tools["record_plan"] = RecordPlanTool(self.store)
         self.runner = ReActRunner(
             provider,
             self.store,
@@ -147,23 +336,35 @@ class Reactor:
                 # widened 500k window; both are operator-tunable.
                 context_finish_reserve=int(os.getenv("SKYNET_CONTEXT_FINISH_RESERVE", "50000")),
                 tool_result_max_chars=int(os.getenv("SKYNET_TOOL_RESULT_MAX_CHARS", "16000")),
+                run_progress_seconds=self.config.run_progress_seconds,
             ),
             worktree_root=improvement_root,
+            on_progress=self._enqueue_run_progress,
         )
-        self.memory_loop = MemoryLoop(provider, budget=Budget(steps=1, tokens=self.config.memory_input_tokens, seconds=180.0, output_tokens=self.config.budget.output_tokens), timeout_seconds=180.0)
+        self.memory_loop = MemoryLoop(provider, budget=Budget(steps=1, tokens=self.config.memory_input_tokens, seconds=self.config.memory_loop_timeout_seconds, output_tokens=self.config.budget.output_tokens), timeout_seconds=self.config.memory_loop_timeout_seconds)
+        self._planner_provider = TurnShapeRecorder(provider)
         self.autonomous_planner = AutonomousPlanner(
-            provider,
+            self._planner_provider,
             self.store,
-            output_tokens=min(4096, self.config.budget.output_tokens),
+            output_tokens=self.config.planner_output_tokens,
             timeout_seconds=self.config.budget.seconds,
             max_active_goals=self.config.max_active_goals,
             hypothesis_ttl_days=self.config.hypothesis_ttl_days,
         )
         self._self_improvement_restart: Any = None
+        self._stop_event: Any = None
         self._run_lock = Lock()
-        soul_path = Path(__file__).resolve().parent.parent / "SOUL.md"
+        workspace_root = Path(__file__).resolve().parent.parent
+        if WORKSPACE_BLOCK_MARKER not in self.config.system_prompt:
+            self.config.system_prompt += f"{WORKSPACE_BLOCK_MARKER}WORKSPACE: {workspace_root}\n[SKYNET WORKSPACE END]"
+        if SENSES_BLOCK_MARKER not in self.config.system_prompt:
+            senses = mcp_senses_line(self.runner.tools) or "SENSES: none configured"
+            self.config.system_prompt += SENSES_BLOCK_MARKER + senses + "\n[SKYNET SENSES END]"
+        soul_path = workspace_root / "SOUL.md"
         if soul_path.exists() and SOUL_BLOCK_MARKER not in self.config.system_prompt:
             self.config.system_prompt += SOUL_BLOCK_MARKER + soul_path.read_text(encoding="utf-8") + "\n[SKYNET SOUL END]"
+        if PLAN_INSTRUCTION not in self.config.system_prompt:
+            self.config.system_prompt += PLAN_INSTRUCTION
 
     def tick(self, wake_cause: str = "timer") -> RunStatus | None:
         if not self._run_lock.acquire(blocking=False):
@@ -172,6 +373,11 @@ class Reactor:
             state = self.store.state()
             if state.active_run_id is not None:
                 return RunStatus.RUNNING
+            # Status repair used to run only at startup, so an inconsistent row
+            # created during a long uptime kept cluttering the queue until the
+            # next restart. Run it before selection; the stable safety nets are
+            # excluded so they are never cancelled.
+            self._repair_status_consistency()
             goals, tasks = self.store.active_work()
             # Genesis is for a genuinely empty database only. Do not resurrect
             # a blocked/cancelled goal after an intentional memory or goal reset.
@@ -192,16 +398,25 @@ class Reactor:
                 self._record_no_active_goal(state, inbox_events)
             # Selectability, not mere task existence, determines whether the
             # LLM planner must be called. This prevents exhausted pending rows
-            # from blocking autonomous replacement planning.
-            selected_work = self._select_work()
+            # from blocking autonomous replacement planning. The decision is
+            # computed without recording it yet, because the reason has to
+            # reflect what the autonomous planner did next.
+            planner, selected_work = self._plan_select()
+            if selected_work is not None:
+                planner.record_decision()
             # An owner message is a notification, not work: it never creates a
             # task and never preempts. When nothing is selectable the fixed pool
             # is the fallback, then the autonomous planner, then the bounded
             # bootstrap task.
             if selected_work is None:
-                generated_tasks = self._run_autonomous_planning(state, goals, wake_cause)
+                generated_tasks, planner_reason = self._run_autonomous_planning(state, goals, wake_cause)
                 goals, tasks = self.store.active_work()
-                selected_work = self.store.task_work(generated_tasks[0]) if generated_tasks else self._select_work()
+                if generated_tasks:
+                    selected_work = self.store.task_work(generated_tasks[0])
+                # One decision per cycle: the reason now says whether the
+                # autonomous planner proposed work, produced nothing, or
+                # failed to parse, instead of the old duplicate "no novel work".
+                planner.record_decision(reason="autonomous_planner_proposed" if selected_work is not None else planner_reason)
                 if selected_work is None:
                     fallback_id = self._create_planner_fallback(goals, state.generation)
                     if fallback_id:
@@ -248,9 +463,34 @@ class Reactor:
                 {
                     "query_chars": len(memory_query),
                     "query_terms": len(memory_query.split()),
+                    # The index searches only the normalized terms (stopwords and
+                    # 1-char tokens dropped, last 24 kept), so the whitespace count
+                    # above overstates the query the retriever really ran and hid
+                    # the trim from the metrics.
+                    "query_terms_effective": len(MemoryStore._normalize_terms(memory_query)),
                     "hits": len(memory_context),
                     "pinned": len(pinned_memories),
                     "top_kinds": [item.get("kind") for item in memory_context[:3]],
+                    # The fused scores are recorded because equal-K rank fusion
+                    # compresses them into a near-flat band (measured spread
+                    # ~0.004 on the live corpus), which is the observable
+                    # signature of priors displacing lexical relevance.
+                    "top_scores": [round(float(item.get("score", 0.0)), 6) for item in memory_context[:3]],
+                    # The fused score alone cannot say whether an injected memory is
+                    # actually about the task: the recency/confidence axes are global
+                    # orderings with no query filter, so a top-3 slot can be prior-only.
+                    # Measured on the live corpus: pure-lexical bm25 puts the queried
+                    # memory at rank 1 for 124/124 memories, while the fused top-1 is
+                    # 21/124 and 7.3% of fused top-3 slots share no term with the task.
+                    # Recording the shared-term count makes an injected-but-irrelevant
+                    # memory visible in the metrics instead of inferred.
+                    "top_lexical_overlap": [
+                        len(
+                            set(MemoryStore._document_terms(str(item.get("content", ""))))
+                            & set(MemoryStore._normalize_terms(memory_query))
+                        )
+                        for item in memory_context[:3]
+                    ],
                 },
                 start.run_id,
             )
@@ -293,6 +533,18 @@ class Reactor:
                 self.store.transition(state, LifecycleState.REACT, run_id=start.run_id, reason="react started")
 
             result = self.runner.run(start, self.config.system_prompt + "\n\n" + SYSTEM_REACT + "\n" + REACT_LOOP_ROLE_SUFFIX)
+            # `run_results.failure` is the fault ledger, and every surface that
+            # counts failures reads it verbatim (skynet/metrics.py
+            # provider_failures -> top_failures). A deferred restart is a
+            # control signal, not a fault: the promotion it followed is already
+            # tool-verified and the run is recorded as COMPLETED. Storing the
+            # label here made a successful promotion the top 'provider failure'
+            # in the metrics window. The ReAct result keeps the label, the
+            # deferred_control and run_result_committed events keep it, and only
+            # the persisted row is normalized.
+            persisted_failure = result.failure
+            if result.control_action.get("type") == "restart_after_checkpoint" and result.status == RunStatus.COMPLETED:
+                persisted_failure = ""
             with self._defer_watchdog_signal(), self.store.transaction():
                 self.store.commit_run_result(
                     start.run_id,
@@ -300,7 +552,7 @@ class Reactor:
                     result.report,
                     result.steps,
                     result.usage_tokens,
-                    result.failure,
+                    persisted_failure,
                 )
                 self.store.append_event(
                     "run_result_committed",
@@ -333,6 +585,28 @@ class Reactor:
                     memory_succeeded = True
                 except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     self.store.append_event("memory_loop_failed", {"error": str(exc)[:1000]}, start.run_id)
+            # `consolidate` reports its own failures as a degraded evaluation
+            # instead of raising, so the durable `memory_loop_failed` event above
+            # is never reached. Record the degraded result here so retention
+            # keeps the post-mortem that the runtime log alone carried.
+            memory_degraded = memory_succeeded and str((memory_result.evaluation or {}).get("status") or "") == "degraded"
+            if memory_degraded:
+                self.store.append_event(
+                    "memory_degraded",
+                    {"error": str((memory_result.evaluation or {}).get("error", ""))[:1000]},
+                    start.run_id,
+                )
+            if memory_succeeded and (memory_result.dropped_fields or memory_result.rejected_sections):
+                # A salvaged reply is not a degradation: record what the harness
+                # had to tolerate so a repeated undeclared key stays visible.
+                self.store.append_event(
+                    "memory_response_tolerated",
+                    {
+                        "dropped_fields": memory_result.dropped_fields[:20],
+                        "rejected_sections": memory_result.rejected_sections[:20],
+                    },
+                    start.run_id,
+                )
             with self._defer_watchdog_signal(), self.store.transaction():
                     state = self.store.state()
                     self.store.transition(state, LifecycleState.CONSOLIDATE, run_id=start.run_id, reason="react finished")
@@ -342,7 +616,7 @@ class Reactor:
                         start.run_id,
                     )
                     if memory_succeeded:
-                        self.store.append_event("memory_loop_finished", {"memory_candidates": len(memory_result.memory_candidates)}, start.run_id)
+                        self.store.append_event("memory_loop_finished", {"memory_candidates": len(memory_result.memory_candidates), "degraded": memory_degraded}, start.run_id)
                     consolidation = self.store.consolidate_versioned(snapshot["snapshot_id"], start.run_id, memory_result.memory_candidates)
                     memory_count = consolidation["memory_count"]
                     self.store.append_event("memory_consolidated", consolidation, start.run_id)
@@ -364,8 +638,33 @@ class Reactor:
                         },
                         start.run_id,
                     )
+                    # A1-lite measurement substrate: did this run record a plan
+                    # before its first durable mutation? The answer is derived
+                    # from event_log sequence order, never from the ReAct loop.
+                    # This is instrumentation ONLY: a missing plan must not
+                    # block, fail, or downgrade the run -- the success criterion
+                    # stays procedural (verified_progress + gate + citation),
+                    # deliberately with no numeric benchmark to reward-hack.
+                    recorded_plan = latest_recorded_plan(self.store, start.run_id)
+                    self.store.append_event(
+                        PLAN_OBSERVATION_EVENT_KIND,
+                        {
+                            "run_id": start.run_id,
+                            "planned": recorded_plan is not None,
+                            "preceded_first_mutation": plan_preceded_first_mutation(self.store, start.run_id),
+                        },
+                        start.run_id,
+                    )
                     retryable_blocker = effective_status == RunStatus.BLOCKED and self._is_retryable_environment_blocker(result.report)
                     provider_failed = self._run_had_provider_failure(start.run_id)
+                    if effective_status == RunStatus.COMPLETED:
+                        # Instrumentation ONLY: a COMPLETED report whose `actions`
+                        # name a ledger-backed tool that left no row is recorded,
+                        # never penalized -- the same contract as the plan
+                        # observation. This is what makes a narrated action
+                        # visible: the report is otherwise trusted verbatim.
+                        for finding in self._unverified_action_claims(start.run_id, result.report):
+                            self.store.append_event("report_claim_unverified", finding, start.run_id)
                     selected_task = selected_work.get("task") if selected_work and selected_work.get("kind") == "task" else None
                     gave_up = False
                     if selected_task:
@@ -377,12 +676,17 @@ class Reactor:
                             RunStatus.INTERRUPTED: "pending",
                         }.get(effective_status, "pending")
                         if task_status == "completed" and self._claims_uncaptured_changes(start.run_id, result.report):
-                            # A run can report file changes it prototyped outside the
-                            # proposal workflow. Keep the task in the queue instead of
-                            # treating the discarded prototype as completed work.
+                            # A run that reports repository paths it did not
+                            # capture through the proposal workflow AND left the
+                            # main worktree verifiably dirty did work that is not
+                            # durable: keep the task in the queue instead of
+                            # treating the discarded prototype as completed. The
+                            # dirtiness check is what separates a real claim from
+                            # prose the old check misread; a clean worktree with
+                            # no captured proposal is not evidence of lost work.
                             self.store.append_event(
                                 "uncaptured_changes",
-                                {"task_id": selected_task["task_id"], "report": result.report[:1000]},
+                                {"task_id": selected_task["task_id"], "report": result.report[:1000], "dirty_worktree": True},
                                 start.run_id,
                             )
                             task_status = "pending"
@@ -478,6 +782,13 @@ class Reactor:
                             "next": "verify the promoted self-improvement after reboot",
                             "checks": ["service starts", "database opens", "provider is reachable", "health window completes"],
                         }
+                    # Shared context across cycles: the plan this run recorded is
+                    # carried into the NEXT StartEnvelope (which serializes
+                    # state.next_plan) under a distinct key, so it cannot clobber
+                    # the MemoryLoop's own writes (`initial_prompt`,
+                    # `planner_hints`, `previous_outcome`) done just above.
+                    if recorded_plan is not None:
+                        state.next_plan["recorded_plan"] = recorded_plan
                     state.retry_count = 0 if effective_status.value == "completed" else state.retry_count + 1
                     delay = self.config.wake_interval_seconds if effective_status.value == "completed" else min(300, 2 ** min(state.retry_count, 8))
                     provider_streak = self._consecutive_provider_failures()
@@ -562,11 +873,16 @@ class Reactor:
             # Retention and decay are maintenance, not metrics: gating them on
             # the snapshot flag silently disabled them when snapshots were off.
             self._maybe_run_daily_maintenance()
+            # The judge-health check is per-cycle, not daily: a broken planner
+            # contract must not degrade silently for a day. Its durable alert
+            # dedup window is the rate limit, and it never gates maintenance.
+            self._check_judge_health()
             if deferred_restart:
                 self._request_self_improvement_restart(deferred_restart)
             return result.status
         except WatchdogTimeout:
-            interrupted = self.interrupt_stale_run(reason="watchdog_timeout", force=True)
+            reason = "owner_stop" if self._stop_event is not None and self._stop_event.is_set() else "watchdog_timeout"
+            interrupted = self.interrupt_stale_run(reason=reason, force=True)
             return interrupted if interrupted is not None else RunStatus.INTERRUPTED
         except Exception as exc:
             # The recovery write must not be torn by the very signal that caused
@@ -619,6 +935,10 @@ class Reactor:
             if not isinstance(update, dict) or update.get("task_id") != task_id:
                 continue
             if update.get("status") == "completed" and result_status != RunStatus.COMPLETED:
+                continue
+            # The task was already written to "completed" earlier in this same
+            # run; a Memory-Loop update must not reopen it to "pending".
+            if result_status == RunStatus.COMPLETED and update.get("status") == "pending":
                 continue
             safe_task_updates.append(update)
         self.store.apply_goal_updates(safe_goal_updates, run_id=run_id)
@@ -683,16 +1003,15 @@ class Reactor:
         if goal is None:
             return None
         title = f"{EXTERNAL_SEEK_TASK_TITLE} [generation {state.generation}]"
-        expected = (
-            "One memory entry cites a specific external source (arXiv id, repository URL, or page URL) "
-            "and states a bounded, testable improvement hypothesis derived from it; or the search is "
-            "recorded as yielding nothing applicable, with the queries used."
-        )
+        expected = EXTERNAL_SEEK_EXPECTED_FACT
+        hypothesis, structural = _EXTERNAL_SEEK_FINGERPRINTS
         with self.store.transaction():
             task_id = self.store.add_task(
                 title,
                 str(goal["goal_id"]),
                 expected_new_fact=expected,
+                hypothesis_fingerprint=hypothesis,
+                structural_fingerprint=structural,
                 area="research",
             )
             self.store.append_event("external_seek_created", {
@@ -741,8 +1060,8 @@ class Reactor:
 
         The archive was fed exclusively by `_run_autonomous_planning`, so the
         organism's real self-improvement traffic never became a stepping stone:
-        promoted self-improvement work left `idea_archive` empty. Quality is the
-        run's measured value, so a promoted change outranks an untested one.
+        nine promoted commits left `idea_archive` empty. Quality is the run's
+        measured value, so a promoted change outranks an untested one.
         """
         task_id = None
         if isinstance(selected_work, dict):
@@ -893,6 +1212,29 @@ class Reactor:
             run_id,
         )
 
+    def _enqueue_run_progress(self, progress: dict[str, Any]) -> None:
+        """Queue one short mid-run progress note on the existing owner channel.
+
+        The Reactor stays the only writer of the outbox; the runner only hands
+        over the facts it already owns. ``agent_message`` is the kind the owner
+        channel already renders (``outbox.render_agent_message``) and the same
+        kind ``send_message_to_user`` uses, so no new delivery path is added.
+        """
+        message = str(progress.get("message", "")).strip()
+        if not message:
+            return
+        self.store.add_outbox("agent_message", {"message": message, "severity": "info"})
+        self.store.append_event(
+            "run_progress_reported",
+            {
+                "run_id": progress.get("run_id"),
+                "step": progress.get("step"),
+                "model_seconds": progress.get("model_seconds"),
+                "last_tool": progress.get("last_tool"),
+            },
+            str(progress.get("run_id") or "") or None,
+        )
+
     def _provider_model(self) -> str:
         """Best-effort model identity without a network probe.
 
@@ -939,7 +1281,8 @@ class Reactor:
         task's give-up budget. Merely having retried a provider along the way is
         not enough: a run that consumed its own time or token budget after a few
         provider retries is a model-side failure, and treating it as an outage
-        made a task retry forever while the give-up budget never moved.
+        made a task retry forever on the live server (attempts grew while the
+        give-up budget never moved).
         """
         for event in self.store.recent_run_events(run_id, limit=None):
             if event["kind"] == "run_result_committed":
@@ -951,8 +1294,8 @@ class Reactor:
         """Count trailing runs that died because no provider answered.
 
         A streak, not a total: one run with any other outcome resets it. This is
-        the signal that stayed invisible when many runs failed in a row on an
-        empty provider error with a recorded cooldown of zero.
+        the signal that stayed invisible while 89 runs failed in a row on an
+        empty ollama error with a recorded cooldown of zero.
         """
         rows = self.store.connection.execute(
             "SELECT status, failure FROM run_results ORDER BY created_at DESC, run_id DESC LIMIT ?",
@@ -990,8 +1333,8 @@ class Reactor:
     def _runtime_facts(self) -> dict[str, Any]:
         """Canonical environment facts the model kept rediscovering the hard way.
 
-        Repeated bash calls failed with "/usr/bin/python3: No module
-        named pytest" while a high-confidence memory recorded the working
+        Seven production bash calls failed with "/usr/bin/python3: No module
+        named pytest" while a 0.95-confidence memory recorded the working
         command that retrieval never returned.
         """
         root = Path(self.config.self_improvement_root or Path.cwd())
@@ -1113,6 +1456,50 @@ class Reactor:
             {"window_days": written.get("window_days"), "marker": metrics.daily_marker()},
         )
 
+    def _repair_status_consistency(self) -> None:
+        """Cancel unselectable task rows every cycle, not only at startup.
+
+        The safety-net templates are passed as exclusions because they stay
+        pending with a terminal fingerprint by design. ``store`` emits
+        ``status_repair`` only when it actually changed a row, and a repair
+        failure is logged rather than allowed to abort the cycle.
+        """
+        try:
+            repaired = self.store.repair_status_consistency(exclude_fingerprints=SAFETY_NET_FINGERPRINTS)
+        except Exception as exc:
+            log.warning("per-cycle status repair failed: %s", exc, exc_info=True)
+            return
+        if repaired["hypotheses"] or repaired["tasks"]:
+            log.info("per-cycle status repair changed rows: %s", repaired)
+
+    def _check_judge_health(self) -> None:
+        """Surface a broken planner contract to the owner instead of degrading silently.
+
+        Runs every cycle, not once a day: the 2026-09-20 incident degraded for a
+        full day, and a daily check would have stayed blind for most of it. The
+        alert's durable dedup window is the rate limit, so a per-cycle check
+        cannot spam the owner. It reads ``planner_attempts`` only and never
+        gates retention or decay, so a degraded judge cannot stop maintenance.
+        """
+        try:
+            check_judge_health(
+                self.store,
+                window=int(os.getenv("SKYNET_JUDGE_HEALTH_WINDOW", str(DEFAULT_WINDOW))),
+                min_samples=int(os.getenv("SKYNET_JUDGE_HEALTH_MIN_SAMPLES", str(DEFAULT_MIN_SAMPLES))),
+                threshold=float(os.getenv("SKYNET_JUDGE_HEALTH_THRESHOLD", str(DEFAULT_THRESHOLD))),
+                cooldown_seconds=float(os.getenv("SKYNET_JUDGE_HEALTH_COOLDOWN_SECONDS", str(DEFAULT_COOLDOWN_SECONDS))),
+                # A window that reaches back before the last restart judges the
+                # previous process's code: on 2026-09-20 the promoted planner
+                # fix could not clear the alert because the pre-fix failures
+                # were still the newest rows. A missing guard yields None ("no
+                # boundary"), which keeps the whole window.
+                since=restart_boundary(Path(self.config.state_path).parent),
+            )
+        except (TypeError, ValueError) as exc:
+            # A malformed env override must not crash the cycle either; the
+            # watchdog itself is already guarded, this covers the parsing.
+            log.warning("judge health settings invalid: %s", exc)
+
     def _maybe_run_daily_maintenance(self) -> None:
         """Run retention/decay at most once per UTC day.
 
@@ -1137,6 +1524,23 @@ class Reactor:
 
     def _run_daily_maintenance(self) -> None:
         """Retention and GC, once per day, so the state cannot grow forever."""
+        # A non-positive window is not "keep everything": it silently turns the
+        # pass into a no-op while ``prune_event_log`` returns 0, exactly the
+        # result a clean pass reports, so the deviation disappears into a
+        # success. Measured over 83 generations and the 46 published reboot
+        # requests: no ``SKYNET_EVENT_RETENTION_DAYS`` appears in the service
+        # unit or the module defaults, so this guard has never fired here -- it
+        # exists so that a generation cannot end with retention silently off.
+        for name, value in (
+            ("event_retention_days", self.config.event_retention_days),
+            ("effect_retention_days", self.config.effect_retention_days),
+            ("transcript_retention_runs", self.config.transcript_retention_runs),
+        ):
+            if int(value) <= 0:
+                self.store.append_event(
+                    "history_retention_unverified",
+                    {"setting": name, "value": int(value), "reason": "non-positive retention window disables this pass"},
+                )
         try:
             pruned = self.store.prune_event_log(self.config.event_retention_days)
             if pruned:
@@ -1147,26 +1551,123 @@ class Reactor:
         except Exception as exc:
             log.warning("event log retention failed: %s", exc, exc_info=True)
         try:
+            pruned_effects = self.store.prune_capability_effects(self.config.effect_retention_days)
+            if pruned_effects:
+                self.store.append_event(
+                    "history_pruned",
+                    {"capability_effects": pruned_effects, "retention_days": self.config.effect_retention_days},
+                )
+        except Exception as exc:
+            log.warning("effect ledger retention failed: %s", exc, exc_info=True)
+        try:
             decayed = self.store.decay_memory_confidence()
             if decayed["faded"] or decayed["dropped"]:
                 self.store.append_event("memory_confidence_decayed", decayed)
         except Exception as exc:
             log.warning("memory confidence decay failed: %s", exc, exc_info=True)
+        try:
+            compacted = self.store.compact_episode_snapshots()
+            if compacted["snapshots"]:
+                self.store.append_event("history_compacted", compacted)
+        except Exception as exc:
+            log.warning("episode snapshot compaction failed: %s", exc, exc_info=True)
+
+    def _unverified_action_claims(self, run_id: str, report: str) -> list[dict[str, str]]:
+        """Report `actions` that name a ledger-backed tool with no ledger row.
+
+        Instrumentation ONLY, in the same spirit as the plan observation: it
+        records a contradicted claim and never blocks, fails, or downgrades the
+        run. A report is a model statement, but for the few tools that always
+        leave a `capability_effects` row an absent row is evidence the action was
+        narrated rather than executed -- the failure a trusted self-report cannot
+        expose (arXiv:2607.22798v1's independent finish gate, arXiv:2607.13716v1's
+        canonical action object).
+        """
+        try:
+            payload = json.loads(report)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        actions = payload.get("actions")
+        if not isinstance(actions, list):
+            return []
+        claimed = self.store.run_effect_capabilities(run_id)
+        findings: list[dict[str, str]] = []
+        for tool in sorted(UNVERIFIED_CLAIM_TOOLS):
+            # Only a claim that names the tool as the INSTRUMENT of the action
+            # ("... via send_message_to_user"). A bare mention can be a plan, a
+            # rationale, or a description of the tool itself; measured on the
+            # live corpus, the instrument form matched 10 claims of which 9 had a
+            # ledger row and the tenth was the known false claim, while a bare
+            # mention flagged four truthful reports.
+            pattern = UNVERIFIED_CLAIM_PATTERNS.get(tool)
+            if pattern is None or not any(pattern.search(str(item)) for item in actions):
+                continue
+            if claimed.get(tool):
+                continue
+            findings.append({
+                "run_id": run_id,
+                "tool": tool,
+                "reported_summary": str(payload.get("summary", ""))[:300],
+            })
+        return findings
+
+    @staticmethod
+    def _has_repository_path(changes: list[Any]) -> bool:
+        """True only for a `changes` entry that names a non-scratch repo path."""
+        for item in changes:
+            match = _REPO_PATH_PATTERN.search(str(item))
+            if match is None:
+                continue
+            if not _is_scratch_path(match.group(1)):
+                return True
+        return False
+
+    def _main_worktree_dirty(self) -> bool:
+        """Whether the repository itself has modified tracked files.
+
+        The verifiable half of the uncaptured-changes check: a scratch prototype
+        leaves the main worktree untouched, while a direct edit through ``bash``
+        does not. A non-git root or a git failure is treated as "not dirty" so a
+        broken probe can never reopen a finished task on its own.
+        """
+        root = self.config.self_improvement_root or Path.cwd()
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode:
+            return False
+        return bool(result.stdout.strip())
 
     def _claims_uncaptured_changes(self, run_id: str, report: str) -> bool:
-        """Detect a COMPLETED report that claims file changes nothing captured.
+        """Detect a COMPLETED report that claims repository changes nothing captured.
 
         Code changes are only durable through the self-improvement proposal
         workflow; a prototype edited in a scratch directory leaves the main
-        worktree untouched.
+        worktree untouched. Only a path-like, non-scratch `changes` entry counts
+        as a claim: the schema permits arbitrary strings and the instruction
+        tells the model not to list prototypes, so a prose denial must not look
+        like a claim. The claim must also be verifiable -- the main worktree has
+        to be dirty -- so a lone path string cannot reopen a finished task.
         """
         try:
             payload = json.loads(report)
         except (TypeError, json.JSONDecodeError):
             return False
-        if not isinstance(payload, dict) or not payload.get("changes"):
+        if not isinstance(payload, dict):
             return False
-        captured = {"propose_self_improvement", "promote_self_improvement"}
+        changes = payload.get("changes")
+        if not isinstance(changes, list) or not self._has_repository_path(changes):
+            return False
+        captured = {"propose_self_improvement"}
         for event in self.store.recent_run_events(run_id, limit=None):
             if event["kind"] != "tool_result":
                 continue
@@ -1174,15 +1675,23 @@ class Reactor:
             tool_name = result.get("call", {}).get("tool_name")
             if tool_name in captured and result.get("result", {}).get("ok") is True:
                 return False
-        return True
+        return self._main_worktree_dirty()
 
-    def _run_autonomous_planning(self, state: AgentState, goals: list[dict[str, Any]], trigger: str) -> list[str]:
+    def _run_autonomous_planning(self, state: AgentState, goals: list[dict[str, Any]], trigger: str) -> tuple[list[str], str]:
+        """Run one bounded planner call and report both tasks and the reason.
+
+        The empty list alone cannot say whether the model crashed or genuinely
+        proposed nothing, so the attempt status is translated into a decision
+        reason the caller records. That is what de-masks a planner failure from
+        an empty portfolio.
+        """
         with self.store.transaction():
             current = self.store.state()
             self.store.transition(current, LifecycleState.PLAN, reason="no ready work; autonomous planning")
         tasks = [dict(row) for row in self.store.connection.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 100")]
         memories = self.store.search_memories(self._planner_memory_query(state, goals), limit=20)
         previous = state.next_plan if isinstance(state.next_plan, dict) else {}
+        self._planner_provider.reset()
         proposals = self.autonomous_planner.generate(
             generation=state.generation,
             goals=goals,
@@ -1191,9 +1700,26 @@ class Reactor:
             previous=previous,
             trigger=trigger,
         )
+        # Emitted here, on the calling thread, because the planner invokes its
+        # provider from a worker thread and the store connection is not
+        # thread-shared. One row per model call: a repaired retry leaves two.
+        shape = self._planner_provider.last_shape
+        if shape is not None:
+            with self.store.transaction():
+                self.store.append_event(
+                    "planner_turn",
+                    {**shape, "attempt_status": self.autonomous_planner.last_status},
+                    None,
+                )
         for proposal in proposals:
             self._archive_proposal(proposal)
-        return [str(item["task_id"]) for item in proposals if item.get("task_id")]
+        status = self.autonomous_planner.last_status
+        reason = {
+            "invalid_response": "planner_invalid_response",
+            "provider_error": "planner_provider_error",
+            "output_truncated": "planner_output_truncated",
+        }.get(status, "no novel work")
+        return [str(item["task_id"]) for item in proposals if item.get("task_id")], reason
 
     @staticmethod
     def _inbox_notifications(inbox_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1259,25 +1785,74 @@ class Reactor:
         ).fetchone()
         if existing and existing["status"] in {"pending", "running"}:
             return str(existing["task_id"])
-        # The previous fallback finished, so a fresh bounded diagnostic keeps the
-        # organism alive instead of parking it in sleep. The generation suffix
-        # gives it a new fingerprint and bounds it to one pending fallback.
+        if self._fallback_repeat_blocked(generation):
+            self.store.append_event(
+                "planner_fallback_capped",
+                {"goal_id": goal_id, "generation": generation, "window": self.config.fallback_repeat_generations},
+            )
+            return None
+        # The previous fallback finished and the window elapsed, so a fresh
+        # bounded diagnostic keeps the organism alive instead of parking it in
+        # sleep. The title carries the generation for display, but the
+        # fingerprints are the stable template identity: a churning fingerprint
+        # was why the same diagnostic could be recreated without limit.
         title = f"{FALLBACK_TASK_TITLE} [generation {generation}]"
+        hypothesis, structural = _FALLBACK_FINGERPRINTS
         with self.store.transaction():
-            task_id = self.store.add_task(title, goal_id=goal_id, expected_new_fact="A focused diagnostic establishes one verified fact or blocker", area="recovery")
+            task_id = self.store.add_task(
+                title,
+                goal_id=goal_id,
+                expected_new_fact=FALLBACK_EXPECTED_FACT,
+                hypothesis_fingerprint=hypothesis,
+                structural_fingerprint=structural,
+                area="recovery",
+            )
             self.store.append_event(
                 "planner_fallback_created",
                 {"task_id": task_id, "goal_id": goal_id, "generation": generation, "reason": "planner produced no ready task"},
             )
         return task_id
 
-    def _select_work(self) -> dict[str, Any] | None:
-        return PortfolioPlanner(
+    def _fallback_repeat_blocked(self, generation: int) -> bool:
+        """Whether the bounded diagnostic fallback is inside its repeat window.
+
+        The generation is read back from the durable creation event, so the cap
+        survives a restart and needs no extra task column. A missing or
+        unreadable event means no recent fallback, which is the safe default:
+        the safety net is allowed.
+        """
+        window = self.config.fallback_repeat_generations
+        if window <= 0:
+            return False
+        row = self.store.connection.execute(
+            "SELECT payload FROM event_log WHERE kind='planner_fallback_created' ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            last_generation = int(json.loads(row["payload"]).get("generation"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return generation - last_generation < window
+
+    def _plan_select(self) -> tuple[PortfolioPlanner, dict[str, Any] | None]:
+        """Compute a portfolio decision without writing it yet.
+
+        The reactor records it once the autonomous planner outcome is known, so
+        one cycle produces one decision whose reason is accurate.
+        """
+        planner = PortfolioPlanner(
             self.store,
             epsilon=self.config.planner_epsilon,
             hypothesis_ttl_days=self.config.hypothesis_ttl_days,
             cell_scarcity_weight=self.config.cell_scarcity_weight,
-        ).select()
+        )
+        return planner, planner.select(record=False)
+
+    def _select_work(self) -> dict[str, Any] | None:
+        planner, work = self._plan_select()
+        planner.record_decision()
+        return work
 
     def _request_self_improvement_restart(self, deferred_restart: dict[str, Any]) -> None:
         """Request a process restart after a completed promotion, without failing the cycle.
@@ -1304,16 +1879,21 @@ class Reactor:
             )
 
     def set_self_improvement_health(self, health_check: Any) -> None:
-        for name in ("propose_self_improvement", "promote_self_improvement"):
-            tool = self.runner.tools.get(name)
-            if isinstance(tool, (PromoteSelfImprovementTool, SelfImprovementTool)):
-                tool.health_check = health_check
+        tool = self.runner.tools.get("propose_self_improvement")
+        if isinstance(tool, SelfImprovementTool):
+            tool.health_check = health_check
 
     def set_self_improvement_restart(self, restart: Any) -> None:
         self._self_improvement_restart = restart
 
     def set_stop_event(self, stop_event: Any) -> None:
-        """Let a blocking owner-dialogue wait end when the process stops."""
+        """Let a blocking owner-dialogue wait end when the process stops.
+
+        The event is also remembered so a ``WatchdogTimeout`` delivered to
+        ``tick`` can tell a clean owner shutdown (``owner_stop``) from a real
+        stale-run watchdog (``watchdog_timeout``).
+        """
+        self._stop_event = stop_event
         tool = self.runner.tools.get("ask_user")
         if isinstance(tool, AskUserTool):
             tool.set_stop_event(stop_event)
@@ -1362,8 +1942,16 @@ class Reactor:
             if state.active_run_id != run_id:
                 return
             self.store.finish_run(run_id, RunStatus.INTERRUPTED)
-            self.store.commit_run_result(run_id, RunStatus.INTERRUPTED, "Run interrupted by the harness before a Finish Report.", 0, 0, reason)
-            self.store.append_event("watchdog_timeout", {"run_id": run_id, "reason": reason}, run_id)
+            usage = self.store.run_usage(run_id)
+            self.store.commit_run_result(run_id, RunStatus.INTERRUPTED, "Run interrupted by the harness before a Finish Report.", usage["steps"], usage["usage_tokens"], reason)
+            # The clean owner shutdown and the stale-run watchdog share this
+            # path but are not the same event. An unknown reason keeps the old
+            # kind so a caller that only knows "interrupted" stays auditable.
+            payload = {"run_id": run_id, "reason": reason}
+            if reason == "owner_stop":
+                self.store.append_event("owner_stop", payload, run_id)
+            else:
+                self.store.append_event("watchdog_timeout", payload, run_id)
             state.active_run_id = None
             self.store.transition(state, LifecycleState.RECOVERING, run_id=run_id, reason=reason)
             state.next_plan = {**state.next_plan, "recovery": {"reason": reason, "run_id": run_id}}
@@ -1398,12 +1986,13 @@ class Reactor:
                 classification = self.store.classify_recovery(interrupted_run_id)
                 recovery_status = RunStatus.NEEDS_RECOVERY if classification["status"] == "result_committed" else RunStatus.INTERRUPTED
                 self.store.finish_run(interrupted_run_id, recovery_status)
+                usage = self.store.run_usage(interrupted_run_id)
                 self.store.commit_run_result(
                     interrupted_run_id,
                     recovery_status,
                     "Run interrupted by a process restart before a Finish Report.",
-                    0,
-                    0,
+                    usage["steps"],
+                    usage["usage_tokens"],
                     "process_restart",
                 )
                 started_event = next((event for event in episode if event["kind"] == "run_started"), None)
@@ -1431,11 +2020,13 @@ class Reactor:
             self.store.transition(state, LifecycleState.RECOVER, run_id=state.active_run_id, reason="process restart recovery")
 
     # `MemoryStore._normalize_terms` keeps only the *last* `_MAX_QUERY_TERMS`
-    # (24) normalized terms, so a long `next_plan["initial_prompt"]` could
-    # silently evict the goal and task words: the searched terms were the
-    # previous run's bookkeeping and the situation-defining words never reached
-    # the index. Long parts are capped, and the situation-defining parts are
-    # appended last so the recall window keeps them.
+    # (24) normalized terms, so a long `next_plan["initial_prompt"]` (measured at
+    # 4342 characters in the live envelope) silently evicted the goal and task
+    # words: on the live selected task d2277e5e the searched terms were the
+    # previous run's pytest bookkeeping and `replace`, `fixed`, `planner`,
+    # `memory` and `roadmap` never reached the index. Long parts are capped, and
+    # the situation-defining parts are appended last so the recall window keeps
+    # them.
     _MEMORY_QUERY_PART_CHARS = 300
 
     @staticmethod
@@ -1480,10 +2071,20 @@ class Reactor:
             raw_goal = selected_work.get("goal")
             task: dict[str, Any] = raw_task if isinstance(raw_task, dict) else {}
             goal: dict[str, Any] = raw_goal if isinstance(raw_goal, dict) else {}
-            parts.append(str(goal.get("title", "")))
+            # The acceptance criterion is the longest part and contributes the
+            # most terms, but it is generic ("memory entry", "specific",
+            # "recorded"): appended last it filled the whole tail-24 recall
+            # window and evicted the situation words. Measured on the live
+            # database, the searched terms were then acceptance boilerplate and
+            # 8 of 24 matched no memory at all. The situation-defining parts go
+            # last so the window keeps them, and the goal title is the very last:
+            # the task title is often longer, so appending it after the goal
+            # title left 0 of 66 goal-title terms inside the window (measured
+            # 2026-09-22).
+            parts.append(str(task.get("expected_new_fact", "")))
             title = task.get("title") or goal.get("title") or selected_work.get("title", "")
             parts.append(str(title))
-            parts.append(str(task.get("expected_new_fact", "")))
+            parts.append(str(goal.get("title", "")))
         return Reactor._join_query_parts(parts)
 
     def close(self) -> None:

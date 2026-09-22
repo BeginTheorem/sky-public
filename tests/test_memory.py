@@ -1,4 +1,5 @@
-"""Tests for the memory loop, store, retrieval and prompt assembly."""
+"""Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import json
@@ -7,7 +8,6 @@ import sqlite3
 import tempfile
 import time
 import unittest
-from datetime import UTC
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -18,11 +18,6 @@ from skynet.models import AgentRunResult, ModelTurn, RunStatus
 from skynet.store import StateStore
 
 
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
-
 def _seed_memories(store: StateStore, rows: list[tuple[str, str, str, float, str]]) -> None:
     for memory_id, kind, content, confidence, updated_at in rows:
         store.connection.execute(
@@ -32,6 +27,7 @@ def _seed_memories(store: StateStore, rows: list[tuple[str, str, str, float, str
         assert store.memory_store is not None
         store.memory_store.index_memory(memory_id, kind, content)
     store.connection.commit()
+
 
 class CoreTests(unittest.TestCase):
     def test_memory_loop_provider_timeout_degrades_without_blocking(self) -> None:
@@ -143,6 +139,87 @@ class CoreTests(unittest.TestCase):
 
         result = MemoryLoop(InvalidMemoryProvider()).consolidate([], AgentRunResult(RunStatus.COMPLETED, "ok"), "system")
         self.assertEqual(result.evaluation["status"], "degraded")
+    def test_memory_loop_drops_an_undeclared_field_instead_of_degrading(self) -> None:
+        from skynet.memory import MemoryLoop
+
+        class StaticProvider:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=self.text)
+
+        payload = {
+            "memory_candidates": [{"kind": "fact", "content": "kept", "confidence": 0.5}],
+            "next_plan": {"next": "keep going"},
+            "initial_prompt": "prompt",
+            "initial_prompt_note": "the model invented this key on 2026-09-22",
+            "goal_updates": [],
+            "task_updates": [],
+            "evaluation": {},
+        }
+        result = MemoryLoop(StaticProvider(json.dumps(payload))).consolidate(
+            [], AgentRunResult(RunStatus.COMPLETED, "ok"), "system"
+        )
+        self.assertNotEqual(result.evaluation.get("status"), "degraded")
+        self.assertEqual(len(result.memory_candidates), 1)
+        self.assertEqual(result.initial_prompt, "prompt")
+        self.assertIn("response.initial_prompt_note", result.dropped_fields)
+    def test_memory_loop_keeps_valid_sections_when_one_is_malformed(self) -> None:
+        from skynet.memory import MemoryLoop
+
+        class StaticProvider:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=self.text)
+
+        payload = {
+            "memory_candidates": [{"kind": "fact", "content": "kept", "confidence": 0.5}],
+            "next_plan": "not-an-object",
+            "initial_prompt": "prompt",
+            "goal_updates": [],
+            "task_updates": [],
+            "evaluation": {},
+        }
+        result = MemoryLoop(StaticProvider(json.dumps(payload))).consolidate(
+            [], AgentRunResult(RunStatus.COMPLETED, "ok"), "system"
+        )
+        self.assertNotEqual(result.evaluation.get("status"), "degraded")
+        self.assertEqual(len(result.memory_candidates), 1)
+        self.assertEqual(result.next_plan, {})
+        self.assertIn("response.next_plan", result.rejected_sections)
+    def test_memory_loop_still_degrades_when_no_section_is_usable(self) -> None:
+        from skynet.memory import MemoryLoop
+
+        class StaticProvider:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=self.text)
+
+        payload = {"memory_candidates": "wrong type", "next_plan": "wrong type", "initial_prompt": 7}
+        result = MemoryLoop(StaticProvider(json.dumps(payload))).consolidate(
+            [], AgentRunResult(RunStatus.COMPLETED, "ok"), "system"
+        )
+        self.assertEqual(result.evaluation.get("status"), "degraded")
+    def test_memory_query_keeps_goal_title_terms_inside_the_tail_window(self) -> None:
+        from skynet.reactor import Reactor
+
+        goal_title = "Reactor checkpoint retention pointer audit"
+        selected_work = {
+            "task": {
+                "title": "Confirm the acceptance criterion " * 20,
+                "expected_new_fact": "generic acceptance boilerplate wording " * 20,
+            },
+            "goal": {"title": goal_title},
+        }
+        query = Reactor._memory_query(selected_work, [], {})
+        terms = MemoryStore._normalize_terms(query)
+        for token in ("reactor", "checkpoint", "retention", "pointer", "audit"):
+            self.assertIn(token, terms)
     def test_memory_loop_receives_clean_history_and_short_memory(self) -> None:
         from skynet.memory import MemoryLoop
 
@@ -206,8 +283,8 @@ class CoreTests(unittest.TestCase):
     def test_memory_fallback_search_scores_when_fts_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
-            store.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES('m1','fact','durable python knowledge',1.0,NULL,?)", (_iso(518400.0),))
-            store.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES('m2','fact','unrelated note',0.5,NULL,?)", (_iso(518400.0),))
+            store.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES('m1','fact','durable python knowledge',1.0,NULL,?)", ("2026-01-01T00:00:00Z",))
+            store.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES('m2','fact','unrelated note',0.5,NULL,?)", ("2026-01-01T00:00:00Z",))
             store.connection.commit()
             memory_store = store.memory_store
             assert memory_store is not None
@@ -217,23 +294,24 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.search_memories("", limit=5), [])
             store.close()
 
+
 class MemoryRetrievalTests(unittest.TestCase):
     def test_memory_search_long_query_returns_relevant_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             _seed_memories(store, [
-                ("m-rare", "fact", "zymurgy calibration procedure", 0.95, _iso(1555200.0)),
-                ("m-py1", "fact", "python reactor runtime", 0.5, _iso(1036800.0)),
-                ("m-py2", "fact", "python gateway timeout", 0.5, _iso(1123200.0)),
-                ("m-py3", "fact", "python durable index", 0.5, _iso(1209600.0)),
-                ("m-py4", "fact", "python search memory", 0.5, _iso(1296000.0)),
-                ("m-py5", "fact", "python lesson constraint", 0.5, _iso(1382400.0)),
-                ("m-py6", "fact", "python observation outcome", 0.5, _iso(1468800.0)),
-                ("m-x1", "fact", "alpha bravo", 0.1, _iso(0.0)),
-                ("m-x2", "fact", "charlie delta", 0.1, _iso(86400.0)),
-                ("m-x3", "fact", "echo foxtrot", 0.1, _iso(172800.0)),
-                ("m-x4", "fact", "golf hotel", 0.1, _iso(259200.0)),
-                ("m-x5", "fact", "india juliet", 0.1, _iso(345600.0)),
+                ("m-rare", "fact", "zymurgy calibration procedure", 0.95, "2026-06-01T00:00:00Z"),
+                ("m-py1", "fact", "python reactor runtime", 0.5, "2026-05-01T00:00:00Z"),
+                ("m-py2", "fact", "python gateway timeout", 0.5, "2026-05-02T00:00:00Z"),
+                ("m-py3", "fact", "python durable index", 0.5, "2026-05-03T00:00:00Z"),
+                ("m-py4", "fact", "python search memory", 0.5, "2026-05-04T00:00:00Z"),
+                ("m-py5", "fact", "python lesson constraint", 0.5, "2026-05-05T00:00:00Z"),
+                ("m-py6", "fact", "python observation outcome", 0.5, "2026-05-06T00:00:00Z"),
+                ("m-x1", "fact", "alpha bravo", 0.1, "2020-01-01T00:00:00Z"),
+                ("m-x2", "fact", "charlie delta", 0.1, "2020-01-02T00:00:00Z"),
+                ("m-x3", "fact", "echo foxtrot", 0.1, "2020-01-03T00:00:00Z"),
+                ("m-x4", "fact", "golf hotel", 0.1, "2020-01-04T00:00:00Z"),
+                ("m-x5", "fact", "india juliet", 0.1, "2020-01-05T00:00:00Z"),
             ])
             query = "python zymurgy " + " ".join(f"filler{i}" for i in range(1, 21))
             results = store.search_memories(query, limit=20)
@@ -247,7 +325,7 @@ class MemoryRetrievalTests(unittest.TestCase):
     def test_memory_search_stopword_only_and_empty_queries_return_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
-            _seed_memories(store, [("m1", "fact", "durable python knowledge", 1.0, _iso(518400.0))])
+            _seed_memories(store, [("m1", "fact", "durable python knowledge", 1.0, "2026-01-01T00:00:00Z")])
             self.assertEqual(store.search_memories("the and of to", limit=5), [])
             self.assertEqual(store.search_memories("", limit=5), [])
             self.assertEqual(store.search_memories("a", limit=5), [])
@@ -262,19 +340,28 @@ class MemoryRetrievalTests(unittest.TestCase):
         self.assertNotIn("word0", terms)
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
-            _seed_memories(store, [("m-tail", "fact", "word199 marker", 0.5, _iso(518400.0))])
+            _seed_memories(store, [("m-tail", "fact", "word199 marker", 0.5, "2026-01-01T00:00:00Z")])
             results = store.search_memories(query, limit=5)
             self.assertIn("m-tail", [item["memory_id"] for item in results])
             store.close()
+
+    def test_normalize_terms_anchors_a_repeat_at_its_last_occurrence(self) -> None:
+        # Callers append the situation-defining parts last, so a goal term that
+        # already appeared earlier must be anchored at its last occurrence; the
+        # old first-occurrence dedup pushed it out of the 24-term window.
+        query = "goal " + " ".join(f"f{index}" for index in range(30)) + " goal"
+        terms = MemoryStore._normalize_terms(query)
+        self.assertEqual(len(terms), 24)
+        self.assertEqual(terms[-1], "goal")
 
     def test_rrf_lifts_recent_confident_partial_match_above_stale_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             _seed_memories(store, [
-                ("m-stale", "fact", "alpha beta gamma delta", 0.10, _iso(0.0)),
-                ("m-fresh", "fact", "alpha", 0.95, _iso(518400.0)),
-                ("m-recent-a", "fact", "unrelated recent item one", 0.90, _iso(864000.0)),
-                ("m-recent-b", "fact", "unrelated recent item two", 0.99, _iso(950400.0)),
+                ("m-stale", "fact", "alpha beta gamma delta", 0.10, "2020-01-01T00:00:00Z"),
+                ("m-fresh", "fact", "alpha", 0.95, "2026-01-01T00:00:00Z"),
+                ("m-recent-a", "fact", "unrelated recent item one", 0.90, "2026-02-01T00:00:00Z"),
+                ("m-recent-b", "fact", "unrelated recent item two", 0.99, "2026-03-01T00:00:00Z"),
             ])
             ids = [item["memory_id"] for item in store.search_memories("alpha beta gamma delta", limit=10)]
             self.assertLess(ids.index("m-fresh"), ids.index("m-stale"))
@@ -284,8 +371,8 @@ class MemoryRetrievalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             _seed_memories(store, [
-                ("m-strong", "fact", "alpha beta gamma", 0.5, _iso(432000.0)),
-                ("m-weak", "fact", "alpha", 0.5, _iso(432000.0)),
+                ("m-strong", "fact", "alpha beta gamma", 0.5, "2025-01-01T00:00:00Z"),
+                ("m-weak", "fact", "alpha", 0.5, "2025-01-01T00:00:00Z"),
             ])
             ids = [item["memory_id"] for item in store.search_memories("alpha beta gamma", limit=10)]
             self.assertLess(ids.index("m-strong"), ids.index("m-weak"))
@@ -321,7 +408,7 @@ class MemoryRetrievalTests(unittest.TestCase):
             store = StateStore(path)
             store.connection.execute(
                 "INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES('m1','fact','durable python knowledge',1.0,NULL,?)",
-                (_iso(518400.0),),
+                ("2026-01-01T00:00:00Z",),
             )
             store.connection.execute("DROP TABLE memories_fts")
             store.connection.commit()
@@ -347,10 +434,10 @@ class MemoryRetrievalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             _seed_memories(store, [
-                ("m-legacy-1", "technical_fact", "shared fact", 0.4, _iso(518400.0)),
-                ("m-legacy-2", "code_fact", "unique legacy", 0.7, _iso(604800.0)),
-                ("m-canonical", "fact", "shared fact", 0.9, _iso(691200.0)),
-                ("m-keep", "fact", "untouched", 0.5, _iso(777600.0)),
+                ("m-legacy-1", "technical_fact", "shared fact", 0.4, "2026-01-01T00:00:00Z"),
+                ("m-legacy-2", "code_fact", "unique legacy", 0.7, "2026-01-02T00:00:00Z"),
+                ("m-canonical", "fact", "shared fact", 0.9, "2026-01-03T00:00:00Z"),
+                ("m-keep", "fact", "untouched", 0.5, "2026-01-04T00:00:00Z"),
             ])
             assert store.memory_store is not None
             changed = store.memory_store.normalize_legacy_kinds()
@@ -371,14 +458,15 @@ class MemoryRetrievalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             _seed_memories(store, [
-                ("m1", "fact", "alpha durable state", 0.8, _iso(518400.0)),
-                ("m2", "fact", "unrelated note", 0.2, _iso(604800.0)),
+                ("m1", "fact", "alpha durable state", 0.8, "2026-01-01T00:00:00Z"),
+                ("m2", "fact", "unrelated note", 0.2, "2026-01-02T00:00:00Z"),
             ])
             results = store.search_memories("alpha", limit=5)
             self.assertTrue(results)
             for item in results:
                 self.assertIn("score", item)
             store.close()
+
 
 class MemoryPromptTests(unittest.TestCase):
     def test_the_memory_prompt_drops_the_react_system_message(self) -> None:

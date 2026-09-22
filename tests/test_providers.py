@@ -17,9 +17,9 @@ from skynet.providers import build_provider
 from skynet.providers.errors import ProviderError
 from skynet.providers.fallback import FallbackProvider
 from skynet.providers.key_rotator import KeyRotator, KeySlot
+from skynet.providers.openrouter import OpenRouterRouterProvider
 from skynet.providers.ollama import OllamaCloudProvider
 from skynet.providers.openai_compatible import OpenAICompatibleProvider
-from skynet.providers.openrouter import OpenRouterProvider
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -121,8 +121,42 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(any("fallback_failure" in line and "nvidia_deepseek" in line for line in captured.output))
         self.assertTrue(any("fallback_selected" in line and "nvidia" in line for line in captured.output))
 
+    def test_provider_failure_reaches_the_durable_event_log(self) -> None:
+        # A provider strike and the whole chain going into cooldown used to be
+        # written only to state/runtime.jsonl, so a failed run left no durable
+        # post-mortem. The reactor wires the store's record_provider_event as
+        # the provider hook; prove the promoted kinds land in event_log.
+        from skynet.store import StateStore
+
+        class Failed:
+            name = "openrouter"
+            def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
+                raise ProviderError("down", category="network", retryable=True, cooldown_seconds=30)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                fallback = FallbackProvider([Failed()])
+                fallback.set_event_logger(store.record_provider_event)
+                with self.assertRaisesRegex(Exception, "all providers failed"):
+                    fallback.complete([], max_tokens=1)
+                with self.assertRaisesRegex(Exception, "all providers failed"):
+                    fallback.complete([], max_tokens=1)
+                kinds = {
+                    str(row[0])
+                    for row in store.connection.execute(
+                        "SELECT kind FROM event_log WHERE kind IN ('fallback_failure', 'fallback_all_cooling')"
+                    )
+                }
+            finally:
+                store.close()
+        self.assertIn("fallback_failure", kinds)
+        self.assertIn("fallback_all_cooling", kinds)
+
     def test_fallback_attempt_is_not_reported_as_a_strike(self) -> None:
-        # The pre-attempt signal says an attempt began, not that one failed.
+        # The pre-attempt signal says an attempt began, not that one failed:
+        # ~91% of successful first tries were logged as a strike, so operator
+        # reports read a success as a failure.
         class Good:
             name = "openrouter"
             def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
@@ -267,7 +301,7 @@ class ProviderTests(unittest.TestCase):
                     b'data: {"usage":{"total_tokens":7}}\n\n',
                     b'data: [DONE]\n\n',
                 ])
-        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.text, "hello world")
         self.assertEqual(result.usage_tokens, 7)
@@ -281,7 +315,7 @@ class ProviderTests(unittest.TestCase):
                 time.sleep(0.02)
                 yield b'data: [DONE]\n\n'
 
-        provider = OpenRouterProvider(
+        provider = OpenRouterRouterProvider(
             base_url=self.base_url,
             api_key="openrouter-secret",
             model="openai/gpt-5.6-luna",
@@ -302,11 +336,82 @@ class ProviderTests(unittest.TestCase):
                     b'data: [DONE]\n\n',
                 ])
 
-        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.text, "")
         self.assertEqual(result.usage_tokens, 3)
         self.assertEqual(result.tool_calls[0].arguments, {})
+
+    def test_openrouter_terminal_finish_reason_ends_the_stream_without_done(self) -> None:
+        # A stream is terminated by either the [DONE] sentinel or a terminal
+        # finish_reason. Requiring the sentinel alone discarded a complete answer
+        # whose tool calls and usage had already arrived.
+        class Response:
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"content":"answered"}}]}\n\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":5}}\n\n',
+                ])
+
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        result = provider._parse_sse(Response(), idle_seconds=60.0)
+        self.assertEqual(result.text, "answered")
+        self.assertEqual(result.finish_reason, "stop")
+        self.assertEqual(result.usage_tokens, 5)
+
+    def test_openrouter_stream_with_neither_terminator_stays_retryable(self) -> None:
+        class Response:
+            def __iter__(self):
+                return iter([b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'])
+
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        with self.assertRaisesRegex(ProviderError, "before \\[DONE\\]") as raised:
+            provider._parse_sse(Response(), idle_seconds=60.0)
+        self.assertEqual(raised.exception.category, "network")
+        self.assertTrue(raised.exception.retryable)
+
+    def test_openrouter_reads_the_reasoning_alias_and_does_not_double_count(self) -> None:
+        # OpenRouter spells the reasoning channel `reasoning`, not `reasoning_content`;
+        # a delta that carries both spellings must still count the text once.
+        class Response:
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"reasoning":"thinking"}}]}\n\n',
+                    b'data: {"choices":[{"delta":{"reasoning_content":"both","reasoning":"both-again"}}]}\n\n',
+                    b'data: [DONE]\n\n',
+                ])
+
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        result = provider._parse_sse(Response(), idle_seconds=60.0)
+        self.assertEqual(result.reasoning_content, "thinkingboth")
+
+    def test_fallback_selected_logs_finish_reason_and_completion_tokens(self) -> None:
+        class Good:
+            name = "openrouter"
+
+            def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
+                return ModelTurn(text="ok", completion_tokens=7, finish_reason="length")
+
+        captured: list[tuple[str, dict[str, object]]] = []
+        provider = FallbackProvider([Good()])
+        provider.set_event_logger(lambda event, payload: captured.append((event, payload)))
+        self.assertEqual(provider.complete([], max_tokens=1).text, "ok")
+        selected = next(payload for event, payload in captured if event == "fallback_selected")
+        self.assertEqual(selected["finish_reason"], "length")
+        self.assertEqual(selected["completion_tokens"], 7)
+
+    def test_openai_parse_propagates_finish_reason(self) -> None:
+        from skynet.providers.openai_compatible import _as_finish_reason
+
+        self.assertIsNone(_as_finish_reason(None))
+        self.assertIsNone(_as_finish_reason(""))
+        self.assertIsNone(_as_finish_reason(3))
+        self.assertEqual(_as_finish_reason("tool_calls"), "tool_calls")
+        provider = OpenAICompatibleProvider(name="nvidia", base_url=self.base_url, api_key="key", model="m")
+        turn = provider._parse({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]})
+        self.assertEqual(turn.finish_reason, "stop")
+        absent = provider._parse({"choices": [{"message": {"content": "hi"}}]})
+        self.assertIsNone(absent.finish_reason)
 
     def test_fallback_ladder_escalates_timeouts_and_pauses_between_strikes(self) -> None:
         from skynet.providers.errors import ProviderError
@@ -331,7 +436,11 @@ class ProviderTests(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - started, 0.1)
 
     def test_fallback_reports_model_time_without_strike_delay(self) -> None:
-        """Backoff between strikes is infrastructure, not model thinking."""
+        """Backoff between strikes is infrastructure, not model thinking.
+
+        Charging it to the run's model budget made slow-but-healthy chains
+        exhaust a run at a few dozen steps.
+        """
         from skynet.providers.errors import ProviderError
 
         class Flaky:
@@ -410,7 +519,7 @@ class ProviderTests(unittest.TestCase):
                 time.sleep(0.05)
                 yield b'data: [DONE]\n\n'
 
-        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m", timeout_seconds=0.01)
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m", timeout_seconds=0.01)
         with patch("skynet.providers.openrouter.request.urlopen", return_value=Response()):
             result = provider.complete([], max_tokens=1)
         self.assertEqual(result.text, "ab")
@@ -428,7 +537,7 @@ class ProviderTests(unittest.TestCase):
                 time.sleep(0.05)
                 yield b'data: [DONE]\n\n'
 
-        provider = OpenRouterProvider(
+        provider = OpenRouterRouterProvider(
             base_url=self.base_url,
             api_key="openrouter-secret",
             model="m",
@@ -439,8 +548,12 @@ class ProviderTests(unittest.TestCase):
             provider.complete([], max_tokens=1)
 
     def test_openrouter_timeout_override_is_an_idle_budget_not_a_deadline(self) -> None:
-        """The fallback ladder's rung must bound silence, never total stream time."""
-        provider = OpenRouterProvider(
+        """The fallback ladder's rung must bound silence, never total stream time.
+
+        Treating it as a total deadline cut off long, actively-streaming
+        reasoning responses and produced the openrouter strike storm.
+        """
+        provider = OpenRouterRouterProvider(
             base_url=self.base_url,
             api_key="openrouter-secret",
             model="m",
@@ -607,7 +720,7 @@ class ProviderTests(unittest.TestCase):
             with patch.dict(os.environ, environment, clear=True), patch("skynet.providers.money_boost_state_path", return_value=state):
                 provider = cast(Any, build_provider())
         self.assertEqual([item.name for item in provider.providers], ["openrouter", "ollama"])
-        openrouter = cast(OpenRouterProvider, provider.providers[0])
+        openrouter = cast(OpenRouterRouterProvider, provider.providers[0])
         self.assertEqual(openrouter.timeout_seconds, 30.0)
         self.assertEqual(openrouter.max_attempts, 3)
 
@@ -645,17 +758,17 @@ class ProviderTests(unittest.TestCase):
         environment = {
             "SKYNET_PROVIDER_CHAIN": "nvidia",
             "NVIDIA_API_KEY": "nvidia-secret",
-            "NVIDIA_PROXY_URL": "socks5://127.0.0.1:1080",
+            "NVIDIA_PROXY_URL": "socks5://127.0.0.1:9050",
         }
         with patch.dict(os.environ, environment, clear=True):
             provider = cast(Any, build_provider())
         nvidia = provider.providers[0]
-        self.assertEqual(nvidia.proxy_url, "socks5://127.0.0.1:1080")
+        self.assertEqual(nvidia.proxy_url, "socks5://127.0.0.1:9050")
 
     def test_proxy_scope_is_reentrant_and_restores_socket(self) -> None:
         import socket
 
-        provider = OpenAICompatibleProvider(name="socks", base_url="http://example.invalid", api_key="", model="m", proxy_url="socks5://127.0.0.1:1080")
+        provider = OpenAICompatibleProvider(name="tor", base_url="http://example.invalid", api_key="", model="m", proxy_url="socks5://127.0.0.1:9050")
         original = socket.create_connection
         with provider._proxy_scope():
             patched = socket.create_connection
@@ -868,7 +981,7 @@ class ProviderTests(unittest.TestCase):
             def __iter__(self):
                 yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
 
-        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
         with self.assertRaises(ProviderError) as raised:
             provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(raised.exception.category, "network")
@@ -895,7 +1008,7 @@ class ProviderTests(unittest.TestCase):
                     yield ("data: " + json.dumps(chunk) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
 
-        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
+        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.tool_calls[0].tool_name, "bash")
         self.assertEqual(result.tool_calls[0].call_id, "call_1")

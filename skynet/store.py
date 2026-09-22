@@ -6,7 +6,8 @@ import math
 import os
 import random
 import sqlite3
-from collections.abc import Iterator, Mapping
+import threading
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -17,6 +18,28 @@ from .memory_store import MemoryStore, normalize_memory_kind
 from .models import AgentState, LifecycleState, RunRecord, RunStatus
 from .runtime_log import RuntimeLog
 from .time import utc_datetime_now, utc_now
+
+# A ledger row whose result carries one of these markers records a refusal
+# decision, not an application: `skynet/tools.py` returns before executing the
+# command for BOTH the soft denylist (`policy_warning`, tools.py:234) and the
+# resurrection hard denylist (`policy_denied`, tools.py:190). Such a row must
+# therefore not count as a prior application. The hard marker was missing from
+# both effect-identity readers after commit 0ee707191708c0bf2f7fe4cca1367ce77902a6
+# fixed only the soft one; measured on the live ledger 2026-09-22 (generation
+# 92), 10 rows carry `policy_denied` and all 10 are the first and only row of
+# their identity, so the omission is latent rather than active. Excluding both
+# changes 0 of the 42 announced identities and 0 same_run_repeat decisions.
+_REFUSAL_RESULT_MARKERS = ("policy_warning", "policy_denied")
+_REFUSAL_RESULT_PREDICATE = " AND ".join(
+    f"json_extract({{alias}}.result, '$.{marker}') IS NULL" for marker in _REFUSAL_RESULT_MARKERS
+)
+# The durable label that separates a refusal from an application. A response
+# body is not an application: a row carrying this status never ran the tool, so
+# no reader may count it as work. The label is derived from the same markers the
+# SQL predicate above reads, and both are kept: the label is what the writer
+# stamps from now on, the marker predicate is what the 63 refusal rows already
+# on disk (measured 2026-09-22, generation 93) are still recognised by.
+REFUSED_EFFECT_STATUS = "refused"
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -40,7 +63,9 @@ CREATE TABLE IF NOT EXISTS runs (
     budget TEXT NOT NULL,
     heartbeat_at TEXT,
     last_phase TEXT,
-    last_progress_at TEXT
+    last_progress_at TEXT,
+    steps INTEGER NOT NULL DEFAULT 0,
+    usage_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS run_results (
     run_id TEXT PRIMARY KEY,
@@ -248,6 +273,12 @@ CREATE INDEX IF NOT EXISTS idx_event_log_kind ON event_log(kind, sequence DESC);
 CREATE INDEX IF NOT EXISTS idx_transcript_run ON transcript(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_stale ON runs(status, heartbeat_at);
 CREATE INDEX IF NOT EXISTS idx_evaluations_run ON evaluations(run_id);
+-- effect_reapplied_runs (below) looks up a call identity by (capability,
+-- arguments_hash) and orders the distinct runs by created_at; without this
+-- index that is a full SCAN of a monotonically growing table on the tool-call
+-- path (measured 2026-09-20 on the live ledger, 2101 rows: 1.328 ms/call,
+-- SCAN + two temp B-trees; with the index 0.014 ms/call, ~97x, covering SEARCH).
+CREATE INDEX IF NOT EXISTS idx_capability_effects_identity ON capability_effects(capability, arguments_hash, created_at, idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(delivery_state, created_at);
 CREATE INDEX IF NOT EXISTS idx_inbox_pending ON inbox(consumed_at);
 CREATE INDEX IF NOT EXISTS idx_hypotheses_structural ON hypotheses(structural_fingerprint);
@@ -265,8 +296,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_area ON tasks(area, status);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned, updated_at DESC);
 """
 
-SCHEMA_VERSION = 11
-MIGRATION_NAMES = {3: "durable-boundaries", 4: "measured-liveness", 5: "planning-rng", 6: "owner-dialogue", 7: "dead-persistence", 8: "drop-dead-checkpoints", 9: "memory-validity", 10: "idea-archive", 11: "memory-decay-clock"}
+SCHEMA_VERSION = 12
+MIGRATION_NAMES = {3: "durable-boundaries", 4: "measured-liveness", 5: "planning-rng", 6: "owner-dialogue", 7: "dead-persistence", 8: "drop-dead-checkpoints", 9: "memory-validity", 10: "idea-archive", 11: "memory-decay-clock", 12: "run-progress"}
 
 # `evaluations.run_id` is NOT NULL; metrics snapshots belong to no run, so they
 # share one sentinel instead of inventing a fake run identity.
@@ -276,26 +307,87 @@ METRICS_RUN_ID = "metrics"
 # when this process first opens the store. Doing it on every writable open
 # reset a live in-flight lease as soon as the reactor and telegram processes
 # opened the same file, so the same message could be delivered twice.
+#
+# The flag is per-process, and the reactor and the telegram bot are separate
+# processes: each starts with it unset, so the first writable open in *each* of
+# them ran the unconditional UPDATE. Measured 2026-09-21 (generation 51) on a
+# scratch store: the reactor claims a message (`delivering`, `claimed_at` set),
+# a second process opens the same file and the row is back to `pending` with
+# `claimed_at` untouched, and that process immediately re-claims it -- exactly
+# the double delivery the docstring forbids. Startup recovery therefore
+# recovers only leases older than the claim window, which is what actually
+# distinguishes a dead sender from a live one.
 _INFLIGHT_LEASES_RECOVERED = False
+
+# How long a claimed outbox row may stay `delivering` before another consumer
+# may take it. Shared by `claim` and by startup recovery so the two can never
+# disagree about which leases are live.
+OUTBOX_LEASE_SECONDS = 300.0
 
 # Event kinds that survive every retention window: the post-mortem of a failed
 # experiment is exactly the set of things that went wrong.
 PROTECTED_EVENT_KINDS = frozenset({
     "doom_loop", "budget_exhausted", "emergency_finish", "watchdog_timeout",
+    "owner_stop",
     "uncaptured_changes", "finish_invalid", "finish_failure", "restart_failed",
-    "restart_escalated", "restart_skipped", "cycle_error", "provider_lockout",
+    # A Finish Report action contradicted by the run's own capability ledger:
+    # the post-mortem must survive retention exactly like uncaptured_changes.
+    "report_claim_unverified",
+    "restart_requested", "restart_escalated", "restart_skipped", "cycle_error", "provider_lockout",
     "provider_failure", "provider_error_classified", "worktree_dirty_after_bash",
-    "livelock_suspected", "memory_loop_failed", "policy_denied", "policy_soft_denied",
+    "livelock_suspected", "memory_loop_failed", "memory_degraded", "policy_denied", "policy_soft_denied",
     "policy_override_confirmed", "registry_corrupted", "mcp_server_unavailable",
     "tool_name_collision", "outbox_dead_letter", "outbox_backlog_suppressed",
     "alert_raised", "task_gave_up", "success_criteria_failed", "goal_proposal_rejected",
+    # A planning attempt that crashed and one that genuinely found no work are the
+    # same empty portfolio; only these kinds tell them apart, so retention must not
+    # drop the evidence that the planner failed.
+    "planner_invalid_response", "planner_provider_error", "planner_output_truncated", "planner_fallback_capped",
+    # The shape of the planner's own model turn: the only durable record that
+    # separates an empty reply from one whose tokens went to the reasoning
+    # channel, so retention must not erase the planner post-mortem.
+    "planner_turn",
+    # The watchdog's only durable trace that the gate-protected planner contour
+    # degraded; the alert row is deduped, so this event is the post-mortem.
+    "judge_health_degraded",
+    # A protected-path proposal is only warned, not rejected; the warning and
+    # the acknowledgement of the identical resubmission are the durable trace
+    # of the warn-once mechanism. The retired soft-denial/approval kinds stay
+    # listed so history is never pruned.
+    "gate_protected_warned", "gate_protected_warning_acknowledged",
+    "gate_protected_soft_denied", "gate_protected_approved",
+    # The A1-lite plan artifact is the measurement substrate for whether an
+    # explicit plan improves a run; retention must not erase the evidence
+    # before the owner can judge the experiment.
+    "plan_recorded", "plan_observation",
     "memory_kinds_normalized", "improvement_proposals_reconciled",
+    "improvement_environment_blocks_resolved",
     "recovery_reconciliation", "run_failure", "run_interrupted", "metrics_snapshot",
+    "effect_reapplied",
     "provider_error", "provider_retry", "fallback_failure", "fallback_skipped",
+    # Chain-level diagnostics that used to be runtime-only: a dead or fully
+    # cooling provider chain is exactly the post-mortem a failed experiment
+    # depends on, so retention must not drop it.
+    "fallback_all_cooling", "provider_chain_reloaded",
+    # Supervisor lifecycle: whether the process actually started, stopped and
+    # observed a reboot window is the durable frame around every cycle.
+    "supervisor_start", "supervisor_stop", "reboot_observation",
     # The idea archive is the organism's lineage: losing it would erase which
     # stepping stones were tried and why, so it survives every retention window.
     "idea_archived", "idea_superseded", "idea_archive_rejected", "idea_materialized",
     "external_seek_created", "external_senses_unavailable", "idea_learnability_rejected",
+})
+
+# Provider-chain diagnostics that are low-volume and diagnostically load-bearing:
+# the reactor's provider hook routes these through ``append_event`` so they
+# survive retention, while the high-volume attempt/selection/request kinds stay
+# in the advanced runtime projection only. ``append_event`` already mirrors a row
+# into that projection as kind ``event``, so the promoted kinds must NOT also be
+# written with ``runtime_log.write`` (that would duplicate every row).
+DURABLE_PROVIDER_EVENT_KINDS = frozenset({
+    "fallback_failure",
+    "fallback_all_cooling",
+    "provider_chain_reloaded",
 })
 
 
@@ -352,11 +444,14 @@ class RunRepository:
             (run.run_id, run.attempt, run.status.value, run.started_at, run.finished_at, json.dumps({"steps": run.budget.steps, "tokens": run.budget.tokens, "seconds": run.budget.seconds}), utc_now(), "initial", utc_now()),
         )
 
-    def touch(self, run_id: str, phase: str, *, progress: bool = False) -> None:
+    def touch(self, run_id: str, phase: str, *, progress: bool = False, steps: int | None = None, usage_tokens: int | None = None) -> None:
         now = utc_now()
         self.connection.execute(
-            "UPDATE runs SET heartbeat_at=?, last_phase=?, last_progress_at=CASE WHEN ? THEN ? ELSE last_progress_at END WHERE run_id=? AND status='running'",
-            (now, phase, progress, now, run_id),
+            "UPDATE runs SET heartbeat_at=?, last_phase=?, "
+            "last_progress_at=CASE WHEN ? THEN ? ELSE last_progress_at END, "
+            "steps=COALESCE(?, steps), usage_tokens=COALESCE(?, usage_tokens) "
+            "WHERE run_id=? AND status='running'",
+            (now, phase, progress, now, steps, usage_tokens, run_id),
         )
 
     def finish(self, run_id: str, status: RunStatus) -> None:
@@ -382,7 +477,7 @@ class OutboxRepository:
         rows = self.connection.execute("SELECT * FROM outbox WHERE delivery_state='pending' ORDER BY created_at LIMIT ?", (limit,)).fetchall()
         return [{"message_id": row["message_id"], "kind": row["kind"], "payload": json.loads(row["payload"])} for row in rows]
 
-    def claim(self, limit: int = 50, lease_seconds: float = 300.0) -> list[dict[str, Any]]:
+    def claim(self, limit: int = 50, lease_seconds: float = OUTBOX_LEASE_SECONDS) -> list[dict[str, Any]]:
         expired_before = (utc_datetime_now() - timedelta(seconds=max(1.0, lease_seconds))).isoformat().replace("+00:00", "Z")
         rows = self.connection.execute("SELECT * FROM outbox WHERE delivery_state='pending' OR (delivery_state='delivering' AND claimed_at < ?) ORDER BY created_at LIMIT ?", (expired_before, limit)).fetchall()
         messages = []
@@ -510,6 +605,10 @@ class StateStore:
         else:
             self.connection = sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
+        # The connection belongs to this thread. The provider chain also runs on
+        # the memory-loop and planner worker threads, so a durable diagnostic
+        # from there must not touch this object (see record_provider_event).
+        self._connection_thread = threading.get_ident()
         # The watchdog thread and the telegram process open the same file; a
         # short busy timeout turns a transient write lock into a wait instead of
         # an immediate "database is locked" failure. synchronous=NORMAL is the
@@ -556,6 +655,13 @@ class StateStore:
             self.connection.execute("ALTER TABLE runs ADD COLUMN last_phase TEXT")
         if "last_progress_at" not in run_columns:
             self.connection.execute("ALTER TABLE runs ADD COLUMN last_progress_at TEXT")
+        if "steps" not in run_columns:
+            # A run that dies mid-episode keeps only its final zeros: the
+            # in-memory counters never reached a row. Persist the running totals
+            # so an interrupted run's cost survives the process.
+            self.connection.execute("ALTER TABLE runs ADD COLUMN steps INTEGER NOT NULL DEFAULT 0")
+        if "usage_tokens" not in run_columns:
+            self.connection.execute("ALTER TABLE runs ADD COLUMN usage_tokens INTEGER NOT NULL DEFAULT 0")
         if "claimed_at" not in columns:
             self.connection.execute("ALTER TABLE outbox ADD COLUMN claimed_at TEXT")
         reset_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(planner_resets)")}
@@ -665,23 +771,44 @@ class StateStore:
             (LifecycleState.BOOT.value,),
         )
 
-    def recover_inflight_outbox(self) -> int:
+    def recover_inflight_outbox(self, *, stale_after_seconds: float | None = None) -> int:
         """Return `delivering` outbox leases to `pending` after a crash.
 
         Explicit on purpose: this is startup recovery, not a side effect of
         opening the database. A second process opening the same file while a
         send is in flight must not steal the lease (that double-delivers).
+
+        ``stale_after_seconds=None`` keeps the original "recover every
+        `delivering` row" behaviour for a deliberate operator call. The
+        automatic startup path passes the lease window instead, because a
+        process cannot tell a crashed sender from a live one by a per-process
+        flag and must not reset a lease another process may still be holding.
+        An expired lease stays recoverable either way: ``claim`` already treats
+        `delivering` rows older than the window as claimable, so nothing is
+        stranded behind this predicate.
         """
+        if stale_after_seconds is None:
+            return max(0, self.connection.execute(
+                "UPDATE outbox SET delivery_state='pending' WHERE delivery_state='delivering'"
+            ).rowcount)
+        cutoff = (utc_datetime_now() - timedelta(seconds=max(1.0, stale_after_seconds))).isoformat().replace("+00:00", "Z")
         return max(0, self.connection.execute(
-            "UPDATE outbox SET delivery_state='pending' WHERE delivery_state='delivering'"
+            "UPDATE outbox SET delivery_state='pending' "
+            "WHERE delivery_state='delivering' AND (claimed_at IS NULL OR claimed_at < ?)",
+            (cutoff,),
         ).rowcount)
 
     def _recover_inflight_leases_once(self) -> None:
-        """Run stale-lease recovery on the first writable open of this process."""
+        """Run stale-lease recovery on the first writable open of this process.
+
+        Stale-only, because the per-process flag does not make this open the
+        first one on the *file*: the telegram bot starting during a reactor send
+        used to reset that send's live lease and deliver the message twice.
+        """
         global _INFLIGHT_LEASES_RECOVERED
         if _INFLIGHT_LEASES_RECOVERED:
             return
-        self.recover_inflight_outbox()
+        self.recover_inflight_outbox(stale_after_seconds=OUTBOX_LEASE_SECONDS)
         _INFLIGHT_LEASES_RECOVERED = True
 
     def state(self) -> AgentState:
@@ -843,8 +970,20 @@ class StateStore:
     def create_run(self, run: RunRecord) -> None:
         self.runs.create(run)
 
-    def touch_run(self, run_id: str, phase: str, *, progress: bool = False) -> None:
-        self.runs.touch(run_id, phase, progress=progress)
+    def touch_run(self, run_id: str, phase: str, *, progress: bool = False, steps: int | None = None, usage_tokens: int | None = None) -> None:
+        self.runs.touch(run_id, phase, progress=progress, steps=steps, usage_tokens=usage_tokens)
+
+    def run_usage(self, run_id: str) -> dict[str, int]:
+        """The run's durable running totals, so a killed episode keeps its cost.
+
+        The ReAct loop's counters live in memory and only reach `run_results` on
+        a Finish Report; an interrupted run used to be recorded as steps=0,
+        tokens=0 even after dozens of tool calls.
+        """
+        row = self.connection.execute("SELECT steps, usage_tokens FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            return {"steps": 0, "usage_tokens": 0}
+        return {"steps": int(row["steps"] or 0), "usage_tokens": int(row["usage_tokens"] or 0)}
 
     def stale_active_run(self, before: str) -> str | None:
         """Return the active run id when its heartbeat is older than `before`.
@@ -896,6 +1035,49 @@ class StateStore:
     def run_result(self, run_id: str) -> dict[str, Any] | None:
         return self.runs.result(run_id)
 
+    def run_effect_capabilities(self, run_id: str) -> dict[str, int]:
+        """How many calls this run actually ran, per capability.
+
+        `capability_effects.idempotency_key` is `{run_id}:{step}:{call_id}`, so
+        the run prefix isolates one run's calls. This is the evidence a Finish
+        Report claim can be checked against: a tool that always records an
+        effect and has a zero count here did not run.
+
+        Counting *rows* was not the same question. `skynet/tools.py` returns a
+        policy refusal before the command runs, and until this reader excluded
+        them a refusal row satisfied the check for the tool it named. The
+        exclusion is two-fold because the ledger holds rows from both eras:
+        `status` names the refusals written since the label exists, and the
+        marker predicate names those already on disk. Measured on the live
+        ledger 2026-09-22 (generation 93): of the 8 consumers of this table this
+        is the only one that counted a refusal as an application, and 0 of the
+        63 refusal rows belong to a claim tool, so the repair changes no verdict
+        recorded so far - it closes the hole instead of altering history.
+        """
+        rows = self.connection.execute(
+            "SELECT capability, count(*) AS n FROM capability_effects AS p "
+            "WHERE p.idempotency_key LIKE ? || ':%' AND p.status != ? AND "
+            + _REFUSAL_RESULT_PREDICATE.format(alias="p")
+            + " GROUP BY capability",
+            (run_id, REFUSED_EFFECT_STATUS),
+        ).fetchall()
+        return {str(row["capability"]): int(row["n"]) for row in rows}
+
+    @staticmethod
+    def effect_status(result: Mapping[str, Any]) -> str:
+        """The ledger `status` for one finished tool call.
+
+        The single place that decides whether a result is an application or a
+        refusal, so the writer (`react.py` records every result) and the reader
+        above cannot drift apart. A refusal never executed the command, so it is
+        labelled `REFUSED_EFFECT_STATUS`; anything else is `applied` when the
+        tool reported success and `failed` when it ran and reported a failure -
+        a failing command is work, a refused one is not.
+        """
+        if any(result.get(marker) for marker in _REFUSAL_RESULT_MARKERS):
+            return REFUSED_EFFECT_STATUS
+        return "applied" if result.get("ok") else "failed"
+
     def recent_run_events(self, run_id: str, limit: int | None = 20) -> list[dict[str, Any]]:
         """Return the bounded, non-reasoning episode needed for recovery."""
         return self.events.recent(run_id, limit)
@@ -904,29 +1086,152 @@ class StateStore:
         allowed = {"run_started", "tool_call", "tool_result", "provider_failure", "provider_error_classified", "provider_retry", "tool_failure", "tool_retry", "context_warning", "context_compacted", "context_limit", "finish_report", "run_finished", "doom_loop"}
         return [event for event in self.recent_run_events(run_id, limit) if event["kind"] in allowed]
 
+    def _snapshot_transcript(self, run_id: str) -> list[dict[str, Any]]:
+        """The transcript projection a snapshot exposes, rebuilt from the table.
+
+        ``react_history`` is the latest-state row the memory loop reads directly
+        from the transcript table (``reactor.py:408``), so embedding it again
+        would duplicate the run.
+        """
+        return [row for row in self.recent_transcript(run_id) if row["kind"] != "react_history"]
+
     def snapshot_episode(self, run_id: str) -> dict[str, Any]:
+        """Freeze one run's episode; the events are stored, the transcript is not.
+
+        Measured 2026-09-20 (generation 46, ``dbstat`` on a read-only copy of the
+        live ledger): the ``transcript`` part was 3.179 MB of the 13.700 MB of
+        snapshot payload (23.2%), and the read-time rebuild reproduced all 43
+        stored copies exactly (0 mismatches, both directions). The copy also had
+        no lifetime of its own: ``prune_run_history`` deletes ``transcript`` and
+        ``episode_snapshots`` in one statement under one ``keep_runs`` window, and
+        no production reader touches it -- only ``snapshot["events"]``
+        (``reactor.py:396``) and ``snapshot["snapshot_id"]`` (``reactor.py:424``)
+        are read. It was a frozen duplicate of a projection, so the row now keeps
+        a pointer to its source instead of the payload and the projection is
+        rebuilt on read.
+        """
         existing = self.connection.execute("SELECT snapshot_id, first_sequence, last_sequence, payload_hash, payload FROM episode_snapshots WHERE run_id=?", (run_id,)).fetchone()
         if existing:
             snapshot = json.loads(existing[4])
             if isinstance(snapshot, list):
-                snapshot = {"events": snapshot, "transcript": []}
+                snapshot = {"events": snapshot}
+            # A legacy row carries its own frozen transcript list; only a pointer
+            # (or a missing part) is rebuilt, so old bytes keep their meaning.
+            if not isinstance(snapshot.get("transcript"), list):
+                snapshot["transcript"] = self._snapshot_transcript(run_id)
             return {"snapshot_id": existing[0], "run_id": run_id, "first_sequence": existing[1], "last_sequence": existing[2], "payload_hash": existing[3], **snapshot}
         events = self.episode_for_memory(run_id, limit=None)
-        # react_history is the latest-state row read directly from the transcript
-        # table by the memory loop; embedding it again would duplicate the run.
-        transcript = [row for row in self.recent_transcript(run_id) if row["kind"] != "react_history"]
+        transcript = self._snapshot_transcript(run_id)
         from uuid import uuid4
-        snapshot_payload = {"events": events, "transcript": transcript}
-        payload = json.dumps(snapshot_payload, ensure_ascii=False, sort_keys=True)
+        # Only the events are stored: the transcript part is a rebuildable
+        # projection of the transcript table with an identical retention window,
+        # so it is replaced by a pointer to its source.
+        payload = json.dumps(
+            {"events": events, "transcript": {"rebuilt_from": "transcript", "rows_at_freeze": len(transcript)}},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         sequences = [int(event["sequence"]) for event in events]
-        snapshot = {"snapshot_id": str(uuid4()), "run_id": run_id, "first_sequence": min(sequences) if sequences else None, "last_sequence": max(sequences) if sequences else None, "payload_hash": hashlib.sha256(payload.encode()).hexdigest(), **snapshot_payload}
+        # payload_hash stays the digest of the stored payload, so a row is still
+        # verifiable against its own bytes.
+        snapshot = {"snapshot_id": str(uuid4()), "run_id": run_id, "first_sequence": min(sequences) if sequences else None, "last_sequence": max(sequences) if sequences else None, "payload_hash": hashlib.sha256(payload.encode()).hexdigest(), "events": events, "transcript": transcript}
         self.connection.execute("INSERT INTO episode_snapshots(snapshot_id, run_id, first_sequence, last_sequence, payload_hash, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (snapshot["snapshot_id"], run_id, snapshot["first_sequence"], snapshot["last_sequence"], snapshot["payload_hash"], payload, utc_now()))
         return snapshot
+
+    def compact_episode_snapshots(self) -> dict[str, int]:
+        """Rewrite legacy snapshot rows that still embed a frozen transcript.
+
+        ``snapshot_episode`` writes a pointer for new rows, but rows written
+        before that decision keep a verbatim copy of a projection the
+        ``transcript`` table already owns, and the read path returns early for
+        an existing row -- so the copies are forward-only leftovers. Measured
+        2026-09-21 on the live ledger: 44 of 51 rows still carried the list
+        form, 14.74 MB of the 16.78 MB of snapshot payload bytes, and all 44
+        rebuilt byte-identically from ``transcript`` (0 mismatches). This
+        rewrites exactly those rows to the pointer form, which is the eviction
+        rule MemGPT applies to its FIFO queue (arXiv:2310.08560 sec. 2.2): the
+        evicted copy becomes an address into the retained store instead of a
+        second copy of it.
+
+        Only the transcript part is dropped: ``events`` is not rebuildable and
+        is never touched, and a row whose rebuild does not reproduce the stored
+        list is left alone (old bytes keep their meaning). ``payload_hash`` is
+        recomputed from the new bytes, so the row stays verifiable against
+        itself.
+        """
+        rewritten = 0
+        reclaimed = 0
+        rows = self.connection.execute(
+            "SELECT run_id, payload FROM episode_snapshots WHERE json_type(payload, '$.transcript') = 'array'"
+        ).fetchall()
+        for row in rows:
+            run_id = row["run_id"]
+            snapshot = json.loads(row["payload"])
+            stored = snapshot.get("transcript")
+            rebuilt = self._snapshot_transcript(run_id)
+            if stored != rebuilt:
+                continue
+            compacted = dict(snapshot)
+            compacted["transcript"] = {"rebuilt_from": "transcript", "rows_at_freeze": len(rebuilt)}
+            payload = json.dumps(compacted, ensure_ascii=False, sort_keys=True)
+            self.connection.execute(
+                "UPDATE episode_snapshots SET payload=?, payload_hash=? WHERE run_id=?",
+                (payload, hashlib.sha256(payload.encode()).hexdigest(), run_id),
+            )
+            rewritten += 1
+            reclaimed += len(row["payload"]) - len(payload)
+        return {"snapshots": rewritten, "bytes": max(0, reclaimed)}
 
     def append_event(self, kind: str, payload: dict[str, Any], run_id: str | None = None) -> int:
         sequence = self.events.append(kind, payload, run_id)
         self.runtime_log.write("event", {"sequence": sequence, "event_kind": kind, "payload": payload}, run_id=run_id)
         return sequence
+
+    def record_provider_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Route a provider-chain diagnostic to the durable event log.
+
+        Kinds in ``DURABLE_PROVIDER_EVENT_KINDS`` go through ``append_event`` so
+        they survive retention and are visible in ``skynet logs``; every other
+        provider kind (attempts, selections, requests, cooldown skips) stays in
+        the advanced runtime projection only, because writing it durably would
+        flood ``event_log``. ``append_event`` mirrors the promoted row back into
+        the runtime projection, so no separate ``runtime_log.write`` is needed.
+        """
+        if kind in DURABLE_PROVIDER_EVENT_KINDS:
+            if threading.get_ident() == self._connection_thread:
+                self.append_event(kind, payload)
+            else:
+                self._append_event_off_thread(kind, payload)
+        else:
+            self.runtime_log.write(kind, payload)
+
+    def _append_event_off_thread(self, kind: str, payload: dict[str, Any]) -> None:
+        """Insert one durable event from a thread that does not own the connection.
+
+        The memory loop and the planner call the provider chain on worker
+        threads, so a fallback during those phases logged from there and hit
+        "SQLite objects created in a thread can only be used in that same
+        thread"; the real provider failure was replaced by that error and the
+        durable row was lost. WAL plus the busy timeout lets a short-lived second
+        connection wait its turn instead, and the runtime projection is mirrored
+        with the same shape ``append_event`` uses. A diagnostic must never abort
+        the provider ladder, so a write failure is swallowed.
+        """
+        sequence: int | None = None
+        try:
+            connection = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
+            try:
+                connection.execute("PRAGMA busy_timeout=5000")
+                cursor = connection.execute(
+                    "INSERT INTO event_log(run_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (None, kind, json.dumps(payload, ensure_ascii=False), utc_now()),
+                )
+                sequence = cursor.lastrowid
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            pass
+        self.runtime_log.write("event", {"sequence": sequence, "event_kind": kind, "payload": payload}, run_id=None)
 
     def append_transcript(self, kind: str, payload: dict[str, Any], run_id: str | None = None) -> int:
         cursor = self.connection.execute(
@@ -940,9 +1245,10 @@ class StateStore:
     def prune_event_log(self, retention_days: int, *, protected_kinds: frozenset[str] = PROTECTED_EVENT_KINDS) -> int:
         """Drop routine events older than the window; never the safety record.
 
-        `event_log` grows without bound over time. The protected set keeps every
-        kind a post-mortem or an audit depends on: deviations, escalations,
-        provider classification, policy decisions, restarts and reconciliations.
+        `event_log` grew without bound (6751 rows in 159 generations, ~42 per
+        cycle). The protected set keeps every kind a post-mortem or an audit
+        depends on: deviations, escalations, provider classification, policy
+        decisions, restarts and reconciliations.
         """
         if retention_days <= 0:
             return 0
@@ -951,6 +1257,101 @@ class StateStore:
         return max(0, self.connection.execute(
             f"DELETE FROM event_log WHERE created_at < ? AND kind NOT IN ({placeholders})",
             (cutoff, *protected_kinds),
+        ).rowcount)
+
+    def prune_capability_effects(self, retention_days: int) -> int:
+        """Drop effect-idempotency rows older than the window.
+
+        ``capability_effects`` was the one monotone table that had no retention
+        statement until this window was added. Re-measured 2026-09-20 (generation
+        39) on a read-only copy of the live ledger: 2281 rows / 6.12 MB of table
+        pages, 13.69% of a 46.9 MB database, plus 729 KB of its own indexes
+        (15.25% inclusive), growing ~126 rows/hour (~3,000 rows/day over an 18.1 h
+        span) with 60.5% of the rows holding 95% of the result bytes (``bash``
+        alone is 58.7%). At that rate this 30-day window settles near 90k rows /
+        ~284 MB including indexes, so the window is what bounds the table -- the
+        old ``~7 rows/hour`` figure understated it roughly eighteenfold. Nothing
+        reaches back that far: ``effect`` is looked up by an
+        exact ``{run_id}:{step}:{call_id}`` key belonging to the run being
+        executed, and runs are reconciled within the reboot window (1 day); the
+        only cross-run reader, ``effect_reapplied_runs``, is a diagnostic pointer
+        whose one-time ``effect_reapplied`` event survives the window, so past the
+        window the worst case is one benign re-announcement.
+
+        A row is kept while a surviving event still names it. ``event_log`` and
+        this table are pruned by two *independent* windows
+        (``event_retention_days`` / ``effect_retention_days``), and the age-only
+        DELETE broke the invariant this table exists to support: measured
+        2026-09-20 (generation 43) on scratch copies of the live ledger, with the
+        effects aged past a 30-day cutoff, the plain DELETE removed 2448 rows and
+        left 2 dangling pointers -- every folded ``tool_result`` event carrying an
+        ``effect_key`` pointed at a row that no longer existed. Reachable through
+        configuration alone (``SKYNET_EVENT_RETENTION_DAYS=60`` with the default
+        effect window): ``prune_event_log(60)`` removed 0 events while
+        ``prune_capability_effects(30)`` removed 2448 rows. The guard pins exactly
+        the pointed subset and drops the rest (same probe: 2446 removed, 0
+        dangling), and the pin is bounded -- 91 folded events over 19.4 h (~112/day)
+        is ~3.4k rows across a 30-day window, far below the ~90k rows this window
+        already tolerates. Rows whose pointer has itself been pruned are dropped
+        as before, so retention still bounds the table.
+
+        The folded result also lands in the ReAct transcript, which this guard did
+        not read. ``_bounded_tool_content`` (``react.py:937-950``) puts the same
+        ``effect_key`` into the ``tool`` message ``_record_history`` persists as
+        ``react_history`` (``react.py:441-445``, ``react.py:806-811``,
+        ``store.py:1030``). The path differs from the event log: ``content`` is
+        itself a JSON-encoded string, so the key is ``$.messages[*].content``
+        parsed again to ``$.effect_key``, not a nested object. Transcript retention
+        is by run count (``transcript_retention_runs``, default 200) and independent
+        of the 30-day effect window, so an aged row whose only surviving pointer was
+        a retained transcript was still deleted -- the dangling pointer this guard
+        exists to prevent, through a second door. Reproduced on a scratch store with
+        a retained ``react_history`` row: the plain DELETE removed the row and left
+        the transcript pointing at nothing.
+
+        ``episode_snapshots`` is the third holder and was the last unguarded one.
+        ``snapshot_episode`` stores the run's ``tool_result`` events verbatim in
+        ``payload.events`` (``store.py:1035``), so the address survives there in
+        the original nested shape (``$.payload.result.effect_key``, not the
+        double-encoded ``content`` shape the transcript copy uses). Snapshots are
+        pruned by run count, never by age, which makes this reachable through
+        configuration alone: with a 1-day event window and the default 30-day
+        effect window the other two holders release the pin while the snapshot
+        keeps it (measured on a scratch copy of the live ledger -- 4327 rows
+        removed, 1 dangling snapshot address). The third subquery closes it:
+        same probe, 4326 removed, 0 dangling, 51 pinned.
+
+        The guard is therefore a second ``NOT IN`` subquery over ``transcript``. It
+        is one SQL statement rather than a Python-collected key set because the pin
+        set has no fixed size -- one retained run can fold hundreds of results and a
+        200-run window can exceed SQLite's bound-variable limit -- while
+        ``json_each`` takes no parameters and is materialised once (``EXPLAIN QUERY
+        PLAN`` reports ``LIST SUBQUERY``, so the cost is independent of the number of
+        aged effect rows scanned). It stays bounded by construction: the subquery
+        reads only rows still present in ``transcript``, so a checkpoint that runs
+        ``prune_run_history`` first (``reactor.py:612``) releases the pin on the next
+        daily pass. ``json_valid``/``IS NOT NULL`` keep ``NULL`` out of the subquery,
+        which ``NOT IN`` needs to delete anything at all.
+        """
+        if retention_days <= 0:
+            return 0
+        cutoff = (utc_datetime_now() - timedelta(days=retention_days)).isoformat().replace("+00:00", "Z")
+        return max(0, self.connection.execute(
+            "DELETE FROM capability_effects WHERE created_at < ? AND idempotency_key NOT IN ("
+            "SELECT json_extract(payload, '$.result.effect_key') FROM event_log "
+            "WHERE kind = 'tool_result' AND json_extract(payload, '$.result.effect_key') IS NOT NULL) "
+            "AND idempotency_key NOT IN ("
+            "SELECT json_extract(json_extract(message.value, '$.content'), '$.effect_key') "
+            "FROM transcript, json_each(transcript.payload, '$.messages') AS message "
+            "WHERE transcript.kind = 'react_history' "
+            "AND json_valid(json_extract(message.value, '$.content')) "
+            "AND json_extract(json_extract(message.value, '$.content'), '$.effect_key') IS NOT NULL) "
+            "AND idempotency_key NOT IN ("
+            "SELECT json_extract(event.value, '$.payload.result.effect_key') "
+            "FROM episode_snapshots, json_each(episode_snapshots.payload, '$.events') AS event "
+            "WHERE json_extract(event.value, '$.kind') = 'tool_result' "
+            "AND json_extract(event.value, '$.payload.result.effect_key') IS NOT NULL)",
+            (cutoff,),
         ).rowcount)
 
     def prune_run_history(self, keep_runs: int) -> dict[str, int]:
@@ -1018,6 +1419,24 @@ class StateStore:
     def pending_inbox(self, limit: int = 50) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT * FROM inbox WHERE consumed_at IS NULL ORDER BY rowid LIMIT ?", (limit,)
+        ).fetchall()
+        return [{"event_id": r["event_id"], "kind": r["kind"], "payload": json.loads(r["payload"])} for r in rows]
+
+    def pending_owner_messages(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Pending owner messages (kind ``user_message``), oldest first.
+
+        A dedicated query rather than ``pending_inbox`` filtering: ``limit`` must
+        bound owner messages, not every pending kind, or a backlog of answers and
+        other notifications would crowd the requested messages out of the window.
+        Read-only by construction -- it never touches ``consumed_at``.
+        """
+        try:
+            capped = max(1, int(limit))
+        except (TypeError, ValueError):
+            capped = 10
+        rows = self.connection.execute(
+            "SELECT * FROM inbox WHERE consumed_at IS NULL AND kind='user_message' ORDER BY rowid LIMIT ?",
+            (capped,),
         ).fetchall()
         return [{"event_id": r["event_id"], "kind": r["kind"], "payload": json.loads(r["payload"])} for r in rows]
 
@@ -1384,7 +1803,14 @@ class StateStore:
             task_id = item.get("task_id")
             if not isinstance(task_id, str):
                 continue
-            status = str(item.get("status", "pending"))
+            # `status` is not required by the memory-response schema. A missing
+            # status is an outcome-only update, so leave the current status
+            # untouched instead of defaulting to "pending" and silently
+            # reopening a task the run just completed.
+            raw_status = item.get("status")
+            if raw_status is None:
+                continue
+            status = str(raw_status)
             if status in {"pending", "running", "completed", "blocked", "cancelled"}:
                 updated = self.connection.execute(
                     "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
@@ -1428,18 +1854,34 @@ class StateStore:
     def reset_task_failures(self, task_id: str) -> None:
         self.connection.execute("UPDATE tasks SET consecutive_model_failures=0 WHERE task_id=?", (task_id,))
 
-    def repair_status_consistency(self) -> dict[str, int]:
+    def repair_status_consistency(self, *, exclude_fingerprints: Iterable[str] = ()) -> dict[str, int]:
         """Remove task rows that can never be selected again.
 
         A pending task whose hypothesis is already terminal has zero novelty, so
         the planner skips it forever while it still clutters the queue. A
         cancelled task's ``ready`` hypothesis is intentionally left alone: the
         autonomous planner's dedup treats only terminal hypotheses as occupied,
-        so a ready hypothesis with no live task stays proposable.
+        so a ready hypothesis with no live task stays proposable (P0-7).
+
+        ``exclude_fingerprints`` keeps the stable safety-net tasks out of the
+        cancel branch: they stay pending with a terminal fingerprint by design
+        and are selected directly. The caller supplies them so this module does
+        not have to import reactor constants (circular import).
 
         Idempotent: a second call repairs nothing.
         """
         now = utc_now()
+        exclusions = tuple(str(item) for item in exclude_fingerprints if item)
+        cancel_sql = """UPDATE tasks SET status='cancelled', updated_at=?
+                   WHERE status IN ('pending', 'running')
+                     AND hypothesis_fingerprint IN (
+                         SELECT fingerprint FROM hypotheses WHERE status IN ('completed', 'rejected', 'exhausted')
+                     )"""
+        cancel_params: tuple[Any, ...] = (now,)
+        if exclusions:
+            placeholders = ",".join("?" for _ in exclusions)
+            cancel_sql += f" AND hypothesis_fingerprint NOT IN ({placeholders})"
+            cancel_params = (now, *exclusions)
         with self.transaction():
             aligned_hypotheses = self.connection.execute(
                 """UPDATE hypotheses SET status='completed', updated_at=?
@@ -1450,14 +1892,7 @@ class StateStore:
                      )""",
                 (now,),
             ).rowcount
-            cancelled_tasks = self.connection.execute(
-                """UPDATE tasks SET status='cancelled', updated_at=?
-                   WHERE status IN ('pending', 'running')
-                     AND hypothesis_fingerprint IN (
-                         SELECT fingerprint FROM hypotheses WHERE status IN ('completed', 'rejected', 'exhausted')
-                     )""",
-                (now,),
-            ).rowcount
+            cancelled_tasks = self.connection.execute(cancel_sql, cancel_params).rowcount
             if aligned_hypotheses or cancelled_tasks:
                 self.append_event("status_repair", {"hypotheses": aligned_hypotheses, "tasks": cancelled_tasks})
         return {"hypotheses": aligned_hypotheses, "tasks": cancelled_tasks}
@@ -1538,7 +1973,7 @@ class StateStore:
             "INSERT INTO memory_consolidations(episode_id, run_id, input_version, output_version, memory_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (episode_id, run_id, input_version, output_version, count, utc_now()),
         )
-        # A compact, bounded digest so an operator can audit a
+        # A compact, bounded digest so the owner/operator can audit a
         # consolidation from the event log without opening the database.
         self.append_event(
             "memory_event",
@@ -1668,6 +2103,107 @@ class StateStore:
         self.connection.execute("INSERT OR REPLACE INTO recovery_reconciliations(run_id, call_id, status, result, created_at) VALUES (?, ?, ?, ?, ?)", (run_id, call_id, status, json.dumps(result), utc_now()))
         self.append_event("tool_reconciled", {"call_id": call_id, "status": status, "result": result}, run_id)
         return {"run_id": run_id, "call_id": call_id, "status": status, "result": result}
+
+    def effect_reapplied_runs(self, capability: str, arguments_hash: str, *, exclude_run_id: str) -> list[str]:
+        """Other runs that already applied this exact call, oldest first.
+
+        ``capability_effects.idempotency_key`` is ``{run_id}:{step}:{call_id}``
+        (skynet/react.py), so the ledger deduplicates one *slot* and not one
+        *call*. A run retried after a crash carries a fresh run_id and re-applies
+        work the previous attempt already applied, and the same is true inside a
+        single run: measured 2026-09-20 with the real runner, an identical
+        run_id, step and call_id executes the tool once, while the identical
+        run_id and step with a regenerated call_id executes it again - and a
+        resumed model turn regenerates the call_id, because ToolCall.call_id is a
+        fresh uuid4. The live ledger already holds 5 identities applied twice
+        inside one run_id. That is the at-least-once-across-crashes
+        cell of the RESUME CONTRACT's ``effect exactly-once`` property
+        (arXiv:2608.03836v3), where LangGraph 1.2.9 re-executes durably recorded
+        work after a real SIGKILL. The contract needs the *identity* of the call,
+        not its slot, so this reads the stable pair (capability, arguments_hash)
+        the ledger already stores. It reports the fact and does not act on it: on
+        the live database (re-measured 2026-09-20, generation 39: 2281 rows) 12
+        call identities repeat across runs and 8 of those 12 hold different results - ``db(sql="SELECT * FROM
+        agent_state")`` returned 9972 bytes in one run and 12114 in the next - so
+        serving a recorded result for a repeated pair would answer a live question
+        with stale state. The false example this docstring used to carry is worth
+        keeping as a warning: ``PRAGMA table_info(inbox)`` was claimed to differ
+        between runs, and all 10 recorded results are row_count 4 / 271 bytes,
+        identical. Because the returned list holds *every* previous run, a
+        non-empty list is not a first repeat: it grows with each occurrence, and
+        ``if previous_runs`` announced one identity once per repeat. The caller
+        uses a non-empty list paired with ``effect_reapplied_announced`` as the
+        one-time signal, so an identity that had already repeated before the
+        signal existed is still announced exactly once. The event it writes is a
+        pointer rather than a tally: its ``previous_run_count`` is the number of
+        other runs at announcement time, which is the transition value 1 for the
+        common case and can exceed 1 for a late-announced identity; a reader that
+        needs the current count calls this method again with the payload's
+        ``arguments_hash``.
+        """
+        # A policy warning is a refusal, not an application: ``skynet/tools.py``
+        # returns the soft-denial result before running the command, so such a
+        # run must not be reported as a run that already applied the call.
+        # Measured on the live ledger 2026-09-22, excluding them leaves all 40
+        # announced identities and their ``previous_run_ids`` unchanged and
+        # removes the warning-only false positives.
+        rows = self.connection.execute(
+            "SELECT DISTINCT substr(p.idempotency_key, 1, instr(p.idempotency_key, ':') - 1) FROM capability_effects AS p "
+            "WHERE p.capability=? AND p.arguments_hash=? "
+            "AND substr(p.idempotency_key, 1, instr(p.idempotency_key, ':') - 1) != ? "
+            "AND " + _REFUSAL_RESULT_PREDICATE.format(alias="p") + " "
+            "ORDER BY p.created_at",
+            (capability, arguments_hash, exclude_run_id),
+        ).fetchall()
+        return [str(row[0]) for row in rows if row[0]]
+
+    def effect_identity_prior_count(self, capability: str, arguments_hash: str, *, exclude_effect_key: str) -> int:
+        """How many OTHER ledger rows already applied this call identity.
+
+        A refusal is not an application: ``skynet/tools.py`` returns the
+        soft-denial result before running the command, so a warning row must not
+        count. Counting it made the one live ``same_run_repeat=true`` event a
+        false positive (run 92e56e65, whose "prior application" was the warning
+        row), and on the live ledger 2026-09-22 it inflated the in-run repeat
+        census from the 2 identities that really executed twice to 16. The hard
+        denylist (``policy_denied``) never executes either and is excluded by the
+        same predicate (see ``_REFUSAL_RESULT_MARKERS``).
+
+        ``effect_reapplied_runs`` excludes the current run on purpose (it names
+        the other runs a reader can compare against), so a call re-issued
+        *inside* one run with a regenerated ``ToolCall.call_id`` was invisible to
+        every reader: measured on the live ledger 2026-09-22, 15 identities hold
+        two rows each inside a single run_id (14 bash, 1 read), all 15 pairs hold
+        different results, and no durable event names any of them. This count is
+        run-agnostic: it sees both cells of the RESUME CONTRACT's
+        ``effect exactly-once`` violation (arXiv:2608.03836v3) - across crashes
+        and inside one run. It reports the fact and never serves the recorded
+        result, because differing results are the norm (15 of 15 in-run pairs).
+        """
+        row = self.connection.execute(
+            "SELECT count(*) FROM capability_effects AS p WHERE p.capability=? AND p.arguments_hash=? "
+            "AND p.idempotency_key!=? AND " + _REFUSAL_RESULT_PREDICATE.format(alias="p"),
+            (capability, arguments_hash, exclude_effect_key),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def effect_reapplied_announced(self, capability: str, arguments_hash: str) -> bool:
+        """Whether the one-time ``effect_reapplied`` pointer already exists.
+
+        ``len(previous_runs) == 1`` was the old announcement signal, which ties
+        "once per identity" to "exactly one prior run": an identity that had
+        already repeated twice before the signal existed never announced at all.
+        The event is a protected kind (``PROTECTED_EVENT_KINDS``), so the row
+        survives every retention window and is the durable record of the
+        announcement; the caller pairs this check with a non-empty
+        ``effect_reapplied_runs`` to keep the event once-only.
+        """
+        row = self.connection.execute(
+            "SELECT 1 FROM event_log WHERE kind='effect_reapplied' "
+            "AND json_extract(payload, '$.tool')=? AND json_extract(payload, '$.arguments_hash')=? LIMIT 1",
+            (capability, arguments_hash),
+        ).fetchone()
+        return row is not None
 
     def record_effect(self, key: str, capability: str, arguments_hash: str, result: dict[str, Any], status: str) -> None:
         self.connection.execute(

@@ -78,6 +78,10 @@ class PortfolioPlanner:
         self.epsilon = max(0.0, min(float(epsilon), 1.0))
         self.hypothesis_ttl_days = max(0.0, float(hypothesis_ttl_days))
         self.cell_scarcity_weight = max(0.0, min(float(cell_scarcity_weight), 1.0))
+        # A decision can be computed now and recorded later, once the caller
+        # knows what the autonomous planner did. That is what lets a cycle
+        # write one decision whose reason reflects the whole selection step.
+        self._pending_decision: tuple[list[PlannerCandidate], PlannerCandidate | None, str, float | None] | None = None
 
     def _cell_for(self, row: dict[str, Any]) -> str:
         from .idea_archive import cell_key
@@ -152,7 +156,7 @@ class PortfolioPlanner:
         candidates.sort(key=lambda item: (-item.score, -item.criticality, -item.novelty, item.workstream_id))
         return candidates[: self.max_workstreams]
 
-    def select(self) -> dict[str, Any] | None:
+    def select(self, *, record: bool = True) -> dict[str, Any] | None:
         ranked = self.rank()
         selected = ranked[0] if ranked else None
         draw: float | None = None
@@ -167,17 +171,33 @@ class PortfolioPlanner:
                 index = 1 + int(draw * 10_000) % (len(ranked) - 1)
                 selected = ranked[index]
                 explore = True
-        self.store.record_planner_decision(
+        self._pending_decision = (
             ranked,
             selected,
-            reason="epsilon_greedy_explore" if explore else (selected.reason if selected else "no novel work"),
-            draw=draw,
+            "epsilon_greedy_explore" if explore else (selected.reason if selected else "no novel work"),
+            draw,
         )
+        if record:
+            self.record_decision()
         if selected is None or selected.task_id is None:
-            return self._select_from_archive()
+            return self._select_from_archive(record=record)
         return self.store.task_work(selected.task_id)
 
-    def _select_from_archive(self) -> dict[str, Any] | None:
+    def record_decision(self, *, reason: str | None = None) -> None:
+        """Persist the decision computed by the last ``select`` call.
+
+        ``select(record=False)`` defers the write so the caller can pass the
+        reason the whole cycle actually produced; calling this twice for one
+        decision is a programming error and the pending slot is cleared to make
+        the second call a no-op instead of a duplicate row.
+        """
+        if self._pending_decision is None:
+            return
+        ranked, selected, default_reason, draw = self._pending_decision
+        self._pending_decision = None
+        self.store.record_planner_decision(ranked, selected, reason=reason or default_reason, draw=draw)
+
+    def _select_from_archive(self, *, record: bool = True) -> dict[str, Any] | None:
         """An exhausted portfolio is not an exhausted search.
 
         Before the organism concludes "no novel work", sample an archived
@@ -197,5 +217,8 @@ class PortfolioPlanner:
         if not parents:
             return None
         task_id = self.store.materialize_idea(str(parents[0]["idea_id"]), str(goal["goal_id"]))
-        self.store.record_planner_decision([], None, reason="archive_materialized")
+        if record:
+            self.store.record_planner_decision([], None, reason="archive_materialized")
+        else:
+            self._pending_decision = ([], None, "archive_materialized", None)
         return self.store.task_work(task_id)

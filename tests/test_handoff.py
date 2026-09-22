@@ -1,4 +1,5 @@
 """The roadmap handoff that gives the organism something to work on."""
+
 from __future__ import annotations
 
 import inspect

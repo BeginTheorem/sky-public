@@ -6,6 +6,10 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .playwright-mcp/
+.env
+config/skynet.env
+config/skynet.env.*
+*.env.bak*
 state/
 inspirations/
 .deployed-commit
@@ -15,17 +19,12 @@ inspirations/
 *.lock
 *.pem
 *.key
+config/deploy.env
 NOTES-*.md
 
 # --- Secrets: never commit real values here ---
-.env
-config/skynet.env.*
-*.env.bak*
-
 # The public tree ships these two as EMPTY templates (key names only).
 # The negation lines below keep them tracked so downloaders can see which
 # keys to fill in. Replace the empty values locally — never commit them.
-config/skynet.env
-config/deploy.env
 !config/skynet.env
 !config/deploy.env

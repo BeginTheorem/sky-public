@@ -1,14 +1,15 @@
 """Tests for the open-boundary subsystem: archive, learnability, diversity, valves."""
+
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
-from datetime import UTC
 from pathlib import Path
 from typing import cast
 from unittest.mock import Mock, patch
 
-from helpers import FakeProvider, FixtureTool
+from helpers import FakeProvider, FixtureTool, commit_all, git_repo
 
 from skynet import metrics
 from skynet.idea_archive import effective_modes, learnability_defect
@@ -19,11 +20,6 @@ from skynet.self_improvement import SelfImprovementManager
 from skynet.store import StateStore
 from skynet.time import utc_now
 
-
-def _iso(seconds: float) -> str:
-    from datetime import datetime
-
-    return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 def _idea(cell: str, *, quality: float, title: str = "an idea", **extra: object) -> dict[str, object]:
     """A minimal, well-formed archive row for a behavioural descriptor cell."""
@@ -37,6 +33,7 @@ def _idea(cell: str, *, quality: float, title: str = "an idea", **extra: object)
     }
     payload.update(extra)
     return payload
+
 
 class IdeaArchiveTests(unittest.TestCase):
     def test_schema_has_archive_table(self) -> None:
@@ -126,6 +123,7 @@ class IdeaArchiveTests(unittest.TestCase):
                 self.assertNotEqual(str(picked[0]["idea_id"]), saturated)
             store.close()
 
+
 def _learnable(**overrides: object) -> dict[str, object]:
     proposal: dict[str, object] = {
         "title": "Adopt retrieval augmentation for the planner",
@@ -137,12 +135,13 @@ def _learnable(**overrides: object) -> dict[str, object]:
     proposal.update(overrides)
     return proposal
 
+
 class ToolProposalArchiveTests(unittest.TestCase):
     def test_tool_proposal_becomes_an_archived_stepping_stone(self) -> None:
         """Real self-improvement traffic feeds the archive, not only planner ideas.
 
-        Archiving that runs only inside the autonomous planner leaves
-        `idea_archive` empty for promoted changes.
+        Nine promoted commits left `idea_archive` empty because archiving ran
+        exclusively inside the autonomous planner.
         """
         with tempfile.TemporaryDirectory() as directory:
             reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3"))
@@ -174,6 +173,7 @@ class ToolProposalArchiveTests(unittest.TestCase):
             self.assertEqual(float(ideas[0]["quality"]), 1.0)
             reactor.close()
 
+
 class LearnabilityTests(unittest.TestCase):
     def test_research_without_citation_is_rejected(self) -> None:
         defect = learnability_defect(_learnable(kind="research"))
@@ -200,6 +200,7 @@ class LearnabilityTests(unittest.TestCase):
         # proposal is rejected.
         self.assertIsNotNone(learnability_defect(_learnable(validation="tests pass")))
 
+
 class DiversityMetricsTests(unittest.TestCase):
     def test_snapshot_includes_diversity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -217,13 +218,14 @@ class DiversityMetricsTests(unittest.TestCase):
             store = StateStore(Path(directory) / "state.sqlite3")
             store.archive_idea(_idea("memory|workflow|own-repo", quality=0.5, evidence_source="own-repo"))
             store.archive_idea(_idea("tools|new-tool|paper", quality=0.5, evidence_source="paper"))
-            diversity = metrics.diversity_health(store.connection, _iso(0.0))
+            diversity = metrics.diversity_health(store.connection, "1970-01-01T00:00:00Z")
             self.assertEqual(diversity["cells_filled"], 2)
             self.assertEqual(diversity["external_evidence_ratio"], 0.5)
             store.close()
 
     def test_effective_modes_single_cell_is_one(self) -> None:
         self.assertEqual(effective_modes([3]), 1.0)
+
 
 class ArchiveSelectionTests(unittest.TestCase):
     def test_select_materializes_from_archive_when_portfolio_is_empty(self) -> None:
@@ -241,6 +243,7 @@ class ArchiveSelectionTests(unittest.TestCase):
             self.assertEqual(materialized["status"], "materialized")
             self.assertEqual(materialized["task_id"], task_id)
             store.close()
+
 
 class ExternalSeekTests(unittest.TestCase):
     def test_valve_creates_a_research_task(self) -> None:
@@ -308,8 +311,8 @@ class ExternalSeekTests(unittest.TestCase):
     def test_valve_opens_on_cadence_even_with_ready_work(self) -> None:
         """The valve is cadence-driven: a busy portfolio must not seal it.
 
-        An exhaustion-only trigger is unreachable whenever the bounded fallback
-        always produces something.
+        An exhaustion-only trigger was unreachable because the bounded fallback
+        always produced something, so external_seek never fired.
         """
         class WebfetchStub:
             """A real tool shape: `tick` serialises the schema, a Mock cannot be."""
@@ -344,6 +347,7 @@ class ExternalSeekTests(unittest.TestCase):
             )
             reactor.close()
 
+
 class ProviderHealthTests(unittest.TestCase):
     def test_degradation_is_flagged_in_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -363,6 +367,7 @@ class ProviderHealthTests(unittest.TestCase):
             data = metrics.snapshot(store, since_days=1.0)
             self.assertFalse(data["providers"]["degraded"])
             store.close()
+
 
 class CriterionEpochTests(unittest.TestCase):
     def test_reactor_records_the_epoch_boundary(self) -> None:
@@ -388,15 +393,38 @@ class CriterionEpochTests(unittest.TestCase):
             self.assertEqual(data["agent"]["criterion_epoch"], 2)
             store.close()
 
+
 class MetaLoopProtectionTests(unittest.TestCase):
-    def test_meta_loop_paths_are_gate_protected(self) -> None:
-        for path in (
-            "skynet/planner.py",
-            "skynet/idea_archive.py",
-            "skynet/autonomous_planner.py",
-            "skynet/metrics.py",
-        ):
-            self.assertTrue(SelfImprovementManager._is_gate_protected(path), path)
+    def test_meta_loop_paths_are_warned_not_hard_protected(self) -> None:
+        # Owner decision 2026-09-21: the meta-contour is open. A first submission
+        # of a meta-loop change is warned (never held or rejected), and only the
+        # identical resubmission proceeds through the full gate.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            commit_all(root, "base")
+            manager = SelfImprovementManager(root, root.parent / "worktrees")
+            metadata = {
+                "hypothesis": {
+                    "problem": "p",
+                    "expected_behavior": "e",
+                    "evidence": "ev",
+                    "validation": "v",
+                    "rollback_condition": "r",
+                }
+            }
+            result = manager.propose_files(
+                {},
+                (sys.executable, "-c", "pass"),
+                changes=[{"path": "skynet/metrics.py", "operation": "create", "content": "x = 1\n"}],
+                metadata=metadata,
+            )
+            self.assertFalse(result["ok"], result)
+            self.assertTrue(result["warned"], result)
+            self.assertEqual(result["status"], "warned_protected")
+            self.assertIn("skynet/metrics.py", cast(list, result["protected_paths"]))
+
 
 if __name__ == "__main__":
     unittest.main()

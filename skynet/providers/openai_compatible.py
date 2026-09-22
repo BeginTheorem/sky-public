@@ -20,7 +20,7 @@ except ImportError:
 from ..models import ModelTurn, ToolCall
 from ..provider import Message, ToolSchema
 from ..time import utc_datetime_now
-from .errors import ProviderError
+from .errors import ProviderError, tool_arguments
 
 # `urllib` has no SOCKS support, so the process-global socket factory is
 # patched for the duration of a proxy-scoped request. A depth counter keeps
@@ -78,7 +78,7 @@ class OpenAICompatibleProvider:
         if parsed.scheme == "socks4":
             socks_type = _socks.SOCKS4  # type: ignore[name-defined]
         proxy_host = parsed.hostname or "127.0.0.1"
-        proxy_port = parsed.port or 1080
+        proxy_port = parsed.port or 9050
         with _PROXY_LOCK:
             if _PROXY_DEPTH == 0:
                 _PROXY_ORIGINAL = socket.create_connection
@@ -141,8 +141,9 @@ class OpenAICompatibleProvider:
 
     def _parse(self, data: dict[str, Any]) -> ModelTurn:
         try:
-            message = data["choices"][0]["message"]
-            calls = [ToolCall(tool_name=item["function"]["name"], arguments=json.loads(item["function"].get("arguments", "{}")), call_id=item.get("id", "")) for item in message.get("tool_calls", [])]
+            choice = data["choices"][0]
+            message = choice["message"]
+            calls = [ToolCall(tool_name=item["function"]["name"], arguments=tool_arguments(json.loads(item["function"].get("arguments", "{}"))), call_id=item.get("id", "")) for item in message.get("tool_calls", [])]
             text = message.get("content") or ""
             reasoning_content = message.get("reasoning_content") or ""
             if not isinstance(reasoning_content, str):
@@ -165,6 +166,7 @@ class OpenAICompatibleProvider:
             return ModelTurn(
                 text=text, reasoning_content=reasoning_content,
                 tool_calls=calls, usage_tokens=total, prompt_tokens=prompt, completion_tokens=completion,
+                finish_reason=_as_finish_reason(choice.get("finish_reason")),
             )
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProviderError(f"{self.name} returned an unsupported response", category="invalid_response", provider=self.name, model=self.model) from exc
@@ -186,6 +188,13 @@ class OpenAICompatibleProvider:
         if 500 <= status < 600:
             return "server", True, 10.0
         return "invalid_request" if 400 <= status < 500 else "http", False, 0.0
+
+
+def _as_finish_reason(value: Any) -> str | None:
+    """Normalise a provider stop reason; an absent or malformed one is None."""
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _as_int(value: Any) -> int:

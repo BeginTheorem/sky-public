@@ -3,8 +3,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-# Deployment target. Infrastructure values must not live in tracked files.
-# Keep the real values in config/deploy.env, which is gitignored.
+# Deployment target. Infrastructure values must not live in tracked files: the
+# host changed once already and every hardcoded copy broke with it. Keep the real
+# values in config/deploy.env, which is gitignored.
 DEPLOY_ENV="$ROOT_DIR/config/deploy.env"
 if [[ -f "$DEPLOY_ENV" ]]; then
     # shellcheck disable=SC1090
@@ -16,8 +17,13 @@ REMOTE_USER="${REMOTE_USER:-}"
 REMOTE_DIR="${REMOTE_DIR:-$HOME/project-skynet}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/deploy_key}"
 
-if [[ -z "$REMOTE_HOST" || -z "$REMOTE_USER" ]]; then
-    printf 'REMOTE_HOST and REMOTE_USER must be set; create config/deploy.env with both\n' >&2
+if [[ -z "$REMOTE_HOST" ]]; then
+    printf 'REMOTE_HOST is not set; create config/deploy.env with REMOTE_HOST=<host>\n' >&2
+    exit 2
+fi
+
+if [[ -z "$REMOTE_USER" ]]; then
+    printf 'REMOTE_USER is not set; create config/deploy.env with REMOTE_USER=<account>\n' >&2
     exit 2
 fi
 
@@ -121,12 +127,21 @@ ROLLBACK_UNIT_UPLOAD="$(mktemp "${TMPDIR:-/tmp}/skynet-rollback-unit.XXXXXX")"
 TELEGRAM_UNIT_UPLOAD="$(mktemp "${TMPDIR:-/tmp}/skynet-telegram-unit.XXXXXX")"
 UNIT_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/skynet-units.XXXXXX.tar")"
 trap 'rm -f "$RUNTIME_UPLOAD" "$UNIT_UPLOAD" "$ROLLBACK_UNIT_UPLOAD" "$TELEGRAM_UNIT_UPLOAD" "$UNIT_ARCHIVE"' EXIT
-cp "$ROOT_DIR/deploy/skynet.service" "$UNIT_UPLOAD"
+sed "s|@ROOT@|$REMOTE_DIR|g" "$ROOT_DIR/deploy/skynet.service.in" > "$UNIT_UPLOAD"
 chmod 644 "$UNIT_UPLOAD"
-cp "$ROOT_DIR/deploy/skynet-rollback.service" "$ROLLBACK_UNIT_UPLOAD"
+sed "s|@ROOT@|$REMOTE_DIR|g" "$ROOT_DIR/deploy/skynet-rollback.service.in" > "$ROLLBACK_UNIT_UPLOAD"
 chmod 644 "$ROLLBACK_UNIT_UPLOAD"
-cp "$ROOT_DIR/deploy/skynet-telegram.service" "$TELEGRAM_UNIT_UPLOAD"
+sed "s|@ROOT@|$REMOTE_DIR|g" "$ROOT_DIR/deploy/skynet-telegram.service.in" > "$TELEGRAM_UNIT_UPLOAD"
 chmod 644 "$TELEGRAM_UNIT_UPLOAD"
+
+# An unrendered placeholder must never reach systemd: fail loudly rather than
+# install a unit whose paths still read @ROOT@.
+for rendered in "$UNIT_UPLOAD" "$ROLLBACK_UNIT_UPLOAD" "$TELEGRAM_UNIT_UPLOAD"; do
+    if grep -q '@ROOT@' "$rendered"; then
+        printf 'FATAL: unrendered @ROOT@ placeholder remains in %s\n' "$rendered" >&2
+        exit 1
+    fi
+done
 tar -cf "$UNIT_ARCHIVE" \
     -C "$(dirname "$UNIT_UPLOAD")" \
     "$(basename "$UNIT_UPLOAD")" \

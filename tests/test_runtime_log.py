@@ -1,4 +1,5 @@
 """Runtime log kind filtering and the verbose provider dump."""
+
 from __future__ import annotations
 
 import json
@@ -57,16 +58,16 @@ class VerboseWriteTests(unittest.TestCase):
                 verbose_write(
                     "provider_request",
                     {
-                        "api_key": "sk-test-notarealkey123",
-                        "token": "dummy-token-value",
-                        "header": "Bearer aaa.bbb.ccc",
+                        "api_key": "sk-live-abcdef123456",
+                        "token": "super-secret-token",
+                        "header": "Bearer abc.def.ghi",
                     },
                     base_path=base,
                 )
             text = (Path(directory) / "verbose.jsonl").read_text(encoding="utf-8")
-            self.assertNotIn("sk-test-notarealkey123", text)
-            self.assertNotIn("dummy-token-value", text)
-            self.assertNotIn("aaa.bbb.ccc", text)
+            self.assertNotIn("sk-live-abcdef123456", text)
+            self.assertNotIn("super-secret-token", text)
+            self.assertNotIn("abc.def.ghi", text)
             self.assertIn("[REDACTED]", text)
 
     def test_verbose_write_is_a_noop_when_disabled(self) -> None:

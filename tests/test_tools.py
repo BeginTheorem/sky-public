@@ -1,4 +1,5 @@
-"""Tool and execution-policy tests."""
+"""Split from the former monolithic CoreTests suite."""
+
 from __future__ import annotations
 
 import json
@@ -20,6 +21,7 @@ from skynet.tools import (
     GrepTool,
     ReadTool,
     WebFetchTool,
+    _describe_command_failure,
     _html_markdown,
     _PolicyRedirectHandler,
 )
@@ -51,8 +53,9 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("policy_warning", result)
 
     def test_denylist_flags_only_real_mutations(self) -> None:
-        # A '>' inside 2>&1 / 2>/dev/null or a protected path quoted inside a
-        # read-only grep is not a mutation and must not warn.
+        # Measured on the live log: 76 of 149 recorded denials were false
+        # positives, fired by a '>' inside 2>&1 / 2>/dev/null or by a protected
+        # path quoted inside a read-only grep. Those must not warn.
         for command in (
             "grep -rn x skynet/ scripts/ 2>/dev/null",
             "grep -n 'state/reboot-request.json' skynet/policy.py",
@@ -66,13 +69,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self_preservation_warning("printf confirmed >> config/skynet.env"), "config/skynet.env")
         self.assertEqual(resurrection_denial("rm -rf .git/"), ".git/")
         self.assertEqual(resurrection_denial("truncate -s 0 config/skynet.env"), ".env")
-        # state/ belongs to the soft contour, not the hard one.
+        # state/ was downgraded from the hard contour to the soft one.
         self.assertIsNone(resurrection_denial("rm -rf state/"))
         self.assertEqual(self_preservation_warning("rm -rf state/"), "state/")
 
     def test_denylist_sees_through_quoted_and_split_targets(self) -> None:
         # A quoted or split destination is still a write: quoting the path must
-        # not turn a hard denial into an allow.
+        # not turn a hard denial into an allow. Regression from the first
+        # matcher fix, which stripped quoted spans before matching redirects.
         self.assertEqual(self_preservation_warning('printf confirmed >> "config/skynet.env"'), "config/skynet.env")
         self.assertEqual(resurrection_denial('echo x > ".git/config"'), ".git/")
         self.assertEqual(resurrection_denial("echo x >> 'config/skynet.env'"), ".env")
@@ -204,6 +208,28 @@ class CoreTests(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertTrue(result["ok"], result)
             self.assertLess(elapsed, 15, f"grep|head should finish quickly, took {elapsed:.1f}s")
+    def test_bash_nonzero_exit_names_the_failure_even_with_no_output(self) -> None:
+        result = BashTool().execute({"command": "exit 3"}, idempotency_key="quiet-exit")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["returncode"], 3)
+        self.assertEqual(result["error"], "command failed: exit status 3 with no output")
+
+    def test_bash_nonzero_exit_with_stderr_omits_the_no_output_suffix(self) -> None:
+        result = BashTool().execute({"command": "echo boom >&2; exit 1"}, idempotency_key="loud-exit")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "command failed: exit status 1")
+        self.assertIn("boom", cast(str, result["stderr"]))
+
+    def test_successful_bash_result_has_no_error_key(self) -> None:
+        result = BashTool().execute({"command": "echo fine"}, idempotency_key="fine")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("error", result)
+
+    def test_describe_command_failure_names_signals(self) -> None:
+        self.assertEqual(_describe_command_failure(-9, "", ""), "command failed: terminated by SIGKILL with no output")
+        self.assertEqual(_describe_command_failure(-9, "x", ""), "command failed: terminated by SIGKILL")
+        self.assertEqual(_describe_command_failure(-1000, "", ""), "command failed: terminated by signal 1000 with no output")
+
     def test_bash_timeout_kills_process_group_and_returns_error(self) -> None:
         started = time.monotonic()
         result = BashTool().execute(
@@ -323,7 +349,12 @@ class CoreTests(unittest.TestCase):
                 policy.check_cwd(link)
 
     def test_execution_policy_allows_the_scratch_root(self) -> None:
-        """bash, read and grep share one boundary, scratch included."""
+        """bash, read and grep share one boundary, scratch included.
+
+        The seed tells the organism to prototype in the scratch directory;
+        refusing it in read/grep while bash soft-allowed it forced the model to
+        read its own files through cat/sed.
+        """
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"
             scratch = Path(directory) / "skynet-scratch"

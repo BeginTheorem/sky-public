@@ -40,7 +40,7 @@ ROADMAP_TASKS: tuple[tuple[str, str], ...] = (
     ),
     (
         "Probe the host from outside the organism",
-        "An external timer probes the host over SSH and reports an unreachable machine directly to the operator channel, because in-process alerts cannot survive a dead host. Acceptance is a test of the external report path.",
+        "An external timer probes the host over SSH and reports an unreachable machine directly to the owner channel, because in-process alerts cannot survive a dead host. Acceptance is a test of the external report path.",
     ),
     (
         "Mine the literature for one mechanism this harness lacks",
@@ -126,9 +126,10 @@ def seed(store: Any, *, root: str | Path | None = None) -> dict[str, Any]:
     # Idempotency alone was not enough. A task seeded by an earlier revision of
     # ROADMAP_TASKS kept its `pending` status after its entry was deleted, so
     # the planner went on selecting work whose acceptance criterion was already
-    # met. Only this module writes area=ROADMAP_AREA, so the scope is exactly
-    # the seeded set, and only `pending` is retired because a `running` task
-    # belongs to an episode already in flight.
+    # met: the doom-loop task stayed pending after its tests landed. Only this
+    # module writes area=ROADMAP_AREA, so the scope is exactly the seeded set,
+    # and only `pending` is retired because a `running` task belongs to an
+    # episode already in flight.
     current_titles = {title for title, _ in ROADMAP_TASKS}
     retired = 0
     if current_titles:

@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from threading import Event, Lock
@@ -33,9 +34,54 @@ from .time import display_timestamp
 
 log = logging.getLogger("skynet.telegram")
 MAX_MESSAGE = 3900
-POLL_TIMEOUT = 30
+# Long-poll window. This is also the worst-case delay before a queued outbox
+# message can leave: the bot drains the outbox only after getUpdates returns, so
+# a reply generated while a poll is in flight waits for that poll to end. The old
+# 30s window was measured as ~29.9s of delivery latency for a message queued
+# mid-poll; a shorter window trades a few more requests for a much smaller worst
+# case. Keep it above 0: short polling burns quota and the token only allows one
+# getUpdates consumer at a time.
+POLL_TIMEOUT = 5
 RETRY_FALLBACK_SECONDS = 30
 SEEN_UPDATE_LIMIT = 512
+
+# Honest read receipts. Telegram marks an owner message as "read" (two ticks) the
+# moment the bot fetches it with getUpdates -- a transport fact, not a statement
+# that the model ever saw the text. The Bot API has no "mark as unread" method,
+# so the only truthful signal we can offer is a reaction the organism controls:
+# eyes while the message is merely queued, a thumbs-up once a run has actually
+# carried it into a ReAct context. The read emoji must come from the API's
+# allowed reaction set: U+2705 (the check mark) is rejected with
+# 400 REACTION_INVALID on this bot's chat, which made every read upgrade a
+# silent no-op, so it is not used. ``setMessageReaction`` is deliberately absent
+# from ALLOWED_UPDATES: the API never delivers reaction updates for reactions set
+# by bots, so subscribing would only add noise.
+ALLOWED_UPDATES = ["message", "callback_query"]
+RECEIPT_SEEN = "👀"      # eyes: fetched, not yet read by the model
+RECEIPT_READ = "👍"      # thumbs up: delivered into a ReAct context (U+2705 is rejected)
+RECEIPT_LIMIT = 200
+# The Bot API accepts only a fixed set of emoji for setMessageReaction; anything
+# outside it is rejected with 400 REACTION_INVALID and the read upgrade silently
+# no-ops. Kept as data so a test can pin both receipts to the accepted set.
+TELEGRAM_ALLOWED_REACTIONS = frozenset({
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢",
+    "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳",
+    "❤‍🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓",
+    "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈",
+    "😇", "😨", "🤝", "✍", "🤗", "🎄", "☃", "💅", "🤪", "🗿", "🆒", "💘",
+    "🤷‍♂", "🤷", "🤷‍♀", "😡",
+})
+# A failed read upgrade used to be retried on every poll (POLL_TIMEOUT is 5s),
+# so one permanently refused reaction cost up to RECEIPT_LIMIT blocking network
+# calls per cycle, forever. Each entry is now attempted at most this many times,
+# with exponential backoff between attempts, and then dropped.
+RECEIPT_MAX_ATTEMPTS = 3
+RECEIPT_RETRY_BACKOFF_SECONDS = 30.0
+# Receipt refresh is a side task on the single poll loop; run it on a cheap
+# cadence and cap the reactions one pass may attempt so a burst of messages or a
+# batch of upgrades cannot stall command intake or the outbox drain.
+RECEIPT_REFRESH_INTERVAL_SECONDS = 30.0
+RECEIPT_REFRESH_BATCH = 5
 DEFAULT_STATUS_DAYS = 1.0
 MIN_STATUS_DAYS = 0.1
 MAX_STATUS_DAYS = 90.0
@@ -49,6 +95,13 @@ SENSITIVE_KEYS = {"reasoning_content", "api_key", "token", "password", "secret"}
 
 def outbox_enabled() -> bool:
     return os.getenv("SKYNET_OUTBOX_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
@@ -70,13 +123,8 @@ TELEGRAM_EVENT_KINDS = {
     "finish_report", "emergency_finish",
     "memory_loop_started", "memory_loop_finished", "memory_loop_failed", "memory_consolidated",
     "proposal_created", "proposal_failed",
-    "supervisor_start", "supervisor_stop", "watchdog_timeout",
+    "supervisor_start", "supervisor_stop", "watchdog_timeout", "owner_stop",
 }
-
-
-def chunks(text: str, limit: int = MAX_MESSAGE) -> list[str]:
-    text = text or "(empty)"
-    return [text[i:i + limit] for i in range(0, len(text), limit)] or ["(empty)"]
 
 
 class TelegramRateLimitError(RuntimeError):
@@ -85,8 +133,139 @@ class TelegramRateLimitError(RuntimeError):
         super().__init__(f"Telegram rate limit; retry after {self.retry_after:g}s")
 
 
+class ApiError(RuntimeError):
+    """A non-429 Bot API failure, with the API's own description preserved.
+
+    ``raise RuntimeError(str(result))`` kept the body, but callers that log
+    only ``str(exc)`` could not name the cause; the description is what names
+    it, so it becomes the message and stays available as an attribute. An HTTP
+    error status (400 and friends) carries the same description in its JSON
+    body, so it is translated here too: without that the caller only sees the
+    opaque ``HTTP Error 400: Bad Request`` status line while the body that was
+    already parsed and discarded named the cause.
+    """
+
+    def __init__(self, description: str, payload: dict[str, Any], http_status: int | None = None) -> None:
+        self.description = description or "unknown Telegram API error"
+        self.payload = payload
+        self.http_status = http_status
+        suffix = f" (HTTP {http_status})" if http_status is not None else ""
+        super().__init__(f"Telegram API error: {self.description}{suffix}")
+
+
 def redact(text: str) -> str:
     return BOT_TOKEN_RE.sub("[bot-token]", SECRET_RE.sub(r"\1=[redacted]", text))
+
+
+# Telegram renders a message either as plain text or, when parse_mode is set, as
+# a small markup subset. MarkdownV2 needs roughly eighteen characters escaped and
+# one missed character rejects the whole send, so the renderer targets HTML:
+# there only &, < and > must be escaped and every tag is balanced by construction.
+HTML_ESCAPE = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
+CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+BOLD_SPAN_RE = re.compile(r"\*\*([^*\n]+)\*\*")
+
+
+def to_telegram_html(text: str) -> str:
+    """Render plain text as Telegram-safe HTML.
+
+    Escaping runs before any tag is inserted, so the result cannot carry a
+    malformed entity; text with no markup (``run=... status=...``) is unchanged
+    apart from the three escaped characters.
+    """
+    escaped = text.translate(HTML_ESCAPE)
+    # Code spans are tokenized before bold is applied: substituting them first
+    # let a ``**`` inside backticks become ``<b>`` nested inside ``<code>``
+    # (`` `a**b**c` `` -> ``<code>a<b>b</b>c</code>``), which Telegram's HTML
+    # parser can reject, and one rejected entity fails the whole send. Bold is
+    # therefore applied only to the segments between code spans.
+    parts: list[str] = []
+    position = 0
+    for match in CODE_SPAN_RE.finditer(escaped):
+        parts.append(BOLD_SPAN_RE.sub(r"<b>\1</b>", escaped[position:match.start()]))
+        parts.append(f"<code>{match.group(1)}</code>")
+        position = match.end()
+    parts.append(BOLD_SPAN_RE.sub(r"<b>\1</b>", escaped[position:]))
+    return "".join(parts)
+
+
+def _markup_spans(text: str) -> list[tuple[int, int]]:
+    """Character ranges carrying markup, as (start, end) over ``text``."""
+    spans = [(m.start(), m.end()) for m in CODE_SPAN_RE.finditer(text)]
+    spans += [(m.start(), m.end()) for m in BOLD_SPAN_RE.finditer(text)]
+    return spans
+
+
+def _split_outside_markup(text: str, point: int) -> int:
+    """Move a split point back so no markup span straddles the boundary.
+
+    ``chunk_html`` measures rendered prefixes and then cuts at an arbitrary
+    character, so a ``code``/``**bold**`` span crossing the cut was emitted as
+    two halves: both delimiters survived as literal text and the formatting was
+    silently lost. Measured on this renderer, a code span beginning 5 characters
+    before the boundary arrived as ``...aaa`code`` and `` span here`...`` with
+    zero ``<code>`` tags in either part. Backing the cut up to the start of the
+    offending span keeps the part within the limit -- a shorter prefix cannot
+    render longer -- and leaves the span whole in the next part. Moving the cut
+    can expose a second, overlapping span, so the scan repeats until stable; a
+    span that begins at the first character cannot be helped this way and the
+    caller keeps its original point.
+    """
+    spans = _markup_spans(text)
+    for _ in range(len(spans) + 1):
+        moved = False
+        for start, end in spans:
+            if start < point < end:
+                point, moved = start, True
+        if not moved:
+            break
+    return point
+
+
+def _telegram_length(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units, not Python code points.
+
+    Telegram's 4096 limit is measured in UTF-16 code units, so an astral
+    character (an emoji, U+1F600 and friends) counts as two while ``len`` counts
+    it as one. A message dense in emoji therefore passed the old check and was
+    still rejected as too long; measuring the rendered prefix in UTF-16 units
+    makes the bisection agree with the server.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
+def chunk_html(text: str, limit: int = MAX_MESSAGE) -> list[str]:
+    """Split text so each rendered part fits Telegram's limit.
+
+    Escaping and markup both inflate the text: ``&`` becomes ``&amp;`` (five
+    characters) and every ``<code>``/``<b>`` span adds its own tags. Chunking the
+    raw text and rendering afterwards can therefore emit a part larger than the
+    limit, and Telegram then rejects the whole send as "message is too long".
+    Measured on this repository's own outbox: a 4007-character ``agent_message``
+    rendered to one 4322-character part, over the 4096 limit, because 24 code
+    spans contributed their tags after the split. Rendered length grows
+    monotonically with prefix length, so the longest prefix that still fits is
+    found by bisection and the part that is measured is exactly the part sent.
+    """
+    text = text or "(empty)"
+    parts: list[str] = []
+    remaining = text
+    while remaining:
+        low, high = 0, len(remaining)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if _telegram_length(to_telegram_html(remaining[:mid])) <= limit:
+                low = mid
+            else:
+                high = mid - 1
+        if low <= 0:
+            low = 1
+        safe = _split_outside_markup(remaining, low)
+        if safe > 0:
+            low = safe
+        parts.append(to_telegram_html(remaining[:low]))
+        remaining = remaining[low:]
+    return parts or ["(empty)"]
 
 
 def sanitize(value: Any, key: str = "") -> Any:
@@ -137,12 +316,12 @@ class TelegramAPI:
                     parsed = parse.urlparse(self.proxy)
                     if parsed.hostname is None or parsed.port is None:
                         raise ValueError("Telegram proxy must include host and port")
-                    # Keep hostname resolution inside the proxy so it can choose
+                    # Keep hostname resolution inside Tor so the proxy can choose
                     # a reachable address instead of receiving a stale local IP.
                     socks.set_default_proxy(socks.SOCKS5, parsed.hostname, parsed.port, rdns=True)
                     socket.socket = socks.socksocket
                     # Preserve the hostname in the sockaddr so PySocks performs
-                    # remote DNS through the proxy, while avoiding IPv6 socket attempts.
+                    # remote DNS through Tor, while avoiding IPv6 socket attempts.
                     def ipv4_getaddrinfo(host, port, _family=0, type=0, proto=0, _flags=0):
                         return [(socket.AF_INET, type or socket.SOCK_STREAM, proto, "", (host, port))]
 
@@ -152,6 +331,8 @@ class TelegramAPI:
                         result = json.loads(response.read().decode("utf-8"))
                 except HTTPError as exc:
                     result = json.loads(exc.read().decode("utf-8"))
+                    if exc.code != 429 and isinstance(result, dict) and result.get("ok") is False:
+                        raise ApiError(str(result.get("description", "")), result, http_status=exc.code) from exc
                     if exc.code != 429:
                         raise
             finally:
@@ -162,12 +343,12 @@ class TelegramAPI:
             parameters = result.get("parameters") or {}
             raise TelegramRateLimitError(float(parameters.get("retry_after", RETRY_FALLBACK_SECONDS)))
         if not result.get("ok"):
-            raise RuntimeError(str(result))
+            raise ApiError(str(result.get("description", "")), result)
         return result
 
     def send(self, chat_id: int, text: str) -> None:
-        for part in chunks(redact(text)):
-            self.call("sendMessage", {"chat_id": chat_id, "text": part})
+        for part in chunk_html(redact(text)):
+            self.call("sendMessage", {"chat_id": chat_id, "text": part, "parse_mode": "HTML"})
 
 
 class PrivateBot:
@@ -188,11 +369,18 @@ class PrivateBot:
         self.allowed_chat = allowed_chat
         self.service = service
         self.offset_path = state_path.parent / "telegram-offset.json"
+        self.receipts_path = state_path.parent / "telegram-receipts.json"
         self._store = store
         self._drainer = drainer
         self._stop = Event()
         self._seen_updates: set[int] = set()
         self._seen_order: deque[int] = deque()
+        self._receipts: dict[int, str] = {}
+        self._receipt_order: deque[int] = deque()
+        self._receipt_read_attempts: dict[int, int] = {}
+        self._receipt_read_retry_after: dict[int, float] = {}
+        self._last_receipt_refresh = 0.0
+        self._load_receipts()
 
     def store(self) -> StateStore:
         if self._store is None:
@@ -208,6 +396,10 @@ class PrivateBot:
                 max_attempts=_int_env("SKYNET_OUTBOX_MAX_ATTEMPTS", 5),
                 backlog_limit=_int_env("SKYNET_OUTBOX_BACKLOG_LIMIT", 20, minimum=0),
                 enabled=outbox_enabled(),
+                # This drainer runs inside the single-threaded long-poll loop, so an
+                # unannounced flood wait must not block it; the rate-limit window
+                # and the post-window probe already carry the penalty.
+                block_on_rate_limit=_bool_env("SKYNET_OUTBOX_BLOCK_ON_RATE_LIMIT", False),
             )
         return self._drainer
 
@@ -275,7 +467,7 @@ class PrivateBot:
 
     def execute(self, chat_id: int, command: str, argument: str) -> None:
         if command == "/help":
-            self.api.send(chat_id, "Команды: /status [дни], /alerts, /metrics, /answer <текст>, /start, /stop, /restart, /provider, /provider_on, /provider_off, /reset_memory, /logs [число], /send <текст>. Обычный текст без «/» уходит организму как сообщение.")
+            self.api.send(chat_id, "Команды: /status [дни], /alerts, /metrics, /answer <текст>, /start, /stop, /restart, /provider, /provider_on, /provider_off, /reset_memory, /logs [число]. Обычный текст без «/» уходит организму как сообщение.")
         elif command == "/status":
             self.send_metrics(chat_id, argument, verbose=False)
         elif command == "/metrics":
@@ -296,12 +488,6 @@ class PrivateBot:
             self.send_logs(chat_id, self.log_run_limit(argument))
         elif command == "/answer":
             self.handle_answer(chat_id, argument)
-        elif command == "/send":
-            if not argument.strip():
-                self.api.send(chat_id, "Использование: /send <сообщение>")
-                return
-            self.store().add_inbox_event(str(uuid4()), "user_message", {"text": argument.strip(), "source": "telegram"})
-            self.api.send(chat_id, "Сообщение поставлено в inbox.")
         elif command == "/start":
             self.systemctl(chat_id, "start")
         else:
@@ -357,7 +543,9 @@ class PrivateBot:
         """
         store = self.store()
         body = text.strip()
-        store.add_inbox_event(str(uuid4()), "user_message", {"text": body, "source": "telegram"})
+        event_id = str(uuid4())
+        store.add_inbox_event(event_id, "user_message", {"text": body, "source": "telegram"})
+        self._track_receipt(message, event_id)
         if not message.get("reply_to_message"):
             return
         open_questions = store.open_questions()
@@ -366,6 +554,187 @@ class PrivateBot:
         target = str(open_questions[0]["question_id"])
         if store.answer_question(target, body, source="telegram"):
             store.add_inbox_event(str(uuid4()), "user_answer", {"question_id": target, "answer": body, "source": "telegram"})
+
+    def _track_receipt(self, message: dict[str, Any], event_id: str) -> None:
+        """Remember which chat message carries which inbox event, for receipts."""
+        message_id = message.get("message_id")
+        if not isinstance(message_id, int):
+            return
+        self._receipts[message_id] = event_id
+        self._receipt_order.append(message_id)
+        while len(self._receipt_order) > RECEIPT_LIMIT:
+            self._forget_receipt(self._receipt_order.popleft())
+        self._react(message_id, RECEIPT_SEEN)
+        self._save_receipts()
+
+    def _forget_receipt(self, message_id: int) -> None:
+        """Drop every trace of one receipt so the ledger cannot grow stale."""
+        self._receipts.pop(message_id, None)
+        self._receipt_read_attempts.pop(message_id, None)
+        self._receipt_read_retry_after.pop(message_id, None)
+        with contextlib.suppress(ValueError):
+            self._receipt_order.remove(message_id)
+
+    def _react(self, message_id: int, emoji: str) -> bool:
+        """Set one receipt reaction; a missing permission must never break intake."""
+        try:
+            self.api.call(
+                "setMessageReaction",
+                {
+                    "chat_id": self.allowed_chat,
+                    "message_id": message_id,
+                    "reaction": json.dumps([{"type": "emoji", "emoji": emoji}]),
+                },
+            )
+            return True
+        except Exception as exc:
+            log.info("read receipt reaction failed message_id=%s emoji=%s: %s", message_id, emoji, exc)
+            return False
+
+    def _refresh_receipts(self) -> None:
+        """Upgrade "fetched" to "read" for messages a run actually carried.
+
+        The organism records ``inbox_delivered_in_run`` with the event ids it put
+        in front of the model, so the check mark means the text reached a ReAct
+        context -- not that a reply was sent. A permanently refused reaction used
+        to be retried on every poll for the life of the entry; each entry is now
+        attempted at most ``RECEIPT_MAX_ATTEMPTS`` times with exponential
+        backoff, then dropped. The whole pass is a bounded side task on the
+        single poll loop: it runs at most once per cadence window and attempts at
+        most ``RECEIPT_REFRESH_BATCH`` reactions, so a burst of upgrades cannot
+        stall command intake or the outbox drain.
+        """
+        if not self._receipts:
+            return
+        now = time.monotonic()
+        if now - self._last_receipt_refresh < RECEIPT_REFRESH_INTERVAL_SECONDS:
+            return
+        self._last_receipt_refresh = now
+        # Driven by the ledger's own event ids, not by a global most-recent-N
+        # window: a window can be outrun (more than RECEIPT_LIMIT deliveries
+        # between two passes), which stranded an older message on "seen" forever.
+        # The ledger is bounded to RECEIPT_LIMIT entries, so the wanted set is
+        # bounded; the join cannot miss an entry the ledger still holds.
+        ledger_ids = sorted({str(value) for value in self._receipts.values() if value})
+        if not ledger_ids:
+            return
+        try:
+            rows = self.store().connection.execute(
+                "SELECT DISTINCT delivered.value AS event_id "
+                "FROM event_log, json_each(event_log.payload, '$.event_ids') AS delivered, "
+                "json_each(?) AS wanted "
+                "WHERE event_log.kind='inbox_delivered_in_run' AND delivered.value = wanted.value",
+                (json.dumps(ledger_ids),),
+            ).fetchall()
+        except Exception:
+            log.exception("read receipt ledger read failed")
+            return
+        read_ids = {str(row[0]) for row in rows}
+        if not read_ids:
+            return
+        changed = False
+        attempted = 0
+        for message_id in list(self._receipt_order):
+            if attempted >= RECEIPT_REFRESH_BATCH:
+                break
+            if self._receipts.get(message_id) not in read_ids:
+                continue
+            if now < self._receipt_read_retry_after.get(message_id, 0.0):
+                continue
+            attempted += 1
+            if self._react(message_id, RECEIPT_READ):
+                self._forget_receipt(message_id)
+                changed = True
+                continue
+            attempts = self._receipt_read_attempts.get(message_id, 0) + 1
+            if attempts >= RECEIPT_MAX_ATTEMPTS:
+                log.warning("dropping read receipt after %s failed attempts message_id=%s", attempts, message_id)
+                self._forget_receipt(message_id)
+                changed = True
+                continue
+            self._receipt_read_attempts[message_id] = attempts
+            self._receipt_read_retry_after[message_id] = now + RECEIPT_RETRY_BACKOFF_SECONDS * (2 ** (attempts - 1))
+            changed = True
+        if changed:
+            self._save_receipts()
+
+    def _load_receipts(self) -> None:
+        """Restore the seen->read ledger so a restart cannot strand a receipt.
+
+        Receipt state lived only in memory, so a message fetched before a bot
+        restart kept the "seen" reaction forever even after a run read it, while
+        the same message upgraded correctly without a restart. The map is small
+        and writes are rare, so it is persisted next to the offset file. The
+        failed-attempt counter is persisted too so a restart cannot reset the
+        bound and re-open the retry storm. The backoff deadline is stored as a
+        wall-clock ``retry_after`` (a monotonic reading does not survive a
+        reboot) and translated back to the local clock on load, so one immediate
+        retry is not granted across a restart. Sidecars written before the field
+        existed simply have no deadline, which is backward compatible.
+        """
+        try:
+            data = json.loads(self.receipts_path.read_text())
+            order = [int(item) for item in data.get("order", [])]
+            receipts = {int(key): str(value) for key, value in data.get("receipts", {}).items()}
+            attempts: dict[int, int] = {}
+            raw_attempts = data.get("read_attempts")
+            if isinstance(raw_attempts, dict):
+                for key, value in raw_attempts.items():
+                    try:
+                        attempts[int(key)] = max(0, int(value))
+                    except (TypeError, ValueError):
+                        continue
+            retry_after: dict[int, float] = {}
+            raw_retry_after = data.get("retry_after")
+            if isinstance(raw_retry_after, dict):
+                for key, value in raw_retry_after.items():
+                    try:
+                        retry_after[int(key)] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+        wall_now = time.time()
+        for message_id in order:
+            if message_id in receipts and message_id not in self._receipts:
+                self._receipts[message_id] = receipts[message_id]
+                self._receipt_order.append(message_id)
+                if message_id in attempts:
+                    self._receipt_read_attempts[message_id] = attempts[message_id]
+                if retry_after.get(message_id, 0.0) > wall_now:
+                    self._receipt_read_retry_after[message_id] = time.monotonic() + (retry_after[message_id] - wall_now)
+
+    def _save_receipts(self) -> None:
+        """Persist the receipt ledger atomically; failure must never break intake."""
+        path = self.receipts_path
+        wall_now = time.time()
+        mono_now = time.monotonic()
+        payload = json.dumps({
+            "order": list(self._receipt_order),
+            "receipts": {str(key): value for key, value in self._receipts.items()},
+            "read_attempts": {
+                str(key): value
+                for key, value in self._receipt_read_attempts.items()
+                if key in self._receipts
+            },
+            "retry_after": {
+                str(key): wall_now + max(0.0, value - mono_now)
+                for key, value in self._receipt_read_retry_after.items()
+                if key in self._receipts
+            },
+        })
+        temp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with temp.open("w", encoding="utf-8") as stream:
+                stream.write(payload + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                temp.unlink()
+            log.warning("could not persist receipt ledger", exc_info=True)
 
     def status_days(self, argument: str) -> float:
         try:
@@ -518,7 +887,7 @@ class PrivateBot:
         self._drain_safely()
         while not self._stop.is_set():
             try:
-                updates = self.api.call("getUpdates", {"offset": offset, "timeout": POLL_TIMEOUT, "allowed_updates": ["message", "callback_query"]}).get("result", [])
+                updates = self.api.call("getUpdates", {"offset": offset, "timeout": POLL_TIMEOUT, "allowed_updates": ALLOWED_UPDATES}).get("result", [])
                 for update in updates:
                     next_offset = max(offset, int(update["update_id"]) + 1)
                     try:
@@ -529,11 +898,12 @@ class PrivateBot:
                     offset = next_offset
                     self.save_number(self.offset_path, offset)
                 self._drain_safely()
+                self._refresh_receipts()
             except TelegramRateLimitError as exc:
                 log.warning("Telegram rate limit; retrying in %.1fs", exc.retry_after)
                 self._stop.wait(exc.retry_after)
             except Exception as exc:
-                # A proxy circuit or Bot API timeout must not destroy the control
+                # A Tor circuit or Bot API timeout must not destroy the control
                 # process or discard the unacknowledged log offset.
                 log.warning("Telegram loop temporarily unavailable; retrying: %s", exc)
                 self._stop.wait(RETRY_FALLBACK_SECONDS)
@@ -554,7 +924,7 @@ def main() -> int:
     except (KeyError, ValueError):
         log.exception("Telegram allowlist is not configured")
         return 2
-    proxy = os.getenv("SKYNET_TELEGRAM_PROXY", "")
+    proxy = os.getenv("SKYNET_TELEGRAM_PROXY", "socks5://127.0.0.1:9050")
     bot = PrivateBot(TelegramAPI(token, proxy), Path(args.state), user, chat, args.service)
     bot.install_signal_handlers()
     bot.run()

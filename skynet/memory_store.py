@@ -24,8 +24,8 @@ KIND_ALIASES: dict[str, str] = {
     "code_fact": "fact",
     "runtime_fact": "fact",
     "engineering_fact": "fact",
-    # The map must cover every kind the model actually emits, otherwise
-    # `UNIQUE(kind, content)` fragments.
+    # Observed on the live database after the first migration; the map must cover
+    # every kind the model actually emits or `UNIQUE(kind, content)` fragments.
     "engineering": "fact",
     "blocker": "risk",
     "blocked": "risk",
@@ -192,8 +192,19 @@ class MemoryStore:
 
     @classmethod
     def _normalize_terms(cls, value: str) -> list[str]:
+        """The query terms the search uses: the LAST `_MAX_QUERY_TERMS`.
+
+        Callers append the situation-defining parts last on purpose, so a term
+        that repeats must be anchored at its last occurrence: `dict.fromkeys`
+        kept the first, so a goal word that had already appeared in an earlier
+        part stayed anchored there and was pushed out of the window by the later
+        parts' own tokens. Measured on the 55 live `run_started` envelopes that
+        carry a previous report, all six goal-title terms stay inside the window
+        on 55/55 envelopes, against 45/55 before, while a query of 200 distinct
+        words is unchanged (terms 176..199).
+        """
         tokens = [token for token in cls._terms(value) if len(token) >= 2 and token not in _STOPWORDS]
-        deduped = list(dict.fromkeys(tokens))
+        deduped = list(dict.fromkeys(reversed(tokens)))[::-1]
         return deduped[-_MAX_QUERY_TERMS:]
 
     @staticmethod

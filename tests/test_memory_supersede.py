@@ -1,4 +1,5 @@
 """Correction lifecycle: supersede contract, instruction, and pass-through."""
+
 from __future__ import annotations
 
 import json

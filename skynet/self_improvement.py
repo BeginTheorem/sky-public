@@ -45,9 +45,26 @@ class SelfImprovementError(RuntimeError):
         self.previous_proposal = dict(previous_proposal) if previous_proposal else None
 
 
+class ProtectedPathWarning(SelfImprovementError):
+    """A proposal touches the gate's own inputs and is warned on first sight.
+
+    The deny is only a warning: the change is recorded as ``warned_protected``
+    (its worktree is kept) and the model must re-submit the identical proposal.
+    The identical fingerprint is then acknowledged and proceeds through the full
+    gate. It is never a hard rejection, and a different diff gets a fresh
+    warning.
+    """
+
+    def __init__(self, offenders: Sequence[str], fingerprint: str, message: str) -> None:
+        super().__init__(message, reason_code="protected_path")
+        self.offenders = list(offenders)
+        self.fingerprint = fingerprint
+
+
 # The gate runs the whole suite now, and on a slow host with real git fixtures
 # that can take minutes; the knob exists so an operator can raise it without
-# editing code.
+# editing code (the old 600s timeouts came from the model choosing one heavy test
+# file as its entire gate).
 TEST_COMMAND_TIMEOUT_SECONDS = float(os.getenv("SKYNET_GATE_TIMEOUT", "600"))
 STATIC_STAGE_TIMEOUT_SECONDS = 300.0
 GATE_STAGE_TIMEOUT_SECONDS = 120.0
@@ -93,15 +110,23 @@ BLOCKED_FAILURE_CLASSES = frozenset({"administrative_test_failure", "environment
 MAX_ENVIRONMENT_ATTEMPTS = 3
 ANCHOR_REASON_CODES = frozenset({"anchor_not_found", "anchor_ambiguous"})
 TERMINAL_PROPOSAL_STATUSES = frozenset({"accepted", "rolled_back", "rejected", "blocked_by_environment"})
+# A protected-path proposal is only warned, not rejected: its worktree must
+# survive so the identical resubmission can run the full gate without being
+# re-applied. Deliberately NOT terminal.
+WARNED_PROTECTED = "warned_protected"
 DEFAULT_PROPOSAL_TTL_HOURS = 24.0
+# A warning only has to survive until the identical resubmission, which arrives
+# within a run or two. A much shorter TTL than a validated proposal keeps a
+# warned worktree from lingering for a day purely because the model moved on.
+DEFAULT_WARNED_TTL_HOURS = 6.0
 DEFAULT_MAX_WORKTREES = 8
-# The gate must never test its own editability: a proposal that rewrites the
-# suite, its configuration, or this module would be validating itself. Those
-# paths are rejected before any stage runs.
+# A proposal that rewrites the suite, its configuration, or this module could
+# neuter the gate and validate itself. Those paths are warned on first
+# submission and only an identical resubmission reaches a stage.
 GATE_PROTECTED_ROOT_FILES = frozenset({"conftest.py", "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg"})
-# The meta-loop decides what the organism works on and how it is judged; the
-# judged must not edit the judge, so the descriptors, the selection policy and
-# the metrics are outside the reach of self-improvement too.
+# The meta-loop decides what the organism works on and how it is judged. Owner
+# decision 2026-09-21 opened it: these paths are warned, not held, so the
+# organism can repair its own judge after an identical resubmission.
 GATE_PROTECTED_PATHS = frozenset({
     "skynet/self_improvement.py",
     "skynet/idea_archive.py",
@@ -110,7 +135,7 @@ GATE_PROTECTED_PATHS = frozenset({
     "skynet/metrics.py",
 })
 VENV_PYTHON_NAMES = frozenset({"python", "python3", ".venv/bin/python", "./.venv/bin/python", ".venv/bin/python3", "./.venv/bin/python3"})
-# The service exports provider-enable flags and the money
+# The service exports provider-enable flags (paid-provider deploy) and the money
 # boost; the suite asserts the factory builds each provider from
 # SKYNET_PROVIDER_CHAIN, so inheriting them turns a code verdict into an
 # environment verdict and rejects every proposal on an untouched tree. The
@@ -233,9 +258,11 @@ def classify_failure(error: BaseException | str) -> str:
 def _transport_unescape(value: str) -> str:
     """Decode literal escape artifacts that survive tool-call transport.
 
-    Decoding the two-character sequences ``\\"`` and ``\\n`` once, and only when
-    the decoded form matches exactly once, recovers anchors mangled in transport
-    while genuinely stale anchors still raise the zero-match error.
+    Measured on the historical runtime log: 22 anchor submissions matched
+    zero times against the file live at attempt time, and 13 of them matched
+    exactly once after decoding the two-character sequences ``\\"`` and
+    ``\\n`` - including all 8 skynet/autonomous_planner.py rows. The remaining
+    9 are genuinely stale and must keep raising the zero-match error.
     """
     if "\\" not in value:
         return value
@@ -252,7 +279,7 @@ class ImprovementProposal:
 class SelfImprovementManager:
     """Isolated, explicitly invoked source-change boundary."""
 
-    def __init__(self, root: str | Path, worktree_root: str | Path | None = None, *, gate_suite: Sequence[str] | None = None) -> None:
+    def __init__(self, root: str | Path, worktree_root: str | Path | None = None, *, gate_suite: Sequence[str] | None = None, store: Any | None = None) -> None:
         self.root = Path(root).resolve()
         if worktree_root is not None:
             self.worktree_root = Path(worktree_root).resolve()
@@ -264,7 +291,7 @@ class SelfImprovementManager:
         self.request_path = self.root / "state" / "reboot-request.json"
         self.proposals_path = self.root / "state" / "self-improvement-proposals.json"
         # The harness owns the gate: the model's command may add a bounded check
-        # but can never replace the suite.
+        # but can never replace the suite (P0-14).
         self.gate_suite: tuple[str, ...] = tuple(gate_suite) if gate_suite else DEFAULT_TEST_COMMAND
         self.last_quarantined: list[str] = []
         self.runtime_log = None
@@ -274,6 +301,35 @@ class SelfImprovementManager:
             self.runtime_log = RuntimeLog(runtime_path)
         except ImportError:
             pass
+        # The durable store is injected by the composition root (``cli.py``): the
+        # manager must not open a second StateStore itself, because construction
+        # recovers inflight leases and would race the live reactor. When it is
+        # absent the warning still lands in the advanced runtime log, but only a
+        # store reaches the owner outbox.
+        self.store = store
+
+    def set_store(self, store: Any | None) -> None:
+        """Inject the durable store used for held-proposal events and alerts."""
+        self.store = store
+
+    def _emit(self, kind: str, payload: dict[str, object]) -> None:
+        """Record a durable event through the store, or the runtime log."""
+        if self.store is not None:
+            self.store.append_event(kind, payload)
+        elif self.runtime_log is not None:
+            self.runtime_log.write(kind, payload)
+
+    def _alert_owner(self, kind: str, payload: dict[str, object]) -> None:
+        """Escalate through the existing alert/outbox machinery, if wired."""
+        if self.store is None:
+            return
+        fingerprint = str(payload.get("change_fingerprint", ""))
+        self.store.raise_alert(
+            kind,
+            payload,
+            severity="warning",
+            dedup_key=f"{kind}:{fingerprint}",
+        )
 
     def _git(self, args: Sequence[str], cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.root, capture_output=True, text=True, check=False)
@@ -407,8 +463,9 @@ class SelfImprovementManager:
             log.warning("could not quarantine corrupt self-improvement registry", exc_info=True)
             return
         log.warning("quarantined corrupt self-improvement registry to %s (%s)", target, reason)
-        if self.runtime_log is not None:
-            self.runtime_log.write("registry_corrupted", {"quarantined": str(target), "reason": reason})
+        # Registry corruption is a cycle-level deviation: route it through the
+        # durable store when one is injected, not only the runtime projection.
+        self._emit("registry_corrupted", {"quarantined": str(target), "reason": reason})
 
     def _write_proposals(self, proposals: dict[str, dict[str, object]]) -> None:
         self.proposals_path.parent.mkdir(parents=True, exist_ok=True)
@@ -597,30 +654,46 @@ class SelfImprovementManager:
         return removed
 
     def sweep_stale_proposals(self) -> list[dict[str, object]]:
-        """Reject validated proposals that outlived the promotion TTL."""
+        """Reject validated or warned proposals that outlived the TTL."""
         try:
             ttl_hours = float(os.getenv("SKYNET_PROPOSAL_TTL_HOURS", str(DEFAULT_PROPOSAL_TTL_HOURS)))
         except ValueError:
             ttl_hours = DEFAULT_PROPOSAL_TTL_HOURS
+        try:
+            warned_ttl_hours = float(os.getenv("SKYNET_WARNED_TTL_HOURS", str(DEFAULT_WARNED_TTL_HOURS)))
+        except ValueError:
+            warned_ttl_hours = DEFAULT_WARNED_TTL_HOURS
         proposals = self._read_proposals()
         now = utc_datetime_now()
         swept: list[dict[str, object]] = []
         changed = False
         for proposal_id, record in proposals.items():
-            if record.get("status") != "validated":
+            status = record.get("status")
+            if status == "validated":
+                stamp = record.get("validated_at") or record.get("created_at")
+                effective_ttl = ttl_hours
+                expired = f"validated proposal expired after {ttl_hours:g}h without promotion"
+            elif status == WARNED_PROTECTED:
+                # An unacknowledged warning holds a worktree only until the
+                # identical resubmission; a shorter TTL reclaims it sooner when
+                # the model moved on, so warnings cannot accumulate into the
+                # worktree quota.
+                stamp = record.get("warned_at") or record.get("created_at")
+                effective_ttl = warned_ttl_hours
+                expired = f"warned proposal expired after {warned_ttl_hours:g}h without resubmission"
+            else:
                 continue
-            stamp = record.get("validated_at") or record.get("created_at")
             if not isinstance(stamp, str):
                 continue
             try:
                 created = parse_timestamp(stamp)
             except ValueError:
                 continue
-            if (now - created).total_seconds() < ttl_hours * 3600:
+            if (now - created).total_seconds() < effective_ttl * 3600:
                 continue
             record["status"] = "rejected"
             record["failure_class"] = "stale_proposal"
-            record["failure"] = f"validated proposal expired after {ttl_hours:g}h without promotion"
+            record["failure"] = expired
             self._cleanup_worktree(str(record.get("worktree", "")))
             swept.append({"proposal_id": proposal_id, "status": "rejected"})
             changed = True
@@ -690,13 +763,15 @@ class SelfImprovementManager:
             return True
         return normalized in GATE_PROTECTED_PATHS
 
-    def _reject_gate_protected_paths(self, proposal: ImprovementProposal, applied_paths: Sequence[str] | None) -> None:
-        """Refuse a proposal that edits the gate's own inputs.
+    def _gate_protected_offenders(self, proposal: ImprovementProposal, applied_paths: Sequence[str] | None) -> list[str]:
+        """Return the gate-protected paths a proposal touches, if any.
 
-        The suite, its configuration and this module decide whether any change
+        The suite, its configuration and the meta-loop decide whether any change
         is safe, so a proposal that can rewrite them could neuter the gate and
-        validate itself. The check runs on the applied paths when the caller has
-        them and falls back to the worktree diff otherwise.
+        validate itself. The verdict is a warning now: the first submission is
+        warned and only an identical resubmission is validated. The check runs on
+        the applied paths when the caller has them and falls back to the worktree
+        diff otherwise.
         """
         # The production caller always passes the applied paths; the worktree
         # diff is a defensive fallback. An explicitly empty list means "known to
@@ -712,13 +787,7 @@ class SelfImprovementManager:
                     reason_code="unknown_paths",
                 )
             paths = resolved
-        offenders = sorted({path for path in paths if self._is_gate_protected(path)})
-        if offenders:
-            raise SelfImprovementError(
-                f"proposal modifies gate-protected path(s): {', '.join(offenders)}; "
-                "the test suite, its configuration and skynet/self_improvement.py cannot be changed by a proposal",
-                reason_code="protected_path",
-            )
+        return sorted({path for path in paths if self._is_gate_protected(path)})
 
     def _quarantine_dirty_worktree(self) -> list[str]:
         """Preserve modified tracked files, then restore a clean main worktree.
@@ -765,7 +834,16 @@ class SelfImprovementManager:
         return quarantined
 
     def _enforce_worktree_quota(self) -> None:
-        """Keep the registered worktree collection below a hard cap."""
+        """Keep the registered worktree collection below a hard cap.
+
+        A warned proposal holds a worktree only so the identical resubmission
+        can run the gate without being re-applied. Those records are reclaimed
+        (worktree removed, record dropped) before the quota can ever refuse new
+        work: since the gate's own inputs are warn-only, a run that edits tests
+        or the meta-loop must not be able to fill the quota with un-resubmitted
+        warnings and wedge self-improvement. A reclaimed warning is simply
+        re-issued if the same change is proposed again.
+        """
         try:
             cap = int(os.getenv("SKYNET_MAX_WORKTREES", str(DEFAULT_MAX_WORKTREES)))
         except ValueError:
@@ -773,16 +851,34 @@ class SelfImprovementManager:
         if cap <= 0:
             return
         proposals = self._read_proposals()
-        with_worktree = [record for record in proposals.values() if record.get("worktree")]
-        if len(with_worktree) < cap:
+
+        def active(record: Mapping[str, object]) -> bool:
+            return bool(record.get("worktree")) and record.get("status") not in TERMINAL_PROPOSAL_STATUSES
+
+        if sum(1 for record in proposals.values() if active(record)) < cap:
             return
-        for record in with_worktree:
-            if record.get("status") in TERMINAL_PROPOSAL_STATUSES:
+        for record in proposals.values():
+            if record.get("status") in TERMINAL_PROPOSAL_STATUSES and record.get("worktree"):
                 self._cleanup_worktree(str(record.get("worktree", "")))
-        active = [record for record in proposals.values() if record.get("worktree") and record.get("status") not in TERMINAL_PROPOSAL_STATUSES]
-        if len(active) >= cap:
+        warned = sorted(
+            ((proposal_id, record) for proposal_id, record in proposals.items() if active(record) and record.get("status") == WARNED_PROTECTED),
+            key=lambda item: str(item[1].get("warned_at") or item[1].get("created_at") or ""),
+        )
+        reclaimed: list[str] = []
+        for proposal_id, record in warned:
+            if sum(1 for item in proposals.values() if active(item)) < cap:
+                break
+            self._cleanup_worktree(str(record.get("worktree", "")))
+            proposals.pop(proposal_id, None)
+            reclaimed.append(proposal_id)
+        if reclaimed:
+            self._write_proposals(proposals)
+            if self.runtime_log is not None:
+                self.runtime_log.write("warned_worktrees_reclaimed", {"proposals": reclaimed, "cap": cap})
+        active_records = [record for record in proposals.values() if active(record)]
+        if len(active_records) >= cap:
             raise SelfImprovementError(
-                f"worktree quota reached ({len(active)} active of {cap}); promote or discard a proposal first",
+                f"worktree quota reached ({len(active_records)} active of {cap}); promote or discard a proposal first",
                 reason_code="worktree_quota",
             )
 
@@ -794,6 +890,10 @@ class SelfImprovementManager:
             self.last_quarantined = self._quarantine_dirty_worktree()
             if not CheckpointManager(self.root).is_clean(allow_untracked=True):
                 raise SelfImprovementError("self-improvement requires no modified tracked files in the main worktree")
+        # Expire stale proposals on every proposal, not only at process start:
+        # a warned worktree that the model never resubmitted must not wait for a
+        # restart before its slot is reclaimed.
+        self.sweep_stale_proposals()
         self._enforce_worktree_quota()
         proposal_id = uuid4().hex
         worktree = self.worktree_root / proposal_id
@@ -933,8 +1033,8 @@ class SelfImprovementManager:
 
         Ruff discovers ``pyproject.toml`` from the worktree, so the ruleset is
         exactly what ``scripts/test.sh`` enforces locally. The tree is clean, so
-        any finding is a regression and there is no baseline. An absent binary
-        is recorded and skipped, like pyright.
+        any finding is a regression: unlike the retired mypy stage there is no
+        baseline. An absent binary is recorded and skipped, like pyright.
         """
         executable = Path(sys.executable).parent / "ruff"
         if not executable.exists():
@@ -964,10 +1064,11 @@ class SelfImprovementManager:
     def _run_pyright_stage(self, worktree: Path, package: Path) -> None:
         """Fail on any pyright error: the editor's language server is the bar.
 
-        pyright is a dev dependency, so an absent binary is recorded and skipped.
-        When present the tree is expected to be clean, so there is no baseline:
-        any diagnostic is a regression. ``--pythonpath`` pins import resolution
-        to this venv even though a proposal worktree has no ``.venv`` of its own.
+        pyright is a dev dependency, so an absent binary is recorded and skipped
+        like pyflakes. When present the tree is expected to be clean, so unlike
+        mypy there is no baseline: any diagnostic is a regression. ``--pythonpath``
+        pins import resolution to this venv even though a proposal worktree has
+        no ``.venv`` of its own.
         """
         executable = Path(sys.executable).parent / "pyright"
         if not executable.exists():
@@ -1017,6 +1118,7 @@ class SelfImprovementManager:
         test_command: str | Sequence[str] = DEFAULT_TEST_COMMAND,
         *,
         applied_paths: Sequence[str] | None = None,
+        fingerprint: str = "",
     ) -> str:
         test_command, fallback = self._coerce_test_command(test_command)
         if fallback and self.runtime_log is not None:
@@ -1027,9 +1129,29 @@ class SelfImprovementManager:
         # commit, promoting broken code; decide it before the expensive stages.
         if applied_paths:
             self._reject_ignored_paths(proposal, applied_paths)
-        # The gate must not test its own editability: reject any change to the
-        # suite, its configuration or this module before a single stage runs.
-        self._reject_gate_protected_paths(proposal, applied_paths)
+        # A proposal that touches the gate's own inputs is only warned: the
+        # first submission of a fingerprint is recorded as warned_protected and
+        # the caller turns the warning into a tool result. The identical
+        # resubmission finds its record here, acknowledges it, and falls through
+        # to the normal verification stages.
+        offenders = self._gate_protected_offenders(proposal, applied_paths)
+        if offenders:
+            if self._warned_record_for_fingerprint(self._read_proposals(), fingerprint) is None:
+                raise ProtectedPathWarning(
+                    offenders,
+                    fingerprint,
+                    f"proposal modifies gate-protected path(s): {', '.join(offenders)}; "
+                    "warning issued, an identical resubmission proceeds through the full gate",
+                )
+            self._emit(
+                "gate_protected_warning_acknowledged",
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "paths": offenders,
+                    "change_fingerprint": fingerprint,
+                    "reason": "identical resubmission acknowledged; proceeding through the normal verification stages",
+                },
+            )
         # Both stages only make sense when the worktree actually carries the
         # package under test; a minimal fixture without it has nothing to prove.
         package = proposal.worktree / "skynet"
@@ -1052,9 +1174,10 @@ class SelfImprovementManager:
             )
             self._run_ruff_stage(proposal.worktree, package)
             self._run_pyright_stage(proposal.worktree, package)
-            # A model-chosen command can never be the gate: the harness suite
-            # always runs, and the model's command is only an additional bounded
-            # stage.
+            # The registry showed six proposals declaring `grep -q`, a `python3
+            # -c` mock or an import as their "test". A model-chosen command can
+            # therefore never be the gate: the harness suite always runs, and the
+            # model's command is only an additional bounded stage.
             if tuple(test_command) != self.gate_suite:
                 self._run_gate_stage(
                     "suite",
@@ -1295,6 +1418,154 @@ class SelfImprovementManager:
     def discard(self, proposal: ImprovementProposal) -> None:
         self._git(["worktree", "remove", "--force", str(proposal.worktree)])
 
+    @staticmethod
+    def _fingerprint_of(record: Mapping[str, object]) -> str:
+        value = record.get("change_fingerprint")
+        return value if isinstance(value, str) else ""
+
+    def _warned_record_for_fingerprint(self, proposals: Mapping[str, dict[str, object]], fingerprint: str) -> dict[str, object] | None:
+        """Find the warned record for an exact fingerprint.
+
+        ``blocked_by_protection`` is the retired status of the same mechanism;
+        treating it as already-warned lets an upgrade finish a proposal that was
+        held under the old owner-approval flow.
+        """
+        for record in proposals.values():
+            if not isinstance(record, dict) or self._fingerprint_of(record) != fingerprint:
+                continue
+            if record.get("status") in {WARNED_PROTECTED, "blocked_by_protection"}:
+                return record
+        return None
+
+    def _warned_result(self, fingerprint: str, offenders: Sequence[str]) -> dict[str, object]:
+        paths = sorted(str(path) for path in offenders)
+        return {
+            "ok": False,
+            "warned": True,
+            "status": WARNED_PROTECTED,
+            "change_fingerprint": fingerprint,
+            "protected_paths": paths,
+            "awaiting_resubmission": True,
+            "error": "WARNING: this proposal touches gate-protected path(s): "
+            f"{', '.join(paths)}. It was NOT applied.\n"
+            "Stop and reconsider whether this edit is genuinely necessary. These paths -- the test suite, "
+            "its configuration, and the self-improvement/planner/metrics modules -- decide whether your own "
+            "changes are safe; editing them can weaken the very checks that verify you.\n"
+            "If you are certain, resubmit the IDENTICAL change through propose_self_improvement (the same "
+            f"files/changes/patch and the same hypothesis; change_fingerprint {fingerprint}). The harness will "
+            "then run the full gate (ruff, pyright, pytest) from the proposal worktree. Any change to the diff "
+            "produces a new fingerprint and a fresh warning.",
+        }
+
+    def _warn_protected_proposal(
+        self,
+        proposal: ImprovementProposal,
+        fingerprint: str,
+        offenders: Sequence[str],
+        applied_paths: Sequence[str] | None,
+        metadata: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Warn once about a protected-path proposal instead of rejecting it.
+
+        The worktree is kept so an identical resubmission can run the full gate
+        without being re-applied; the warning is recorded as a durable,
+        retention-protected event and the owner is reached through the existing
+        alert/outbox channel.
+        """
+        record: dict[str, object] = {
+            "proposal_id": proposal.proposal_id,
+            "worktree": str(proposal.worktree),
+            "base_commit": proposal.base_commit,
+            "status": WARNED_PROTECTED,
+            "change_fingerprint": fingerprint,
+            "protected_paths": sorted(str(path) for path in offenders),
+            "applied_paths": [str(path) for path in applied_paths] if applied_paths is not None else [],
+            "warned_at": utc_now(),
+            # No failure_class: a warning is not a verdict, and
+            # check_registry_integrity would otherwise demand "rejected".
+            "failure_class": "",
+            **metadata,
+        }
+        proposals = self._read_proposals()
+        proposals[proposal.proposal_id] = record
+        self._write_proposals(proposals)
+        payload: dict[str, object] = {
+            "proposal_id": proposal.proposal_id,
+            "paths": record["protected_paths"],
+            "change_fingerprint": fingerprint,
+            "reason": "proposal touches gate-protected path(s); warning issued, identical resubmission proceeds",
+            "hypothesis": metadata.get("hypothesis", {}),
+        }
+        self._emit("gate_protected_warned", payload)
+        self._alert_owner("gate_protected_warned", payload)
+        if self.runtime_log is not None:
+            self.runtime_log.write("proposal_warned", {"proposal_id": proposal.proposal_id, "paths": record["protected_paths"], "change_fingerprint": fingerprint})
+        return self._warned_result(fingerprint, offenders)
+
+    def _resume_warned(self, record: Mapping[str, object], fingerprint: str, test_command: str | Sequence[str], metadata: Mapping[str, object]) -> dict[str, object]:
+        """Run the full gate for a warned proposal on identical resubmission.
+
+        The identical change is proposed again, the fingerprint matches the
+        warned record, and the harness acknowledges the warning and proceeds
+        through the normal verification stages (ruff, pyright, the suite). The
+        stored worktree and applied paths are reused so the diff is not
+        re-applied. A green gate validates the proposal; a failure is
+        classified as usual.
+        """
+        proposal_id = str(record.get("proposal_id") or "")
+        worktree = Path(str(record.get("worktree") or ""))
+        base_commit = str(record.get("base_commit") or "")
+        proposal = ImprovementProposal(proposal_id, worktree, base_commit)
+        stored_paths = record.get("applied_paths")
+        paths = [str(item) for item in stored_paths] if isinstance(stored_paths, list) else None
+        raw_protected = record.get("protected_paths")
+        protected = [str(item) for item in raw_protected] if isinstance(raw_protected, list) else []
+        try:
+            test_command, fallback = self._coerce_test_command(test_command)
+            commit = self.validate_and_commit(proposal, test_command, applied_paths=paths, fingerprint=fingerprint)
+            self._record_validated(proposal, commit, test_command, fallback=fallback)
+            current = self._read_proposals().get(proposal_id, {})
+            current.update(metadata)
+            current["change_fingerprint"] = fingerprint
+            current["failure_class"] = ""
+            current["parent_proposal_id"] = metadata.get("parent_proposal_id", "")
+            self._write_proposals(self._read_proposals() | {proposal_id: current})
+            result: dict[str, object] = {
+                "ok": True,
+                "proposal_id": proposal_id,
+                "worktree": str(worktree),
+                "base_commit": base_commit,
+                "commit": commit,
+                "promotion_required": True,
+                "warned_protected_paths": protected,
+            }
+            if fallback:
+                result["test_command_fallback"] = True
+            return result
+        except Exception as exc:
+            failure_class = classify_failure(exc)
+            proposals = self._read_proposals()
+            current = proposals.get(proposal_id)
+            if isinstance(current, dict):
+                current["status"] = "blocked_by_environment" if failure_class in BLOCKED_FAILURE_CLASSES else "rejected"
+                current["failure_class"] = failure_class
+                current["failure"] = str(exc)[:1000]
+                reason_code = getattr(exc, "reason_code", "")
+                if isinstance(reason_code, str) and reason_code:
+                    current["reason_code"] = reason_code
+                    current["match_count"] = getattr(exc, "match_count", None)
+                self._write_proposals(proposals)
+            if self.runtime_log is not None:
+                self.runtime_log.write("proposal_failed", {"proposal_id": proposal_id, "failure_class": failure_class, "error": str(exc)[:1000]})
+            self._cleanup_worktree(str(worktree))
+            return {
+                "ok": False,
+                "status": "blocked_by_environment" if failure_class in BLOCKED_FAILURE_CLASSES else "rejected",
+                "proposal_id": proposal_id,
+                "failure_class": failure_class,
+                "error": str(exc)[:1000],
+            }
+
     def propose_files(
         self,
         files: Mapping[str, str],
@@ -1305,7 +1576,14 @@ class SelfImprovementManager:
         metadata: Mapping[str, object] | None = None,
         on_dirty: str = "quarantine",
     ) -> dict[str, object]:
-        """Run one bounded proposal from an agent; promotion remains explicit."""
+        """Run one bounded proposal from an agent.
+
+        The returned result carries ``promotion_required`` when the change is
+        validated but not yet promoted; ``SelfImprovementTool`` promotes it
+        automatically when a health check is available. An identical repeat of a
+        validated proposal resumes its promotion instead of being refused, so a
+        change that passed the gate but failed the health gate is never trapped.
+        """
         self.last_quarantined = []
         metadata = dict(metadata or {})
         fingerprint = hashlib.sha256(json.dumps({"files": dict(files), "changes": list(changes), "patch": patch, "hypothesis": metadata.get("hypothesis", {})}, sort_keys=True, default=str).encode()).hexdigest()
@@ -1315,23 +1593,43 @@ class SelfImprovementManager:
                 continue
             # An environment failure is not a verdict about the patch: the same
             # change must be retryable once the environment is repaired, so it
-            # does not burn the fingerprint. Only real rejections and already
-            # validated or accepted changes are permanently refused; an
-            # environment-blocked change is refused once the bounded number of
-            # attempts is spent, so a persistent environment fault cannot loop.
+            # does not burn the fingerprint. A change that already passed the
+            # gate but whose promotion failed (typically the health gate) must
+            # also be finishable: an identical repeat resumes promotion with the
+            # stored commit instead of being refused, so the duplicate guard
+            # cannot trap verified work. Only real rejections and changes that
+            # already promoted are permanently refused; an environment-blocked
+            # change is refused once its bounded attempts are spent.
             status = record.get("status")
             stored_attempts = record.get("environment_attempts")
             attempts = stored_attempts if isinstance(stored_attempts, int) else 1
             exhausted = status == "blocked_by_environment" and attempts >= MAX_ENVIRONMENT_ATTEMPTS
-            if status in {"rejected", "validated", "awaiting_reboot", "accepted"} or exhausted:
+            if status == "validated":
+                return {
+                    "ok": True,
+                    "proposal_id": previous_id,
+                    "worktree": str(record.get("worktree", "")),
+                    "base_commit": str(record.get("base_commit", "")),
+                    "commit": str(record.get("commit", "")),
+                    "promotion_required": True,
+                    "resumed_validation": True,
+                }
+            if status in {"rejected", "awaiting_reboot", "accepted"} or exhausted:
                 previous_class = str(record.get("failure_class") or "unknown")
                 raise SelfImprovementError(
                     f"identical proposal was already attempted as {previous_id} "
                     f"(failure_class={previous_class}); change the hypothesis or patch",
                     previous_proposal={"proposal_id": previous_id, "failure_class": previous_class},
                 )
+        # A warned protected-path proposal is resumed here, on the next
+        # identical proposal: the fingerprint is the durable key, so only the
+        # exact change that was warned has its warning acknowledged.
+        warned = self._warned_record_for_fingerprint(previous, fingerprint)
+        if warned is not None:
+            return self._resume_warned(warned, fingerprint, test_command, metadata)
         proposal = self.propose(on_dirty=on_dirty)
         quarantined = list(self.last_quarantined)
+        applied_paths: list[str] | None = None
         try:
             test_command, fallback = self._coerce_test_command(test_command)
             if fallback and self.runtime_log is not None:
@@ -1346,7 +1644,7 @@ class SelfImprovementManager:
             else:
                 applied = None
                 applied_paths = self.apply_files(proposal, files)
-            commit = self.validate_and_commit(proposal, test_command, applied_paths=applied_paths)
+            commit = self.validate_and_commit(proposal, test_command, applied_paths=applied_paths, fingerprint=fingerprint)
             self._record_validated(proposal, commit, test_command, fallback=fallback)
             record = self._read_proposals()[proposal.proposal_id]
             record.update(metadata)
@@ -1362,6 +1660,8 @@ class SelfImprovementManager:
             if quarantined:
                 result["quarantined_files"] = quarantined
             return result
+        except ProtectedPathWarning as warning:
+            return self._warn_protected_proposal(proposal, fingerprint, warning.offenders, applied_paths, metadata)
         except Exception as exc:
             failure_class = classify_failure(exc)
             proposals = self._read_proposals()
@@ -1512,53 +1812,3 @@ class SelfImprovementTool:
             if self.manager.last_quarantined:
                 failure["quarantined_files"] = list(self.manager.last_quarantined)
             return failure
-
-
-class PromoteSelfImprovementTool:
-    name = "promote_self_improvement"
-    capability_kind = "write"
-
-    def __init__(self, manager: SelfImprovementManager, health_check: Callable[[], dict[str, object]]) -> None:
-        self.manager = manager
-        self.health_check = health_check
-
-    @property
-    def schema(self) -> dict[str, object]:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": "Promote one previously validated self-improvement proposal. Use only after reviewing its tests and expected behavior; the harness performs the health gate and writes the reboot request.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"proposal_id": {"type": "string"}},
-                    "required": ["proposal_id"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-
-    def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
-        del idempotency_key
-        proposal_id = arguments.get("proposal_id")
-        if not isinstance(proposal_id, str) or not proposal_id:
-            return {"ok": False, "error": "proposal_id is required"}
-        try:
-            health = self.health_check()
-            if not health.get("ok"):
-                return {"ok": False, "error": "health gate failed", "health": health}
-            commit = self.manager.promote_pending(proposal_id, health)
-            return {
-                "ok": True,
-                "proposal_id": proposal_id,
-                "commit": commit,
-                "reboot_requested": True,
-                "control_action": {
-                    "type": "restart_after_checkpoint",
-                    "proposal_id": proposal_id,
-                    "commit": commit,
-                    "reason": "self-improvement promoted; persist memory and checkpoint before restart",
-                },
-            }
-        except (OSError, SelfImprovementError, CheckpointError) as exc:
-            return {"ok": False, "error": str(exc)[:1000]}
