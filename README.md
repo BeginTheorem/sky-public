@@ -63,9 +63,10 @@ Telegram bot, GitHub MCP) in `config/skynet.env`.
 ```bash
 ./scripts/test.sh          # ruff + pyright + pytest
 ```
-## Known bags:
+## Known bugs
 
-In the current public version, the task scheduler is faulty. I have already fixed it; the fix will be published in the next version (in the coming days).
+The task scheduler was faulty in the initial public release. That fix is
+included in this version.
 
 ## License
 
