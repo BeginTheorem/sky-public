@@ -10,12 +10,12 @@ set -u
 UNIT="${1:-unknown}"
 REASON="${2:-unit failed}"
 TOKEN="${SKYNET_TELEGRAM_BOT_TOKEN:-}"
-CHAT_ID="${SKYNET_TELEGRAM_CHAT_ID:-}"
+CHAT_ID="${SKYNET_TELEGRAM_ALLOWED_CHAT_ID:-${SKYNET_TELEGRAM_CHAT_ID:-}}"
 PROXY="${SKYNET_TELEGRAM_PROXY:-}"
 TIMEOUT="${SKYNET_ALERT_TIMEOUT:-10}"
 
 if [[ -z "$TOKEN" || -z "$CHAT_ID" ]]; then
-    echo "alert skipped: SKYNET_TELEGRAM_BOT_TOKEN or SKYNET_TELEGRAM_CHAT_ID is not set" >&2
+    echo "alert skipped: SKYNET_TELEGRAM_BOT_TOKEN or SKYNET_TELEGRAM_ALLOWED_CHAT_ID is not set" >&2
     exit 0
 fi
 
