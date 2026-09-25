@@ -1,16 +1,15 @@
 # SkyNet
 
-**WARNING:** this is a very raw alpha version. If it does not run for you, that is
-expected — the current version is not meant to work out of the box. The author is
-not a professional programmer. This repository is a cleaned-up public copy that
-lags behind the local version in functionality. Bug fixes and feature suggestions
-are welcome, but acceptance is not guaranteed.
+**WARNING**. This is a very raw alpha version. If it does not run for you, that is
+expected — the current version is not meant to work out of the box. This repository 
+is a cleaned-up public copy that lags behind the local version in functionality. 
+Bug fixes and feature suggestions are welcome, but acceptance is not guaranteed.
 
 **About the project.** When OpenAI announced the solution to a millennium problem,
 it seemed to me that the time of AGI had arrived. In my understanding, that means,
 above all, the ability to make decisions independently. Testing that ability is
 precisely the goal of this experiment. More precisely, I tried to build a digital
-analogue of intelligent life as I understand it.
+analogue of intelligent life as I understand it. 
 
 ## Design in one screen
 
