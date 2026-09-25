@@ -20,9 +20,56 @@ MEMORY_LOOP_INSTRUCTION = (
     "Return JSON only with memory_candidates, next_plan, initial_prompt, goal_updates, task_updates, and evaluation. "
     "When new evidence contradicts an existing memory, emit a candidate with supersedes_memory_id set to the contradicted "
     "memory's id and put the contradicting evidence in evidence; never supersede on a guess. "
+    "A synthesis that generalizes several memories into a higher-level claim must name the memories it is derived from, one "
+    "per line in evidence as '<memory_id>: <what it supports>', and be emitted only when those rows are actually in the "
+    "memory_context or pinned_memories given to you; a claim that cites no memory and no episode event is a guess, so keep "
+    "it out of memory_candidates. "
     "Goal/task updates must reference existing IDs and include evidence in outcome when completing work. "
     "Do not include reasoning. Do not resurrect completed, blocked, exhausted, or reset planning context."
 )
+
+# Marks text cut to fit a budget rather than omitted entirely, so a reader can
+# tell a shortened item apart from one that was never sent, and can see how much
+# was dropped without a second field to account for.
+def _truncation_mark(omitted: int) -> str:
+    return f" ...[truncated by the memory-loop budget: {omitted} chars omitted]"
+
+
+def _truncated_item(item: dict[str, Any], limit_chars: int, kind: str) -> dict[str, Any]:
+    """Return ``item`` reduced to fit ``limit_chars``, keeping valid JSON.
+
+    A single item larger than the whole budget must not be admitted whole: the
+    callers' running-total guard compares only *subsequent* items against the
+    limit, so one oversized row used to set the prompt size and the configured
+    budget bounded nothing -- measured on the live ledger (generation 184,
+    read-only copy), 27 of the 29 degraded Memory-Loop episodes sent a single
+    transcript row over 48,000 chars (max 460,118) and the built request
+    measured 2.9x its configured input budget. The longest text-bearing field is
+    prefix-truncated and marked; every other field is kept, because kind,
+    position and timestamp are what make the row interpretable.
+    """
+    encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) <= limit_chars:
+        return item
+    for field_name in ("content", "payload", "report", "text"):
+        value = item.get(field_name)
+        if not isinstance(value, str) or not value:
+            continue
+        mark = _truncation_mark(len(value))
+        overhead = len(encoded) - len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        keep = limit_chars - overhead - len(mark)
+        while keep > 0:
+            trimmed = dict(item)
+            trimmed[field_name] = value[:keep] + mark
+            result = json.dumps(trimmed, ensure_ascii=False, separators=(",", ":"))
+            if len(result) <= limit_chars:
+                return trimmed
+            # Escaping can expand the kept prefix, so shave the excess.
+            keep -= len(result) - limit_chars
+    # No text field to shorten (or the wrapper alone exceeds the budget): the
+    # only honest reduction left is to send the item's shape, not its content.
+    return {"kind": f"{kind}_item_truncated", "omitted_chars": len(encoded)}
+
 
 
 @dataclass(slots=True)
@@ -171,6 +218,14 @@ class MemoryLoop:
         size = 0
         for event in reversed(episode):
             encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            if not selected and len(encoded) > limit_chars:
+                # Same admission rule as _bounded_context: the newest item is
+                # the one this function exists to keep, so an item too large for
+                # the whole budget is shortened rather than let through whole.
+                trimmed = _truncated_item(event, max(1, limit_chars // 2), "episode")
+                selected.append(trimmed)
+                size += len(json.dumps(trimmed, ensure_ascii=False, separators=(",", ":")))
+                continue
             if selected and size + len(encoded) > limit_chars:
                 break
             selected.append(event)
@@ -186,6 +241,24 @@ class MemoryLoop:
         size = 0
         for item in reversed(items):
             encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            if not selected and len(encoded) > limit_chars:
+                # The guard below reads `selected and ...`, so the FIRST item --
+                # always the newest, the one this function exists to keep -- was
+                # admitted whole however large it was: one oversized transcript
+                # row set the prompt size and the budget it was meant to enforce
+                # bounded nothing. Measured on the live ledger (generation 184,
+                # read-only copy): in 27 of the 29 episodes whose Memory Loop
+                # degraded, a single transcript row exceeds 48,000 chars (max
+                # 460,118); `_bounded_context` returned 2 items totalling
+                # 558,781 chars against a 48,000-char limit (11.6x), the built
+                # request measured 2.9x the 50,000-token `memory_input_tokens`
+                # budget, and all 29 had to be recovered or were lost. An item
+                # that cannot fit is now shortened and marked instead of
+                # admitted whole; older items fill only what is left.
+                trimmed = _truncated_item(item, max(1, limit_chars // 2), kind)
+                selected.append(trimmed)
+                size += len(json.dumps(trimmed, ensure_ascii=False, separators=(",", ":")))
+                continue
             if selected and size + len(encoded) > limit_chars:
                 break
             selected.append(item)
@@ -202,7 +275,7 @@ class MemoryLoop:
             raise ValueError("memory loop returned an empty response")
         data = parse_json_object(text)
         # A single undeclared key used to fail the whole consolidation
-        # (`initial_prompt_note` beside `initial_prompt`, 2026-09-22). Drop the
+        # (`initial_prompt_note` beside `initial_prompt`). Drop the
         # extras and validate each section on its own so one malformed section
         # cannot discard the candidates and plan that were perfectly good.
         dropped = drop_unknown_fields(data, MEMORY_RESPONSE_SCHEMA)

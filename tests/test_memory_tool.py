@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,87 @@ class MemoryToolTests(unittest.TestCase):
             found = tool.execute({"action": "search", "query": "reactor lifecycle"}, idempotency_key="s1")
             self.assertTrue(found["ok"], found)
             self.assertIn("the reactor owns lifecycle", [item["content"] for item in found["memories"]])
+            store.close()
+
+    def test_remember_echoes_the_effective_state_it_actually_wrote(self) -> None:
+        """The self-report must name the row that was written, not the request.
+
+        `remember` is a policy-permissive write: it accepts any kind, any
+        confidence and any length, then silently rewrites all three -- the kind
+        through `normalize_memory_kind`, the confidence through `_clamp_float`,
+        the body through `content[:MAX_CONTENT_CHARS]`. Measured on live state
+        before this fix: 10 of 97 transcript calls had their requested kind
+        rewritten (reading/opinion/finding -> observation, decision -> outcome)
+        and one 5130-char body was stored at 3999 with `ok: true` and no
+        warning, so the caller could not detect the loss.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            if not _has(store, "remember_memory"):
+                self.skipTest("store.remember_memory not present yet")
+            tool = MemoryTool(store)
+            # (1) An out-of-vocabulary kind is rewritten; the echo must match the row.
+            aliased = tool.execute(
+                {"action": "remember", "content": "a reading note", "kind": "reading"},
+                idempotency_key="r1",
+            )
+            self.assertTrue(aliased["ok"], aliased)
+            stored_kind = store.connection.execute(
+                "SELECT kind FROM memories WHERE memory_id=?", (aliased["memory_id"],)
+            ).fetchone()["kind"]
+            self.assertEqual(aliased["kind"], stored_kind)
+            self.assertNotEqual(aliased["kind"], "reading")
+            self.assertIn("notes", aliased)
+            # (2) An over-length body is silently capped; the loss must be reported.
+            body = "m" * (MemoryTool.MAX_CONTENT_CHARS + 130)
+            capped = tool.execute(
+                {"action": "remember", "content": body, "kind": "measurement"},
+                idempotency_key="r2",
+            )
+            self.assertTrue(capped["ok"], capped)
+            self.assertTrue(capped.get("truncated"))
+            self.assertEqual(capped["content_chars"], MemoryTool.MAX_CONTENT_CHARS)
+            stored_length = store.connection.execute(
+                "SELECT length(content) FROM memories WHERE memory_id=?", (capped["memory_id"],)
+            ).fetchone()[0]
+            self.assertEqual(stored_length, MemoryTool.MAX_CONTENT_CHARS)
+            self.assertEqual(capped["content_chars"], stored_length)
+            # (2b) The cap boundary lands on whitespace: the store strips before
+            # binding, so the echo must name the persisted length, not the slice.
+            boundary_body = "m" * (MemoryTool.MAX_CONTENT_CHARS - 1) + " " + "x" * 130
+            boundary = tool.execute(
+                {"action": "remember", "content": boundary_body, "kind": "measurement"},
+                idempotency_key="r2b",
+            )
+            self.assertTrue(boundary["ok"], boundary)
+            self.assertTrue(boundary.get("truncated"))
+            boundary_stored = store.connection.execute(
+                "SELECT length(content) FROM memories WHERE memory_id=?", (boundary["memory_id"],)
+            ).fetchone()[0]
+            self.assertEqual(boundary_stored, MemoryTool.MAX_CONTENT_CHARS - 1)
+            self.assertEqual(boundary["content_chars"], boundary_stored)
+            # (3) An out-of-range confidence is clamped; the echo names the stored value.
+            clamped = tool.execute(
+                {"action": "remember", "content": "over-range confidence", "kind": "fact", "confidence": 5},
+                idempotency_key="r3",
+            )
+            self.assertTrue(clamped["ok"], clamped)
+            stored_confidence = store.connection.execute(
+                "SELECT confidence FROM memories WHERE memory_id=?", (clamped["memory_id"],)
+            ).fetchone()[0]
+            self.assertEqual(clamped["confidence"], stored_confidence)
+            self.assertEqual(stored_confidence, 1.0)
+            # (4) A clean call still succeeds and carries no substitution note.
+            clean = tool.execute(
+                {"action": "remember", "content": "clean fact", "kind": "fact", "confidence": 0.9},
+                idempotency_key="r4",
+            )
+            self.assertTrue(clean["ok"], clean)
+            self.assertTrue(clean["memory_id"])
+            self.assertEqual(clean["kind"], "fact")
+            self.assertEqual(clean["confidence"], 0.9)
+            self.assertNotIn("notes", clean)
+            self.assertNotIn("truncated", clean)
             store.close()
 
     def test_remember_attributes_the_run_from_the_effect_key(self) -> None:
@@ -215,6 +297,56 @@ class MemoryToolTests(unittest.TestCase):
             self.assertNotEqual(new_id, old_id)
             found = tool.execute({"action": "search", "query": "service port 8080"}, idempotency_key="c2")
             self.assertIn("the service listens on port 8080", [item["content"] for item in found["memories"]])
+            store.close()
+
+    def test_correct_keeps_run_attribution_on_the_successor(self) -> None:
+        """A correction must not launder away the run that owns the fact.
+
+        Measured on the live database: of 33 supersede pairs whose
+        predecessor carried a source_run, 8 successors were written with
+        source_run=NULL, because MemoryTool._correct never received the effect
+        key and StateStore.correct_memory had no source_run parameter.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            if not _has(store, "correct_memory"):
+                self.skipTest("store.correct_memory not present yet")
+            tool = MemoryTool(store)
+            run_id = "99999999-8888-7777-6666-555555555555"
+            original = tool.execute(
+                {"action": "remember", "content": "attributed original claim", "kind": "fact"},
+                idempotency_key=f"{run_id}:3:abc",
+            )
+            self.assertTrue(original["ok"], original)
+            corrected = tool.execute(
+                {
+                    "action": "correct",
+                    "memory_id": original["memory_id"],
+                    "content": "attributed corrected claim",
+                    "evidence": "episode-42",
+                },
+                idempotency_key=f"{run_id}:4:def",
+            )
+            self.assertTrue(corrected["ok"], corrected)
+            row = store.connection.execute(
+                "SELECT source_run FROM memories WHERE memory_id=?", (corrected["memory_id"],)
+            ).fetchone()
+            self.assertEqual(row["source_run"], run_id)
+            store.close()
+
+    def test_correct_inherits_attribution_when_the_store_is_called_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            if not _has(store, "correct_memory"):
+                self.skipTest("store.correct_memory not present yet")
+            if "source_run" not in inspect.signature(store.correct_memory).parameters:
+                self.skipTest("store.correct_memory does not accept source_run yet")
+            old_id = store.remember_memory("directly written claim", kind="fact", source_run="run-inherited")
+            new_id = store.correct_memory(old_id, content="directly written correction", evidence="e")
+            row = store.connection.execute(
+                "SELECT source_run FROM memories WHERE memory_id=?", (new_id,)
+            ).fetchone()
+            self.assertEqual(row["source_run"], "run-inherited")
             store.close()
 
     def test_invalid_arguments_return_ok_false_without_raising(self) -> None:

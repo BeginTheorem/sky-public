@@ -175,6 +175,44 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(report["evidence"][0], "short", "in-range strings are untouched")
         self.assertEqual(report["evidence"][1], "y" * 900, "evidence items have no declared maxLength")
 
+    def test_clamp_lengths_cuts_at_a_sentence_boundary_and_marks_it(self) -> None:
+        from skynet.model_contracts import FINISH_REPORT_SCHEMA, clamp_lengths
+        # Live shape: 15 of 90 persisted summaries sit exactly at the 1200 cap
+        # and none of the 15 ends at a sentence boundary.
+        sentence = "The measurement holds for every snapshot in the ledger. "
+        report = {
+            "status": "COMPLETED",
+            "summary": sentence * 60,
+            "evidence": [],
+            "actions": [],
+            "changes": [],
+            "tests": [],
+            "blocker": "",
+            "next_hypothesis": "",
+        }
+        clamped = clamp_lengths(report, FINISH_REPORT_SCHEMA)
+        summary = report["summary"]
+        self.assertIn("response.summary", clamped)
+        self.assertLessEqual(len(summary), 1200)
+        self.assertTrue(summary.endswith("…"), "a shortened string must be visibly shortened")
+        self.assertTrue(
+            summary[:-1].rstrip().endswith("."),
+            "the cut must land on a sentence terminator, not mid-clause",
+        )
+
+    def test_clamp_lengths_keeps_the_hard_cut_when_no_boundary_exists(self) -> None:
+        from skynet.model_contracts import trim_to_limit
+        token = "z" * 5000
+        self.assertEqual(len(trim_to_limit(token, 1200)), 1200)
+        self.assertEqual(trim_to_limit("short", 1200), "short")
+        # A boundary before the keep-ratio floor is not used: the whole point is
+        # to keep most of the text, not to honour the earliest punctuation mark.
+        early = "Early sentence. " + "tail " * 400
+        trimmed = trim_to_limit(early, 1200)
+        self.assertLessEqual(len(trimmed), 1200)
+        self.assertTrue(trimmed.endswith("…"))
+        self.assertGreater(len(trimmed), 600)
+
     def test_system_grants_owner_freedom_and_lists_real_tools(self) -> None:
         from skynet.model_contracts import ANTI_LOOP_PROTOCOL, SYSTEM, SYSTEM_MEMORY, SYSTEM_REACT
         # The old denial is gone; the owner channel is a choice, not a command.

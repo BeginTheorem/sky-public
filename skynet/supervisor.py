@@ -12,8 +12,9 @@ from typing import cast
 
 from .checkpoints import CheckpointError, CheckpointManager
 from .lock import ProcessLock
+from .memory_audit import checkpoint_memory_audit, memory_audit_continuity_report, verify_chain
 from .models import LifecycleState
-from .proposal_registry import sweep_environment_blocks
+from .proposal_registry import audit_promotion_registry, sweep_environment_blocks
 from .provider import LLMProvider, Tool
 from .reactor import HEALTHY_LIFECYCLES, SAFETY_NET_FINGERPRINTS, Reactor, ReactorConfig
 from .recovery import RebootGuard
@@ -213,6 +214,50 @@ class Supervisor:
                     self.reactor.store.append_event("improvement_environment_blocks_resolved", {"resolved": closed})
             except Exception:
                 log.exception("environment-block sweep failed; continuing")
+            # A record can read 'accepted' while its promoted commit is no
+            # longer an ancestor of HEAD: reconcile only revisits awaiting_reboot
+            # and promoting rows, and an external rollback resets HEAD past
+            # every later promotion. Nothing rewrites the record here -- the
+            # detector only names the contradiction so the loss is observable.
+            try:
+                orphans = audit_promotion_registry(self.self_improvement.proposals_path, self.root)
+                if orphans:
+                    log.warning("promotions that are neither live nor rolled back: %s", orphans)
+                    self.reactor.store.append_event("promotion_liveness_violations", {"violations": orphans})
+            except Exception:
+                log.exception("promotion-liveness audit failed; continuing")
+            # The owner keeps his own continuity with a permanent read-only log
+            # of memory-change metadata and offered to hold the same obligation
+            # for this one. The store is compared against the last checkpoint:
+            # a mismatch is reported as a fact -- that it changed, when, and by
+            # how many rows and bytes -- together with the two provenance counts
+            # that separate an in-band write from an outside one. No content is
+            # read back out of the log and nothing is repaired here.
+            try:
+                state_dir = Path(self.config.state_path).parent
+                continuity = memory_audit_continuity_report(self.reactor.store.connection, state_dir)
+                if continuity.get("status") == "changed_externally":
+                    log.warning("memory store changed outside the audit checkpoints: %s", continuity)
+                    self.reactor.store.append_event("memory_audit_external_change", continuity)
+                elif continuity.get("status") == "no_baseline":
+                    checkpoint_memory_audit(self.reactor.store.connection, state_dir, reason="startup_baseline")
+                # The continuity report above compares the store against the
+                # checkpoint, and both live in files the checkpoint writer
+                # rewrites -- so a writer who re-issues both consistently
+                # reports "unchanged" over an outside memory change and erases
+                # the only trace of it (measured: one forged line
+                # plus a matching checkpoint turned changed_externally into
+                # unchanged, while verify_chain already named the break at line
+                # 1). verify_chain was reachable only from the test suite, so
+                # that detection reached nothing the organism could see. It runs
+                # here on every start and reports; it never repairs, and never
+                # reads content back out of the log.
+                chain = verify_chain(state_dir)
+                if not chain.get("ok", True):
+                    log.warning("memory audit chain does not verify: %s", chain)
+                    self.reactor.store.append_event("memory_audit_chain_broken", chain)
+            except Exception:
+                log.exception("memory-audit continuity check failed; continuing")
             try:
                 orphans = self.self_improvement.prune_orphan_worktrees()
                 if orphans:

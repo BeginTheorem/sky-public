@@ -29,6 +29,9 @@ class FallbackProvider:
     event_logger: Callable[[str, dict[str, object]], None] | None = None
     state_path: Path | None = None
     ladder_deadline_seconds: float = 600.0
+    # How long a call may wait out a chain-wide cooldown before admitting the
+    # chain is down. 0.0 keeps the historical behaviour (raise immediately).
+    max_wait_for_cooldown_seconds: float = 0.0
     # Optional supplier of the currently active provider names. Re-read at every
     # call so enabling or disabling the paid provider takes effect without a
     # process restart; provider instances (and their cooldowns) are preserved.
@@ -41,6 +44,22 @@ class FallbackProvider:
             raise ValueError("FallbackProvider requires at least one provider")
         if self.max_attempts <= 0:
             self.max_attempts = len(self.providers)
+        # An explicit ladder IS the organism's provider-retry mechanism:
+        # ReActConfig.provider_retries stays 0 because retries live here, and a
+        # provider struck once inside a call stays eligible for the remaining
+        # rungs even after that failure opens its cooldown. A one-rung ladder
+        # therefore disables retries entirely instead of shortening them, so a
+        # single transient fault that a second strike would have absorbed ends
+        # the episode. Measured on the live database: 7 needs_recovery runs
+        # fail with "all providers failed after 1 attempts:
+        # openrouter[invalid_response]" while the deployed
+        # SKYNET_PROVIDER_TIMEOUT_LADDER=900 supplies exactly one rung, and 6 of
+        # those 7 wrote no memories at all. Reusing the last configured timeout
+        # as a second rung keeps the operator's timeout budget while restoring
+        # the one retry the ladder exists for. An empty ladder is untouched: it
+        # keeps the documented legacy one-strike-per-provider behaviour.
+        if len(self.timeout_ladder) == 1:
+            self.timeout_ladder = (self.timeout_ladder[0], self.timeout_ladder[0])
         self._blocked_until = {}
         self._load_state()
 
@@ -139,6 +158,22 @@ class FallbackProvider:
                 remaining[name] = round(value, 1)
         return remaining
 
+    def _clear_cooldown(self, name: str) -> None:
+        """Forget a cooldown the provider has just disproved by answering.
+
+        A retryable failure opens a cooldown so the next cycle backs off, but a
+        later *successful* strike from the same provider proves it is healthy
+        now. Leaving that stale cooldown in place aborted the very next step of
+        the same run on the live switch: a 500 on one step put
+        nemotron in a 30s cooldown, the same step's retry then succeeded, and the
+        following step was skipped as still cooling down -- three such aborts
+        escalated to provider_lockout while the provider was actively answering.
+        """
+        blocked = self._blocked_until or {}
+        if name in blocked:
+            blocked.pop(name, None)
+            self._save_state()
+
     def _active_providers(self) -> list[LLMProvider]:
         """The subset of the constructed chain the supplier currently lists.
 
@@ -183,13 +218,10 @@ class FallbackProvider:
         # ladder deadline wait are infrastructure, not model thinking, so they
         # are excluded from the budget the reactor charges.
         model_seconds = 0.0
-        for strike, rung in enumerate(strikes):
-            if first_strike_at is not None and self.ladder_deadline_seconds > 0:
-                elapsed = time.monotonic() - first_strike_at
-                if elapsed > self.ladder_deadline_seconds:
-                    self._log("fallback_ladder_deadline", {"elapsed_seconds": round(elapsed, 1), "deadline_seconds": self.ladder_deadline_seconds, "attempts": strikes_done})
-                    break
-            provider = None
+
+        def _select() -> LLMProvider | None:
+            """Pick the next eligible provider, advancing the round-robin."""
+            nonlocal position
             for _ in range(len(providers)):
                 candidate = providers[position % len(providers)]
                 position += 1
@@ -197,14 +229,30 @@ class FallbackProvider:
                 # A provider already struck in this call stays eligible for the
                 # remaining rungs; a cooldown only gates the next cycle.
                 if name in struck_this_call:
-                    provider = candidate
-                    break
+                    return candidate
                 blocked_until = (self._blocked_until or {}).get(name, 0.0)
                 if blocked_until > time.time():
                     self._log("fallback_skipped", {"provider": name, "reason": "cooldown", "remaining_seconds": round(blocked_until - time.time(), 1)})
                     continue
-                provider = candidate
-                break
+                return candidate
+            return None
+
+        waited_for_cooldown = False
+        for strike, rung in enumerate(strikes):
+            if first_strike_at is not None and self.ladder_deadline_seconds > 0:
+                elapsed = time.monotonic() - first_strike_at
+                if elapsed > self.ladder_deadline_seconds:
+                    self._log("fallback_ladder_deadline", {"elapsed_seconds": round(elapsed, 1), "deadline_seconds": self.ladder_deadline_seconds, "attempts": strikes_done})
+                    break
+            provider = _select()
+            if provider is None and not waited_for_cooldown:
+                # Nothing was even tried before the abort. If the chain itself
+                # said when it can answer and that instant is near, one bounded
+                # wait preserves the episode that would otherwise be discarded
+                # with zero strikes. See _wait_out_short_cooldown.
+                waited_for_cooldown = True
+                self._wait_out_short_cooldown(strikes_done)
+                provider = _select()
             if provider is None:
                 # Every candidate is inside its cooldown. Breaking here used to
                 # raise "all providers failed after 0 strikes: " with an empty
@@ -242,6 +290,18 @@ class FallbackProvider:
                 # The planner's provider call passes through here and nowhere
                 # else, so its stop reason has to be recorded on this line: a
                 # reply cut off at the output ceiling leaves no other trace.
+                truncated = result.finish_reason == "length"
+                # ``max_tokens`` travels here as the *requested* ceiling, which
+                # is not necessarily the one that was enforced: a provider may
+                # refuse more than its own limit, or spend the budget on its
+                # reasoning channel. Recording the requested value beside the
+                # stop reason is what makes a cut-off reply diagnosable.
+                # Measured: three consecutive planner generations
+                # ended at exactly ``completion_tokens`` 2240 with
+                # ``finish_reason='length'`` and ``text_chars`` 0 while the
+                # planner had asked for 16384, and no record said how far apart
+                # those two numbers were, so the operator instruction to raise
+                # the knob could neither be confirmed nor refuted.
                 self._log(
                     "fallback_selected",
                     {
@@ -249,8 +309,49 @@ class FallbackProvider:
                         "attempt": strike + 1,
                         "completion_tokens": result.completion_tokens,
                         "finish_reason": result.finish_reason,
+                        "requested_max_tokens": max_tokens,
+                        "reasoning_chars": len(result.reasoning_content),
                     },
                 )
+                if truncated:
+                    # A distinct event rather than another payload field: the
+                    # planner already gets ``planner_output_truncated``, but a
+                    # cut-off *episode* turn left no record a reader could find
+                    # without scanning every ``provider_response``. This event
+                    # carries the three numbers that decide whether the ceiling
+                    # or the request is at fault.
+                    self._log(
+                        "provider_output_truncated",
+                        {
+                            "provider": name,
+                            "attempt": strike + 1,
+                            "completion_tokens": result.completion_tokens,
+                            "requested_max_tokens": max_tokens,
+                            "reasoning_chars": len(result.reasoning_content),
+                            "text_chars": len(result.text),
+                        },
+                    )
+                if strike:
+                    # A retry that answers is the one outcome no other durable
+                    # event records: ``fallback_failure`` is durable but says
+                    # nothing about the recovery, and the successful selection
+                    # below is indistinguishable from a first-strike answer.
+                    # The retry-amplification paper names exactly this quantity
+                    # -- success rate after retry -- as instrumentation without
+                    # which a retry storm cannot be reconstructed after the
+                    # fact (arXiv:2608.25403, sec. 8.1). Measured on the live
+                    # database it is rare: 14 recovering calls against 2623
+                    # first-strike selections, so it cannot flood the log.
+                    self._log(
+                        "fallback_retry_recovered",
+                        {
+                            "provider": name,
+                            "attempt": strike + 1,
+                            "attempts": len(strikes),
+                            "prior_failures": list(failures),
+                        },
+                    )
+                self._clear_cooldown(name)
                 return result
             except ProviderError as exc:
                 failures.append(f"{name}[{exc.category}]: {exc}")
@@ -267,7 +368,7 @@ class FallbackProvider:
                 if exc.category == "invalid_response":
                     # A malformed response is produced by ONE provider, so it is
                     # provider-local, not chain-fatal: measured live, a single
-                    # "malformed streamed tool call" aborted an episode
+                    # openrouter "malformed streamed tool call" aborted an episode
                     # whose other providers were never struck. Cool this
                     # provider and keep the ladder going; if every provider
                     # answers malformed, the loop still ends in the aggregate
@@ -292,6 +393,45 @@ class FallbackProvider:
         # The earliest remaining cooldown is when the chain can answer again;
         # the latest would over-sleep every provider that recovered sooner.
         raise ProviderError(message, category="unavailable", retryable=True, cooldown_seconds=min(blocked_remaining.values(), default=0.0))
+
+    def _wait_out_short_cooldown(self, strikes_done: int) -> float:
+        """Back off until the chain's own declared recovery point, if it is near.
+
+        Every provider sitting inside its cooldown is not a failure of any one
+        of them: it is a statement about WHEN the chain can answer, and this
+        class already computes that instant (``blocked_until``). Raising
+        immediately spends the whole episode on that statement and discards the
+        work already inside it. Measured on the live database: 5 of the 21
+        needs_recovery runs died with ZERO strikes attempted purely because the
+        earliest recorded cooldown had 12.2-30.0s left, two of them after 22 and
+        41 verified steps.
+
+        The wait is deliberately narrow. It fires only when this call has not
+        struck a single provider yet (the measured defect), only while the
+        earliest horizon is no longer than ``max_wait_for_cooldown_seconds``
+        -- the same magnitude as MIN_PROVIDER_COOLDOWN_SECONDS, i.e. the
+        smallest backoff this class already considers meaningful -- and only
+        once per call. A longer horizon stays a decision for the caller: the
+        reactor owns cross-run scheduling, with its own jittered backoff.
+        """
+        if self.max_wait_for_cooldown_seconds <= 0 or strikes_done:
+            return 0.0
+        blocked = self._blocked_remaining()
+        if not blocked:
+            return 0.0
+        horizon = min(blocked.values())
+        if horizon > self.max_wait_for_cooldown_seconds:
+            self._log(
+                "fallback_cooldown_wait_skipped",
+                {"remaining_seconds": horizon, "bound_seconds": self.max_wait_for_cooldown_seconds},
+            )
+            return 0.0
+        self._log(
+            "fallback_cooldown_wait",
+            {"remaining_seconds": horizon, "bound_seconds": self.max_wait_for_cooldown_seconds},
+        )
+        time.sleep(horizon)
+        return horizon
 
     def _strike(self, provider: LLMProvider, messages: Sequence[Message], *, max_tokens: int, tools: Sequence[ToolSchema], timeout_seconds: float | None) -> ModelTurn:
         if timeout_seconds is not None and getattr(provider, "accepts_timeout_override", False):

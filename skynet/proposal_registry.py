@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +86,89 @@ def _fingerprint(record: dict[str, Any]) -> str:
 # (``self_improvement.py:1331``); it cannot be imported because that module
 # imports this one.
 TERMINAL_SIBLING_STATUSES = frozenset({"rejected", "validated", "awaiting_reboot", "accepted"})
+
+# Statuses whose record claims the promoted commit is the code now running.
+# Only these are checked for liveness; a rejected or environment-blocked record
+# never claimed a commit, so a missing one is not a violation for it.
+LIVE_CLAIMING_STATUSES = frozenset({"accepted", "awaiting_reboot", "promoting"})
+
+
+def audit_promotion_liveness(
+    proposals: dict[str, Any],
+    in_history: Callable[[str], bool | None],
+) -> list[dict[str, Any]]:
+    """Report promotions that claim to be live while their commit is not.
+
+    ``reconcile_awaiting_reboot`` only ever visits ``awaiting_reboot`` and
+    ``promoting`` records, so once a record reads ``accepted`` nothing revisits
+    it. An external rollback (``request_rollback``, or the startup script) resets
+    HEAD backwards past every later promotion, and the records whose commits
+    then left HEAD keep claiming ``accepted`` with no recorded rollback reason:
+    a promotion that is neither live nor explicitly rolled back.
+
+    Pure and read-only on purpose. A naive repair -- mark every non-ancestor
+    record rolled back -- has a false-positive path of its own when unrelated
+    history is dropped, so this function only names the contradiction and leaves
+    the decision to a caller that can judge it. ``in_history`` returns ``None``
+    when ancestry cannot be decided (unreadable registry entry, absent commit,
+    failed git call); an undecidable row is never reported as a violation.
+    """
+    violations: list[dict[str, Any]] = []
+    for proposal_id, record in proposals.items():
+        if not isinstance(record, dict):
+            continue
+        status = str(record.get("status", ""))
+        if status not in LIVE_CLAIMING_STATUSES:
+            continue
+        commit = str(record.get("promoted_commit") or record.get("commit") or "")
+        if not commit:
+            # Nothing was ever claimed, so there is no contradiction to report.
+            continue
+        ancestor = in_history(commit)
+        if ancestor is False:
+            violations.append(
+                {
+                    "proposal_id": proposal_id,
+                    "status": status,
+                    "commit": commit,
+                    "reason": "record claims the promotion is live but the commit is not an ancestor of HEAD",
+                }
+            )
+    return violations
+
+
+def audit_promotion_registry(proposals_path: Path | str, root: Path | str) -> list[dict[str, Any]]:
+    """Read the registry and report promotions that are neither live nor rolled back.
+
+    Best-effort: an unreadable registry or a missing git worktree yields no
+    violations rather than an exception, because this runs in startup
+    housekeeping beside the reconcile sweep and must never block a start.
+    """
+    path = Path(proposals_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    def in_history(commit: str) -> bool | None:
+        try:
+            check = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+                cwd=str(root), capture_output=True, text=True, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if check.returncode == 0:
+            return True
+        if check.returncode == 1:
+            return False
+        # 128 and friends mean git could not answer at all (unknown commit,
+        # no repository); that is undecidable, not a violation.
+        return None
+
+    return audit_promotion_liveness(data, in_history)
 
 
 def _spent_fingerprints(proposals: dict[str, Any], ceiling: int) -> set[str]:

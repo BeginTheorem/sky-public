@@ -613,7 +613,7 @@ class CoreTests(unittest.TestCase):
 
         formatter = UTCLogFormatter("%(message)s", "%Y-%m-%dT%H:%M:%S", "Asia/Tokyo")
         record = logging_module.LogRecord("t", logging_module.INFO, "p", 1, "m", (), None)
-        record.created = 0  # 1970-01-01T00:00:00Z is 09:00 in Tokyo.
+        record.created = 0  # the Unix epoch is 09:00 in Tokyo.
         self.assertEqual(formatter.formatTime(record, "%Y-%m-%dT%H:%M:%S"), "1970-01-01T09:00:00")
 
     def _stub_reporting(self, renderer):

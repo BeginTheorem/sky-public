@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,9 +18,9 @@ from skynet.providers import build_provider
 from skynet.providers.errors import ProviderError
 from skynet.providers.fallback import FallbackProvider
 from skynet.providers.key_rotator import KeyRotator, KeySlot
-from skynet.providers.openrouter import OpenRouterRouterProvider
 from skynet.providers.ollama import OllamaCloudProvider
 from skynet.providers.openai_compatible import OpenAICompatibleProvider
+from skynet.providers.openrouter import OpenRouterProvider
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -188,6 +189,46 @@ class ProviderTests(unittest.TestCase):
             fallback.complete([], max_tokens=1)
         self.assertEqual(provider.calls, 1)
 
+    def test_chain_wide_cooldown_is_waited_out_when_the_horizon_is_short(self) -> None:
+        """The live shape: every provider cooling, earliest horizon ~0.5s.
+
+        Measured on state/skynet.sqlite3: 5 of the 21 needs_recovery runs died
+        with ZERO strikes purely because the whole chain was inside a cooldown
+        whose earliest recorded recovery was 12.2-30.0s away -- two of them
+        after 22 and 41 verified steps. A horizon the chain itself declared is
+        not a reason to discard an episode that has not tried anything yet.
+        """
+        class Healthy:
+            name = "healthy"
+            def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
+                return ModelTurn(text="ok")
+
+        fallback = FallbackProvider([Healthy()], max_wait_for_cooldown_seconds=5.0)
+        fallback._blocked_until = {"healthy": time.time() + 0.5}
+        started = time.monotonic()
+        with self.assertLogs("skynet.providers.fallback", level="INFO") as captured:
+            result = fallback.complete([], max_tokens=1)
+        self.assertEqual(result.text, "ok")
+        self.assertGreaterEqual(time.monotonic() - started, 0.4)
+        self.assertTrue(any("fallback_cooldown_wait" in line for line in captured.output))
+
+    def test_a_long_chain_wide_cooldown_is_not_waited_out(self) -> None:
+        # The bound exists so a chain that is down for minutes is not waited on
+        # inside one call: that decision belongs to the reactor's cross-run
+        # backoff, which has its own escalation and jitter.
+        class Down:
+            name = "down"
+            def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
+                raise ProviderError("down", category="network", retryable=True, cooldown_seconds=300)
+
+        fallback = FallbackProvider([Down()], max_wait_for_cooldown_seconds=5.0)
+        with self.assertRaisesRegex(Exception, "all providers failed"):
+            fallback.complete([], max_tokens=1)
+        started = time.monotonic()
+        with self.assertRaisesRegex(Exception, "all providers failed"):
+            fallback.complete([], max_tokens=1)
+        self.assertLess(time.monotonic() - started, 1.0)
+
     def test_fallback_health_excludes_provider_in_cooldown(self) -> None:
         class Healthy:
             name = "healthy"
@@ -301,7 +342,7 @@ class ProviderTests(unittest.TestCase):
                     b'data: {"usage":{"total_tokens":7}}\n\n',
                     b'data: [DONE]\n\n',
                 ])
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.text, "hello world")
         self.assertEqual(result.usage_tokens, 7)
@@ -315,7 +356,7 @@ class ProviderTests(unittest.TestCase):
                 time.sleep(0.02)
                 yield b'data: [DONE]\n\n'
 
-        provider = OpenRouterRouterProvider(
+        provider = OpenRouterProvider(
             base_url=self.base_url,
             api_key="openrouter-secret",
             model="openai/gpt-5.6-luna",
@@ -336,7 +377,7 @@ class ProviderTests(unittest.TestCase):
                     b'data: [DONE]\n\n',
                 ])
 
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.text, "")
         self.assertEqual(result.usage_tokens, 3)
@@ -353,7 +394,7 @@ class ProviderTests(unittest.TestCase):
                     b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":5}}\n\n',
                 ])
 
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.text, "answered")
         self.assertEqual(result.finish_reason, "stop")
@@ -364,10 +405,30 @@ class ProviderTests(unittest.TestCase):
             def __iter__(self):
                 return iter([b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'])
 
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
         with self.assertRaisesRegex(ProviderError, "before \\[DONE\\]") as raised:
             provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(raised.exception.category, "network")
+        self.assertTrue(raised.exception.retryable)
+
+    def test_openrouter_length_stop_with_empty_text_is_retryable(self) -> None:
+        """A ceiling stop with no visible content must strike, not "succeed".
+
+        Measured: the planner asked for 16384 tokens, openrouter stopped at
+        2240 with an empty text and ``finish_reason='length'``, and the ladder
+        returned it as a success -- so no retry or fallback ever ran.
+        """
+        class Response:
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"reasoning":"thinking hard"}}]}\n\n',
+                    b'data: {"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"total_tokens":2240}}\n\n',
+                ])
+
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        with self.assertRaises(ProviderError) as raised:
+            provider._parse_sse(Response(), idle_seconds=60.0)
+        self.assertEqual(raised.exception.category, "response_quality")
         self.assertTrue(raised.exception.retryable)
 
     def test_openrouter_reads_the_reasoning_alias_and_does_not_double_count(self) -> None:
@@ -381,7 +442,7 @@ class ProviderTests(unittest.TestCase):
                     b'data: [DONE]\n\n',
                 ])
 
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="openai/gpt-5.6-luna")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.reasoning_content, "thinkingboth")
 
@@ -400,6 +461,49 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(selected["finish_reason"], "length")
         self.assertEqual(selected["completion_tokens"], 7)
 
+    def test_fallback_selected_records_requested_ceiling_beside_stop_reason(self) -> None:
+        """A cut-off reply must be diagnosable from the log line alone.
+
+        Measured: three consecutive planner generations stopped at
+        completion_tokens 2240 with finish_reason='length' while the planner
+        requested 16384, and the recorded line could not say how far apart the
+        two numbers were -- so the operator instruction to raise the knob could
+        neither be confirmed nor refuted. The requested ceiling, the reasoning
+        volume and a dedicated truncation event close that gap.
+        """
+        class CutOff:
+            name = "openrouter"
+
+            def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
+                return ModelTurn(text="", reasoning_content="thinking hard", completion_tokens=2240, finish_reason="length")
+
+        captured: list[tuple[str, dict[str, object]]] = []
+        provider = FallbackProvider([CutOff()])
+        provider.set_event_logger(lambda event, payload: captured.append((event, payload)))
+        provider.complete([], max_tokens=16384)
+        selected = next(payload for event, payload in captured if event == "fallback_selected")
+        self.assertEqual(selected["requested_max_tokens"], 16384)
+        self.assertEqual(selected["completion_tokens"], 2240)
+        self.assertEqual(selected["reasoning_chars"], len("thinking hard"))
+        truncated = next(payload for event, payload in captured if event == "provider_output_truncated")
+        self.assertEqual(truncated["requested_max_tokens"], 16384)
+        self.assertEqual(truncated["completion_tokens"], 2240)
+        self.assertEqual(truncated["text_chars"], 0)
+
+    def test_no_truncation_event_when_a_turn_stops_normally(self) -> None:
+        """``stop`` and ``tool_calls`` are normal ends; only ``length`` is a cut-off."""
+        class Normal:
+            name = "openrouter"
+
+            def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
+                return ModelTurn(text="done", completion_tokens=12, finish_reason="stop")
+
+        captured: list[tuple[str, dict[str, object]]] = []
+        provider = FallbackProvider([Normal()])
+        provider.set_event_logger(lambda event, payload: captured.append((event, payload)))
+        provider.complete([], max_tokens=16384)
+        self.assertFalse(any(event == "provider_output_truncated" for event, _ in captured))
+
     def test_openai_parse_propagates_finish_reason(self) -> None:
         from skynet.providers.openai_compatible import _as_finish_reason
 
@@ -412,6 +516,102 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(turn.finish_reason, "stop")
         absent = provider._parse({"choices": [{"message": {"content": "hi"}}]})
         self.assertIsNone(absent.finish_reason)
+
+    def test_length_stop_with_empty_text_is_a_retryable_provider_error(self) -> None:
+        """The output-ceiling guard: no visible content means no usable answer.
+
+        Returning an empty ``length`` turn as success is what let the
+        ceiling freeze the planner for seven hours.
+        """
+        from skynet.providers.errors import ProviderError
+
+        provider = OpenAICompatibleProvider(name="nemotron", base_url=self.base_url, api_key="key", model="m")
+        with self.assertRaises(ProviderError) as raised:
+            provider._parse(
+                {"choices": [{"message": {"content": "", "reasoning_content": "thinking"}, "finish_reason": "length"}]}
+            )
+        self.assertEqual(raised.exception.category, "response_quality")
+        self.assertTrue(raised.exception.retryable)
+
+    def test_length_stop_with_visible_text_stays_a_valid_answer(self) -> None:
+        provider = OpenAICompatibleProvider(name="nemotron", base_url=self.base_url, api_key="key", model="m")
+        turn = provider._parse({"choices": [{"message": {"content": "a long but real answer"}, "finish_reason": "length"}]})
+        self.assertEqual(turn.text, "a long but real answer")
+        self.assertEqual(turn.finish_reason, "length")
+
+    def test_proxy_403_rotates_the_tor_circuit_and_retries_once(self) -> None:
+        """A dirty Tor exit answers 403; the provider must rotate and retry once."""
+        provider = OpenAICompatibleProvider(
+            name="nemotron", base_url=self.base_url, api_key="key", model="m", proxy_url="socks5://127.0.0.1:9050"
+        )
+        _Handler.statuses = [403, 200]
+        with (
+            patch.object(OpenAICompatibleProvider, "_proxy_scope", return_value=nullcontext()),
+            patch("skynet.providers.openai_compatible.tor_control.newnym", return_value=True) as rotate,
+        ):
+            turn = provider.complete([{"role": "user", "content": "hello"}], max_tokens=10)
+        self.assertEqual(turn.text, "ok")
+        rotate.assert_called_once()
+        self.assertEqual(_Handler.statuses, [], "the 403 and the retry must both have been sent")
+
+    def test_proxy_403_without_rotation_stays_a_fatal_auth_error(self) -> None:
+        provider = OpenAICompatibleProvider(
+            name="nemotron", base_url=self.base_url, api_key="key", model="m", proxy_url="socks5://127.0.0.1:9050"
+        )
+        _Handler.statuses = [403]
+        with (
+            patch.object(OpenAICompatibleProvider, "_proxy_scope", return_value=nullcontext()),
+            patch("skynet.providers.openai_compatible.tor_control.newnym", return_value=False),self.assertRaises(ProviderError) as raised
+        ):
+            provider.complete([{"role": "user", "content": "hello"}], max_tokens=10)
+        self.assertEqual(raised.exception.category, "auth")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(_Handler.statuses, [], "a failed rotation must not spend a second request")
+
+    def test_proxy_403_again_after_rotation_is_fatal(self) -> None:
+        """The retry is a single rotation, not a loop: a second 403 stays fatal."""
+        provider = OpenAICompatibleProvider(
+            name="nemotron", base_url=self.base_url, api_key="key", model="m", proxy_url="socks5://127.0.0.1:9050"
+        )
+        _Handler.statuses = [403, 403]
+        with (
+            patch.object(OpenAICompatibleProvider, "_proxy_scope", return_value=nullcontext()),
+            patch("skynet.providers.openai_compatible.tor_control.newnym", return_value=True),self.assertRaises(ProviderError) as raised
+        ):
+            provider.complete([{"role": "user", "content": "hello"}], max_tokens=10)
+        self.assertEqual(raised.exception.category, "auth")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(_Handler.statuses, [])
+
+    def test_a_successful_strike_clears_the_provider_cooldown(self) -> None:
+        """A provider that just answered must not stay cooling down.
+
+        Measured on the live switch: a 500 on one step put nemotron in
+        a 30s cooldown, the same step's retry then succeeded, and the following
+        step was skipped as still cooling down -- aborting the run and, after
+        three such aborts, escalating to provider_lockout while the provider was
+        actively answering.
+        """
+        class Flaky:
+            name = "flaky"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, *_args: object, **_kwargs: object) -> ModelTurn:
+                self.calls += 1
+                if self.calls == 1:
+                    raise ProviderError("boom", category="server", retryable=True, cooldown_seconds=30.0)
+                return ModelTurn(text="ok", finish_reason="stop")
+
+        captured: list[tuple[str, dict[str, object]]] = []
+        provider = FallbackProvider([Flaky()], max_attempts=2, timeout_ladder=(900.0, 900.0), strike_delay_seconds=0.0)
+        provider.set_event_logger(lambda event, payload: captured.append((event, payload)))
+        self.assertEqual(provider.complete([], max_tokens=1).text, "ok")
+        self.assertEqual(provider._blocked_remaining(), {}, "a success must clear the cooldown it disproved")
+        # The next step of the same run must reach the provider, not skip it.
+        self.assertEqual(provider.complete([], max_tokens=1).text, "ok")
+        self.assertFalse(any(event == "fallback_skipped" for event, _ in captured))
 
     def test_fallback_ladder_escalates_timeouts_and_pauses_between_strikes(self) -> None:
         from skynet.providers.errors import ProviderError
@@ -519,7 +719,7 @@ class ProviderTests(unittest.TestCase):
                 time.sleep(0.05)
                 yield b'data: [DONE]\n\n'
 
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m", timeout_seconds=0.01)
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m", timeout_seconds=0.01)
         with patch("skynet.providers.openrouter.request.urlopen", return_value=Response()):
             result = provider.complete([], max_tokens=1)
         self.assertEqual(result.text, "ab")
@@ -537,7 +737,7 @@ class ProviderTests(unittest.TestCase):
                 time.sleep(0.05)
                 yield b'data: [DONE]\n\n'
 
-        provider = OpenRouterRouterProvider(
+        provider = OpenRouterProvider(
             base_url=self.base_url,
             api_key="openrouter-secret",
             model="m",
@@ -553,7 +753,7 @@ class ProviderTests(unittest.TestCase):
         Treating it as a total deadline cut off long, actively-streaming
         reasoning responses and produced the openrouter strike storm.
         """
-        provider = OpenRouterRouterProvider(
+        provider = OpenRouterProvider(
             base_url=self.base_url,
             api_key="openrouter-secret",
             model="m",
@@ -720,9 +920,53 @@ class ProviderTests(unittest.TestCase):
             with patch.dict(os.environ, environment, clear=True), patch("skynet.providers.money_boost_state_path", return_value=state):
                 provider = cast(Any, build_provider())
         self.assertEqual([item.name for item in provider.providers], ["openrouter", "ollama"])
-        openrouter = cast(OpenRouterRouterProvider, provider.providers[0])
+        openrouter = cast(OpenRouterProvider, provider.providers[0])
         self.assertEqual(openrouter.timeout_seconds, 30.0)
         self.assertEqual(openrouter.max_attempts, 3)
+
+    def test_factory_builds_openrouter_deepseek_then_glm_backup_rung(self) -> None:
+        """OpenRouter carries two models as two rungs: DeepSeek first, GLM as backup.
+
+        The rungs must be separately named, or a DeepSeek cooldown would bench
+        the GLM backup too (FallbackProvider keys cooldowns by provider name).
+        """
+        environment = {
+            "SKYNET_PROVIDER_CHAIN": "openrouter,openrouter_glm",
+            "OPENROUTER_ENABLED": "true",
+            "OPENROUTER_API_KEY": "openrouter-secret",
+            "OPENROUTER_MODEL": "deepseek/deepseek-v4.1-flash",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "money-boost.json"
+            state.write_text('{"enabled": true}', encoding="utf-8")
+            with patch.dict(os.environ, environment, clear=True), patch("skynet.providers.money_boost_state_path", return_value=state):
+                provider = cast(Any, build_provider())
+                from skynet.providers import active_chain_names
+
+                self.assertEqual(active_chain_names(), ["openrouter", "openrouter_glm"])
+        self.assertEqual([item.name for item in provider.providers], ["openrouter", "openrouter_glm"])
+        primary = cast(OpenRouterProvider, provider.providers[0])
+        backup = cast(OpenRouterProvider, provider.providers[1])
+        self.assertEqual(primary.name, "openrouter")
+        self.assertEqual(primary.model, "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(backup.name, "openrouter_glm")
+        self.assertEqual(backup.model, "z-ai/glm-5.3-flash")
+
+    def test_backup_rung_leaves_the_active_view_without_money_boost(self) -> None:
+        environment = {
+            "SKYNET_PROVIDER_CHAIN": "openrouter,openrouter_glm",
+            "OPENROUTER_ENABLED": "true",
+            "OPENROUTER_API_KEY": "openrouter-secret",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "money-boost.json"
+            state.write_text('{"enabled": false}', encoding="utf-8")
+            with patch.dict(os.environ, environment, clear=True), patch("skynet.providers.money_boost_state_path", return_value=state):
+                provider = cast(Any, build_provider())
+                from skynet.providers import active_chain_names
+
+                self.assertEqual(active_chain_names(), [])
+                self.assertEqual([item.name for item in provider.providers], ["openrouter", "openrouter_glm"])
 
     def test_factory_builds_requested_provider_order(self) -> None:
         environment = {
@@ -981,7 +1225,7 @@ class ProviderTests(unittest.TestCase):
             def __iter__(self):
                 yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
 
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
         with self.assertRaises(ProviderError) as raised:
             provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(raised.exception.category, "network")
@@ -1008,7 +1252,7 @@ class ProviderTests(unittest.TestCase):
                     yield ("data: " + json.dumps(chunk) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
 
-        provider = OpenRouterRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
+        provider = OpenRouterProvider(base_url=self.base_url, api_key="openrouter-secret", model="m")
         result = provider._parse_sse(Response(), idle_seconds=60.0)
         self.assertEqual(result.tool_calls[0].tool_name, "bash")
         self.assertEqual(result.tool_calls[0].call_id, "call_1")

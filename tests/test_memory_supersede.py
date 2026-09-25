@@ -45,6 +45,26 @@ class MemorySupersedeTests(unittest.TestCase):
         self.assertIn("supersedes_memory_id", MEMORY_LOOP_INSTRUCTION)
         self.assertIn("never supersede on a guess", MEMORY_LOOP_INSTRUCTION)
 
+    def test_instruction_requires_derived_claims_to_cite_their_source_memories(self) -> None:
+        # arXiv:2304.03442 sec. 4.2 (reflection): a higher-level memory is stored
+        # together with the records it was inferred from, and sec. 6.5.3 shows the
+        # generalization is what makes the agent useful on questions the raw
+        # observations cannot answer. The live store contradicts that: 12 of 388
+        # active rows name another memory, and only 3 of the 107 rows written in
+        # synthesis language do. The instruction must ask for the derivation.
+        self.assertIn("must name the memories it is derived from", MEMORY_LOOP_INSTRUCTION)
+        self.assertIn("cites no memory and no episode event is a guess", MEMORY_LOOP_INSTRUCTION)
+
+    def test_schema_accepts_a_derived_candidate_that_cites_source_memories(self) -> None:
+        derived = {
+            "kind": "hypothesis",
+            "content": "the deferred-restart backlog is a cadence defect, not a scheduling one",
+            "confidence": 0.6,
+            "evidence": ["abc123: 5 promotions never went live", "def456: restart window closes after 3 cycles"],
+        }
+        validate_shape(_memory_response(derived), MEMORY_RESPONSE_SCHEMA)
+        self.assertEqual(MemoryLoop._parse(ModelTurn(text=json.dumps(_memory_response(derived)))).memory_candidates, [derived])
+
     def test_parse_preserves_supersede_candidate_verbatim(self) -> None:
         candidate = {
             "kind": "fact",

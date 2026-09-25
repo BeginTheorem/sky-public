@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+from .memory_store import normalize_memory_kind
 from .provider import Tool
 from .store import StateStore
 
@@ -90,7 +91,7 @@ class MemoryTool(Tool):
         if action in {"pin", "unpin"}:
             return self._set_pinned(action, arguments)
         if action == "correct":
-            return self._correct(arguments)
+            return self._correct(arguments, idempotency_key=idempotency_key)
         return {"ok": False, "error": f"unknown action: {action or '<missing>'}"}
 
     def _search(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -124,7 +125,16 @@ class MemoryTool(Tool):
         missing = self._missing("remember_memory")
         if missing is not None:
             return missing
-        kind = str(arguments.get("kind", "observation")).strip() or "observation"
+        requested_kind = str(arguments.get("kind", "observation")).strip() or "observation"
+        # The store normalizes the kind and this tool clamps the confidence and
+        # the length. Each of those is a silent substitution at the write
+        # boundary, so the effective values are computed here once and echoed
+        # back: the tool's self-report must describe the row that was written.
+        # Measured on live state before this change: 10 of 97 `remember` calls
+        # had their requested kind silently rewritten (reading/opinion/finding
+        # -> observation, decision -> outcome) and one 5130-char body was
+        # stored at 3999 with `ok: true` and no warning.
+        effective_kind = normalize_memory_kind(requested_kind)
         confidence = self._clamp_float(
             arguments.get("confidence", self.DEFAULT_CONFIDENCE),
             default=self.DEFAULT_CONFIDENCE,
@@ -137,13 +147,36 @@ class MemoryTool(Tool):
             # Mid-integration: the store cannot attribute the run yet, so the
             # memory is written unattributed rather than failing the call.
             run_id = None
+        # The store binds `content.strip()` (StateStore.remember_memory), so a
+        # bound that ends in whitespace is persisted one character shorter than
+        # the slice. Measure the string that will actually be written, not the
+        # request: measured live, an echo of 4000 accompanied a row of 3999
+        # (memory b55141d782b9b311b9f07de1de21dc39) exactly when the character at
+        # MAX_CONTENT_CHARS-1 was whitespace, while a mid-word cut matched.
+        bounded_content = content[: self.MAX_CONTENT_CHARS].strip()
         try:
             memory_id = self.store.remember_memory(
-                content[: self.MAX_CONTENT_CHARS], kind=kind, confidence=confidence, pinned=pinned, source_run=run_id
+                bounded_content, kind=effective_kind, confidence=confidence, pinned=pinned, source_run=run_id
             )
         except Exception as exc:
             return {"ok": False, "error": f"remember_memory failed: {exc}"}
-        return {"ok": True, "memory_id": memory_id}
+        result: dict[str, Any] = {
+            "ok": True,
+            "memory_id": memory_id,
+            "kind": effective_kind,
+            "confidence": confidence,
+            "pinned": pinned,
+        }
+        notes: list[str] = []
+        if effective_kind != requested_kind:
+            notes.append(f"kind {requested_kind!r} was stored as {effective_kind!r}")
+        if len(bounded_content) < len(content):
+            result["truncated"] = True
+            result["content_chars"] = len(bounded_content)
+            notes.append(f"content was stored at {len(bounded_content)} of {len(content)} characters")
+        if notes:
+            result["notes"] = notes
+        return result
 
     def _forget(self, arguments: dict[str, Any]) -> dict[str, Any]:
         memory_id = str(arguments.get("memory_id", "")).strip()
@@ -171,7 +204,7 @@ class MemoryTool(Tool):
             return {"ok": False, "error": f"set_memory_pinned failed: {exc}"}
         return {"ok": True, "updated": updated}
 
-    def _correct(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _correct(self, arguments: dict[str, Any], *, idempotency_key: str = "") -> dict[str, Any]:
         memory_id = str(arguments.get("memory_id", "")).strip()
         content = str(arguments.get("content", "")).strip()
         evidence = str(arguments.get("evidence", "")).strip()
@@ -184,9 +217,19 @@ class MemoryTool(Tool):
         missing = self._missing("correct_memory")
         if missing is not None:
             return missing
+        # A correction is a write too: without the effect key the corrected row
+        # is born with source_run=NULL even though its predecessor carried a run
+        # (measured: 8 of 33 live supersede pairs lost attribution,
+        # e.g. 163e0943df48e96a6278fb4fcaf48c76 -> 98548ee7409fdf3ef61bdf7a466fb16a).
+        run_id, _step = _run_context_from_effect_key(self.store, idempotency_key)
+        if not self._supports_source_run():
+            run_id = None
         try:
             new_id = self.store.correct_memory(
-                memory_id, content=content[: self.MAX_CONTENT_CHARS], evidence=evidence[: self.MAX_EVIDENCE_CHARS]
+                memory_id,
+                content=content[: self.MAX_CONTENT_CHARS],
+                evidence=evidence[: self.MAX_EVIDENCE_CHARS],
+                source_run=run_id,
             )
         except Exception as exc:
             return {"ok": False, "error": f"correct_memory failed: {exc}"}

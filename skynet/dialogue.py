@@ -83,7 +83,6 @@ class AskUserTool(Tool):
         }
 
     def execute(self, arguments: dict[str, Any], *, idempotency_key: str) -> dict[str, Any]:
-        del idempotency_key
         question = str(arguments.get("question", "")).strip()
         if not question:
             return {"ok": False, "error": "question must not be empty"}
@@ -99,7 +98,13 @@ class AskUserTool(Tool):
             ttl = float(arguments.get("ttl_seconds", self.default_ttl_seconds))
         except (TypeError, ValueError):
             ttl = self.default_ttl_seconds
-        question_id = self.store.ask_question(question, options=options, ttl_seconds=ttl)
+        # The call identity travels with the question so a crash between the
+        # outbox write and the effect commit cannot ask the owner twice
+        # (arXiv:2608.01710v1; reproduced on a fresh store: 2 rows unpatched,
+        # 1 patched).
+        question_id = self.store.ask_question(
+            question, options=options, ttl_seconds=ttl, question_key=idempotency_key or None
+        )
         try:
             wait_seconds = max(0.0, min(float(arguments.get("wait_seconds", 0) or 0), self.MAX_WAIT_SECONDS))
         except (TypeError, ValueError):
@@ -316,6 +321,26 @@ class SendMessageToUserTool(Tool):
         severity = str(arguments.get("severity", "info"))
         if severity not in {"info", "warning", "critical"}:
             severity = "info"
-        self.store.add_outbox("agent_message", {"message": message[:4000], "severity": severity, "idempotency_key": idempotency_key})
+        # The outbox row is keyed by the call's effect key, not a fresh uuid.
+        # `add_outbox` used to be called without `message_id`, so every call
+        # minted a new `uuid4` and the row's identity was issuance-specific.
+        # `capability_effects.idempotency_key` is `{run_id}:{step}:{call_id}`,
+        # which `react.py` writes *after* the tool returns (react.py:429-433): a
+        # crash in that window leaves the message queued and no cached result,
+        # the resumed run re-issues the identical call, and a second row is
+        # enqueued and later delivered - two owner messages for one semantic
+        # action. Reproduced on a fresh store with this tool: 2 pending rows
+        # unpatched, 1 with the key. The live ledger today is the latent state
+        # (34 agent_message rows, 33 distinct payload idempotency_keys, 0
+        # duplicates): the payload already records the semantic key, only the
+        # row identity was issuance-specific. With the stable key the second
+        # INSERT is ignored and the call returns the first row, so one message
+        # per call identity (arXiv:2608.01710v1, semantic replay / durable
+        # token-independent state).
+        self.store.add_outbox(
+            "agent_message",
+            {"message": message[:4000], "severity": severity, "idempotency_key": idempotency_key},
+            message_id=idempotency_key or None,
+        )
         self.store.append_event("agent_message_queued", {"severity": severity, "message": message[:300]})
         return {"ok": True, "state": "queued"}

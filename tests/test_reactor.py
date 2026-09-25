@@ -788,6 +788,104 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.snapshot_episode("run-legacy")["transcript"], rebuilt)
             reactor.close()
 
+    def test_maintenance_pass_failure_is_recorded_durably(self) -> None:
+        # Each maintenance pass swallows its own exception so the cycle cannot
+        # die, and the only trace used to be a journald warning: measured on the
+        # live store, 0 durable rows named any retention failure. A forced
+        # failure must now leave exactly one durable row naming the pass.
+        passes = (
+            ("prune_event_log", "event_log_retention"),
+            ("prune_capability_effects", "capability_effects_retention"),
+            ("decay_memory_confidence", "memory_confidence_decay"),
+            ("compact_episode_snapshots", "episode_snapshot_compaction"),
+        )
+        for attribute, pass_name in passes:
+            with self.subTest(pass_name=pass_name), tempfile.TemporaryDirectory() as directory:
+                reactor = Reactor(
+                    FakeProvider(),
+                    {"fixture_tool": FixtureTool()},
+                    ReactorConfig(state_path=Path(directory) / "state.sqlite3", metrics_snapshot_enabled=False),
+                )
+                try:
+                    def boom(*_args: object, _name: str = pass_name, **_kwargs: object) -> None:
+                        raise KeyError(f"forced {_name}")
+
+                    setattr(reactor.store, attribute, boom)
+                    reactor._run_daily_maintenance()
+                    rows = reactor.store.connection.execute(
+                        "SELECT payload FROM event_log WHERE kind='maintenance_failed'"
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1, f"{pass_name} did not leave exactly one durable row")
+                    payload = json.loads(rows[0]["payload"])
+                    self.assertEqual(payload["pass"], pass_name)
+                    self.assertEqual(payload["error_class"], "KeyError")
+                finally:
+                    reactor.close()
+
+    def test_healthy_maintenance_pass_records_no_failure(self) -> None:
+        # The instrument must stay rare: an unpatched pass writes no row and its
+        # prune counts are the real ones, not a swallowed failure.
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3", metrics_snapshot_enabled=False),
+            )
+            try:
+                observed: list[tuple[str, int]] = []
+                real_events = reactor.store.prune_event_log
+                real_effects = reactor.store.prune_capability_effects
+
+                def counted_events(days: int) -> int:
+                    pruned = real_events(days)
+                    observed.append(("event_log", pruned))
+                    return pruned
+
+                def counted_effects(days: int) -> int:
+                    pruned = real_effects(days)
+                    observed.append(("capability_effects", pruned))
+                    return pruned
+
+                reactor.store.prune_event_log = counted_events  # type: ignore[method-assign]
+                reactor.store.prune_capability_effects = counted_effects  # type: ignore[method-assign]
+                reactor._run_daily_maintenance()
+                self.assertEqual(len(observed), 2, "both retention passes still run")
+                self.assertEqual(
+                    reactor.store.connection.execute(
+                        "SELECT COUNT(*) FROM event_log WHERE kind='maintenance_failed'"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                reactor.close()
+
+    def test_maintenance_failed_survives_event_retention(self) -> None:
+        # The row reports on the retention window, so retention pruning must not
+        # erase it: an unprotected kind at the same age is dropped instead.
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3", metrics_snapshot_enabled=False),
+            )
+            try:
+                reactor.store.append_event("maintenance_failed", {"pass": "event_log_retention", "error_class": "RuntimeError"})
+                reactor.store.append_event("run_started", {"run_id": "old"})
+                reactor.store.connection.execute(
+                    "UPDATE event_log SET created_at='2020-01-01T00:00:00Z' "
+                    "WHERE kind IN ('maintenance_failed','run_started')"
+                )
+                reactor.store.connection.commit()
+                reactor.store.prune_event_log(1)
+                surviving = [
+                    row[0] for row in reactor.store.connection.execute(
+                        "SELECT kind FROM event_log WHERE kind IN ('maintenance_failed','run_started')"
+                    ).fetchall()
+                ]
+                self.assertEqual(surviving, ["maintenance_failed"])
+            finally:
+                reactor.close()
+
     def test_memory_injection_respects_configured_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             class CaptureProvider(FakeProvider):
@@ -854,6 +952,195 @@ class CoreTests(unittest.TestCase):
             )
             self.assertTrue(finished["degraded"])
             reactor.close()
+
+    def test_degraded_memory_loop_leaves_a_pending_capture(self) -> None:
+        # A single transient provider fault used to end with the whole episode's
+        # memory work discarded (event_log 16199-16205 on run e7e36432). The run
+        # still completes; what must change is that the loss is recoverable.
+        class DegradedMemoryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls % 3 == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                if self.calls % 3 == 2:
+                    return ModelTurn(
+                        text=json.dumps({"status": "COMPLETED", "summary": "finished the bounded episode", "evidence": ["fixture tool result"], "actions": [], "changes": [], "tests": [], "blocker": "", "next_hypothesis": ""}),
+                        usage_tokens=1,
+                    )
+                return ModelTurn(text="not valid json", usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                DegradedMemoryProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            self.assertEqual(reactor.tick("degraded-capture-test"), RunStatus.COMPLETED)
+            started = reactor.store.connection.execute("SELECT run_id FROM event_log WHERE kind='run_started' LIMIT 1").fetchone()
+            pending = reactor.store.connection.execute(
+                "SELECT run_id, payload FROM event_log WHERE kind='memory_capture_pending'"
+            ).fetchall()
+            self.assertEqual(len(pending), 1, "one degraded episode leaves exactly one pending capture")
+            self.assertEqual(pending[0]["run_id"], started["run_id"])
+            payload = json.loads(pending[0]["payload"])
+            self.assertEqual(payload["run_id"], started["run_id"])
+            self.assertTrue(payload["error"], "the pending record names the error that lost the capture")
+            self.assertGreater(payload["transcript_rows"], 0, "the record points at the transcript that still exists")
+            self.assertGreater(payload["episode_events"], 0)
+            snapshot = reactor.store.connection.execute(
+                "SELECT snapshot_id FROM episode_snapshots WHERE run_id=?", (started["run_id"],)
+            ).fetchone()
+            self.assertEqual(payload["snapshot_id"], snapshot["snapshot_id"], "the record points at the frozen episode")
+            finished = json.loads(
+                reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='memory_loop_finished'").fetchone()["payload"]
+            )
+            self.assertTrue(finished["degraded"])
+            self.assertTrue(finished["pending_capture"])
+            self.assertEqual(finished["memory_candidates"], 0)
+            reactor.close()
+
+    def test_two_degraded_episodes_write_two_distinct_pending_captures(self) -> None:
+        class DegradedMemoryProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls % 3 == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                if self.calls % 3 == 2:
+                    return ModelTurn(
+                        text=json.dumps({"status": "COMPLETED", "summary": "finished the bounded episode", "evidence": ["fixture tool result"], "actions": [], "changes": [], "tests": [], "blocker": "", "next_hypothesis": ""}),
+                        usage_tokens=1,
+                    )
+                return ModelTurn(text="not valid json", usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                DegradedMemoryProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            reactor.tick("degraded-capture-one")
+            reactor.tick("degraded-capture-two")
+            rows = reactor.store.connection.execute(
+                "SELECT run_id FROM event_log WHERE kind='memory_capture_pending' ORDER BY sequence"
+            ).fetchall()
+            self.assertEqual(len(rows), 2, "each degraded episode gets its own record")
+            self.assertEqual(len({row["run_id"] for row in rows}), 2, "the records name distinct runs")
+            reactor.close()
+
+    def test_healthy_memory_loop_writes_no_pending_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            self.assertEqual(reactor.tick("healthy-capture-test"), RunStatus.COMPLETED)
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='memory_capture_pending'").fetchone()[0],
+                0,
+            )
+            finished = json.loads(
+                reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='memory_loop_finished'").fetchone()["payload"]
+            )
+            self.assertFalse(finished["degraded"])
+            self.assertFalse(finished["pending_capture"])
+            reactor.close()
+
+    def test_young_pointer_is_recaptured_and_exhausted_pointer_released(self) -> None:
+        # One fixture with both cases the bounded lifetime must separate: a
+        # pointer whose snapshot and transcript still exist (young) and one whose
+        # evidence never arrived (exhausted, the shape left after the window took
+        # it). The young pointer is re-attempted exactly once under its own
+        # recovery episode id -- the degraded pass already wrote a zero-candidate
+        # consolidation for the original snapshot, so reusing that id would be
+        # dropped as `replayed` -- and each pointer gets exactly one disposition.
+        from skynet.models import RunRecord
+        from skynet.time import utc_now
+
+        class RecaptureProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                return ModelTurn(
+                    text=json.dumps(
+                        {
+                            "memory_candidates": [
+                                {"kind": "fact", "content": "recovered from the lost episode", "confidence": 0.9}
+                            ],
+                            "next_plan": {},
+                            "initial_prompt": "",
+                            "goal_updates": [],
+                            "task_updates": [],
+                            "evaluation": {},
+                        }
+                    ),
+                    usage_tokens=1,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                RecaptureProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3", metrics_snapshot_enabled=False),
+            )
+            try:
+                store = reactor.store
+                # Exhausted: a pointer whose snapshot and transcript never existed.
+                store.create_run(RunRecord("expired-run", 1, RunStatus.COMPLETED, utc_now(), Budget()))
+                store.record_pending_memory_capture("expired-run", error="provider timeout", transcript_rows=0, events=0)
+                # Young: the frozen episode and the transcript are both present.
+                store.create_run(RunRecord("lost-run", 1, RunStatus.COMPLETED, utc_now(), Budget()))
+                store.append_event("tool_result", {"call_id": "c1", "tool_name": "fixture_tool", "result": {"ok": True}}, "lost-run")
+                store.append_transcript("react_history", {"messages": [{"role": "user", "content": "x"}]}, "lost-run")
+                store.snapshot_episode("lost-run")
+                store.record_pending_memory_capture("lost-run", error="provider timeout", transcript_rows=1, events=1)
+
+                reactor._reconcile_pending_captures()
+                released = {
+                    row["run_id"]: json.loads(row["payload"])
+                    for row in store.connection.execute("SELECT run_id, payload FROM event_log WHERE kind='memory_capture_released'")
+                }
+                self.assertEqual(set(released), {"expired-run"}, "the oldest pointer is the one reconciled")
+                self.assertEqual(released["expired-run"]["disposition"], "expired")
+                self.assertEqual(
+                    [row["run_id"] for row in store.pending_memory_captures()],
+                    ["lost-run"],
+                    "a disposed pointer is no longer pending",
+                )
+
+                reactor._reconcile_pending_captures()
+                released = {
+                    row["run_id"]: json.loads(row["payload"])
+                    for row in store.connection.execute("SELECT run_id, payload FROM event_log WHERE kind='memory_capture_released'")
+                }
+                self.assertEqual(set(released), {"expired-run", "lost-run"})
+                self.assertEqual(released["lost-run"]["disposition"], "recaptured")
+                self.assertEqual(released["lost-run"]["memories"], 1)
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM memories WHERE source_run='lost-run'").fetchone()[0],
+                    1,
+                    "the recovered memory is attributed to the episode that lost it",
+                )
+                self.assertEqual(store.pending_memory_captures(), [])
+
+                # One attempt per pointer, not a loop: nothing is left pending.
+                reactor._reconcile_pending_captures()
+                self.assertEqual(
+                    store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='memory_capture_released'")
+                    .fetchone()[0],
+                    2,
+                    "a third pass writes no further disposition",
+                )
+            finally:
+                reactor.close()
 
     def test_healthy_memory_loop_has_no_degraded_event(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -960,3 +1247,204 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(reactor._unverified_action_claims("run-2", "not json"), [])
             self.assertEqual(reactor._unverified_action_claims("run-2", json.dumps([1, 2])), [])
             reactor.close()
+
+
+class StallResilienceTests(unittest.TestCase):
+    """The stall: housekeeping reachable and progress escalated.
+
+    The seven silent hours had two structural causes: the per-cycle checks sat
+    behind the no-work early return, and nothing escalated a live process that
+    never completed a run. These tests pin the fix for both.
+    """
+
+    def _reactor(self, directory: str, **config: Any) -> Reactor:
+        return Reactor(Mock(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3", **config))
+
+    @staticmethod
+    def _old_run(reactor: Reactor, run_id: str, when: datetime, status: str = "completed") -> None:
+        stamp = when.isoformat().replace("+00:00", "Z")
+        reactor.store.connection.execute(
+            "INSERT INTO runs (run_id, attempt, status, started_at, finished_at, budget) VALUES (?, 1, ?, ?, ?, '{}')",
+            (run_id, status, stamp, stamp),
+        )
+        reactor.store.connection.commit()
+
+    @staticmethod
+    def _supervisor_start(reactor: Reactor, when: datetime) -> None:
+        stamp = when.isoformat().replace("+00:00", "Z")
+        reactor.store.connection.execute(
+            "INSERT INTO event_log (kind, payload, created_at) VALUES ('supervisor_start', '{}', ?)",
+            (stamp,),
+        )
+        reactor.store.connection.commit()
+
+    def test_progress_stall_alerts_when_no_run_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, stall_alert_seconds=3600.0)
+            try:
+                self._old_run(reactor, "run-old", datetime.now(UTC) - timedelta(hours=2))
+                state = reactor.store.state()
+                state.generation = 5
+                reactor._check_progress_stall(state)
+                rows = reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='alert_raised'").fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertIn("no_progress_stall", rows[0]["payload"])
+                # The durable dedup window is the rate limit: a second no-work
+                # cycle must not queue the same alert again.
+                reactor._check_progress_stall(state)
+                self.assertEqual(
+                    reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='alert_raised'").fetchone()[0],
+                    1,
+                )
+            finally:
+                reactor.store.close()
+
+    def test_progress_stall_is_silent_while_runs_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, stall_alert_seconds=3600.0)
+            try:
+                self._old_run(reactor, "run-new", datetime.now(UTC))
+                reactor._check_progress_stall(reactor.store.state())
+                self.assertEqual(
+                    reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='alert_raised'").fetchone()[0],
+                    0,
+                )
+            finally:
+                reactor.store.close()
+
+    def test_progress_stall_ignores_a_stale_run_when_the_process_just_started(self) -> None:
+        """A normal restart must not inherit the previous process's history.
+
+        The reboot guard is stale after a normal restart (it is only written for
+        an organism-initiated reboot), so the process start has to come from
+        ``supervisor_start``; otherwise every restart after an hour of downtime
+        alerts on its first cycle.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, stall_alert_seconds=3600.0)
+            try:
+                self._old_run(reactor, "run-old", datetime.now(UTC) - timedelta(hours=5))
+                self._supervisor_start(reactor, datetime.now(UTC))
+                reactor._check_progress_stall(reactor.store.state())
+                self.assertEqual(
+                    reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='alert_raised'").fetchone()[0],
+                    0,
+                )
+            finally:
+                reactor.store.close()
+
+    def test_progress_stall_fires_when_runs_never_complete(self) -> None:
+        """Only a completed run is progress: a run that keeps failing is a stall."""
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, stall_alert_seconds=3600.0)
+            try:
+                started = datetime.now(UTC) - timedelta(hours=2)
+                self._supervisor_start(reactor, started)
+                self._old_run(reactor, "run-failed", started, status="interrupted")
+                reactor._check_progress_stall(reactor.store.state())
+                rows = reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='alert_raised'").fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertIn("no_progress_stall", rows[0]["payload"])
+            finally:
+                reactor.store.close()
+
+    def test_progress_stall_is_disabled_by_a_non_positive_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, stall_alert_seconds=0.0)
+            try:
+                self._old_run(reactor, "run-old", datetime.now(UTC) - timedelta(days=1))
+                reactor._check_progress_stall(reactor.store.state())
+                self.assertEqual(
+                    reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='alert_raised'").fetchone()[0],
+                    0,
+                )
+            finally:
+                reactor.store.close()
+
+    def test_no_work_cycle_runs_housekeeping_and_the_stall_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory)
+            try:
+                reactor.store.add_goal("an active goal", priority=1.0)
+                with (
+                    patch.object(Reactor, "_plan_select", return_value=(Mock(), None)),
+                    patch.object(Reactor, "_run_autonomous_planning", return_value=([], "planner_empty")),
+                    patch.object(Reactor, "_create_planner_fallback", return_value=None),
+                    patch.object(Reactor, "_seek_external_evidence", return_value=None),
+                    patch.object(reactor, "_run_per_cycle_housekeeping") as housekeeping,
+                    patch.object(reactor, "_check_progress_stall") as stall,
+                    patch.object(reactor, "_sleep_without_work") as sleep,
+                ):
+                    reactor.tick("test")
+                housekeeping.assert_called_once()
+                stall.assert_called_once()
+                sleep.assert_called_once()
+            finally:
+                reactor.store.close()
+
+    def test_per_cycle_housekeeping_runs_all_three_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, metrics_snapshot_enabled=True)
+            try:
+                with (
+                    patch.object(reactor, "_record_daily_metrics") as daily,
+                    patch.object(reactor, "_maybe_run_daily_maintenance") as maintenance,
+                    patch.object(reactor, "_check_judge_health") as judge,
+                ):
+                    reactor._run_per_cycle_housekeeping()
+                daily.assert_called_once()
+                maintenance.assert_called_once()
+                judge.assert_called_once()
+            finally:
+                reactor.store.close()
+
+    def test_per_cycle_housekeeping_respects_the_metrics_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, metrics_snapshot_enabled=False)
+            try:
+                with (
+                    patch.object(reactor, "_record_daily_metrics") as daily,
+                    patch.object(reactor, "_maybe_run_daily_maintenance") as maintenance,
+                    patch.object(reactor, "_check_judge_health") as judge,
+                ):
+                    reactor._run_per_cycle_housekeeping()
+                daily.assert_not_called()
+                maintenance.assert_called_once()
+                judge.assert_called_once()
+            finally:
+                reactor.store.close()
+
+    def test_external_seek_opens_on_wall_clock_when_generation_is_frozen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(
+                directory,
+                external_seek_every_generations=4,
+                external_seek_cooldown_seconds=10.0,
+                external_seek_min_seconds=20.0,
+            )
+            try:
+                reactor.store.append_event("external_seek_created", {"task_id": "t", "generation": 1})
+                stale = (datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+                reactor.store.connection.execute("UPDATE event_log SET created_at=? WHERE kind='external_seek_created'", (stale,))
+                reactor.store.connection.commit()
+                state = reactor.store.state()
+                state.generation = 3  # 3 % 4 != 0: the generation gate alone says no
+                self.assertTrue(reactor._external_seek_due(state))
+            finally:
+                reactor.store.close()
+
+    def test_external_seek_cooldown_still_blocks_the_wall_clock_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(
+                directory,
+                external_seek_every_generations=4,
+                external_seek_cooldown_seconds=3600.0,
+                external_seek_min_seconds=1.0,
+            )
+            try:
+                reactor.store.append_event("external_seek_created", {"task_id": "t", "generation": 4})
+                state = reactor.store.state()
+                state.generation = 3
+                self.assertFalse(reactor._external_seek_due(state))
+            finally:
+                reactor.store.close()

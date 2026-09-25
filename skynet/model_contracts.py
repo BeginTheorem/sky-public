@@ -76,7 +76,7 @@ PLANNER_RESPONSE_SCHEMA: dict[str, Any] = {
 MEMORY_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "memory_candidates": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "description": "Canonical memory kind; prefer one of: " + ", ".join(MEMORY_KINDS) + ". Any other value is normalized to observation, not rejected."}, "content": {"type": "string"}, "confidence": {"type": "number", "description": "Confidence in the [0, 1] interval."}, "source": {"type": "string"}, "durable": {"type": "boolean"}, "supersedes_memory_id": {"type": "string", "description": "Optional id of an existing memory this candidate corrects; the store marks it superseded and links the new memory."}, "evidence": {"type": "array", "items": {"type": "string"}, "description": "Optional contradicting evidence for a supersede; required in spirit when supersedes_memory_id is set."}}, "required": ["kind", "content"], "additionalProperties": False}},
+        "memory_candidates": {"type": "array", "items": {"type": "object", "properties": {"kind": {"type": "string", "description": "Canonical memory kind; prefer one of: " + ", ".join(MEMORY_KINDS) + ". Any other value is normalized to observation, not rejected."}, "content": {"type": "string"}, "confidence": {"type": "number", "description": "Confidence in the [0, 1] interval."}, "source": {"type": "string"}, "durable": {"type": "boolean"}, "supersedes_memory_id": {"type": "string", "description": "Optional id of an existing memory this candidate corrects; the store marks it superseded and links the new memory."}, "evidence": {"type": "array", "items": {"type": "string"}, "description": "Evidence for this candidate: the contradicting evidence when supersedes_memory_id is set, and otherwise one '<memory_id>: <what it supports>' line per existing memory a derived or generalized claim rests on. Required in spirit for any claim that is not a direct episode observation."}}, "required": ["kind", "content"], "additionalProperties": False}},
         "next_plan": {"type": "object", "additionalProperties": True},
         "initial_prompt": {"type": "string"},
         "goal_updates": {"type": "array", "items": {"type": "object", "properties": {"goal_id": {"type": "string", "minLength": 1}, "status": {"type": "string"}, "outcome": {"type": "string"}, "evidence": {"type": "array", "items": {"type": "string"}}}, "required": ["goal_id"], "additionalProperties": False}},
@@ -168,7 +168,7 @@ def parse_json_value(text: str) -> Any:
     That second exception exists because the rejection cost a live provider
     call. ``event_log`` seq 6244 records ``planner_retry`` with reason
     "structured model response contains no acceptable JSON value" for attempt
-    ``face6cb8`` (2026-09-20T20:27:52Z): the model answered in prose around a
+    ``face6cb8``: the model answered in prose around a
     bare JSON value, the decoder refused it, and the planner spent a second
     call (20:26:52 -> 20:29:34) asking for the same value again. Only the
     lenient half is relaxed: ``parse_json_object`` keeps rejecting prose, so the
@@ -232,8 +232,8 @@ def _load_balanced_json_value(text: str, accept: Callable[[Any], bool]) -> Any:
     Candidates are opening brackets. ``json.JSONDecoder.raw_decode`` reads one
     complete value from a bracket, so a nested object or a top-level array is
     never truncated at the first closing brace the way a
-    ``text[text.find("{"):text.rfind("}") + 1]`` slice would be; the incident of
-    2026-09-20 was exactly that slice destroying a legitimate top-level array.
+    ``text[text.find("{"):text.rfind("}") + 1]`` slice would be; the incident
+    was exactly that slice destroying a legitimate top-level array.
 
     The candidate whose value reaches furthest into the reply wins, and among
     ties the longest one (the earliest bracket) does. That returns the
@@ -316,7 +316,7 @@ def clamp_lengths(value: Any, schema: dict[str, Any], *, path: str = "response")
             item = value[key]
             limit = _max_length(child_schema)
             if isinstance(item, str) and limit is not None and len(item) > limit:
-                value[key] = item[:limit]
+                value[key] = trim_to_limit(item, limit)
                 clamped.append(child_path)
                 continue
             clamped.extend(clamp_lengths(item, child_schema, path=child_path))
@@ -327,7 +327,7 @@ def clamp_lengths(value: Any, schema: dict[str, Any], *, path: str = "response")
             for index, item in enumerate(value):
                 child_path = f"{path}[{index}]"
                 if isinstance(item, str) and limit is not None and len(item) > limit:
-                    value[index] = item[:limit]
+                    value[index] = trim_to_limit(item, limit)
                     clamped.append(child_path)
                     continue
                 clamped.extend(clamp_lengths(item, item_schema, path=child_path))
@@ -410,6 +410,37 @@ def drop_unknown_fields(value: Any, schema: dict[str, Any], *, path: str = "resp
             for index, item in enumerate(value):
                 dropped.extend(drop_unknown_fields(item, item_schema, path=f"{path}[{index}]"))
     return dropped
+
+
+_SENTENCE_END = ".!?…"
+_TRUNCATION_MARK = " …"
+_MIN_KEEP_RATIO = 0.5
+
+
+def trim_to_limit(text: str, limit: int) -> str:
+    """Cut *text* to *limit* characters at the last readable boundary.
+
+    A hard slice ends mid-word (``... must be conditional on ``), which reads
+    as a complete thought and hides that anything was removed. Measured on the
+    live ledger: 15 of 90 persisted Finish summaries sit exactly at the 1200
+    character cap and none of the 15 ends at a sentence boundary. The trim
+    prefers the last sentence terminator, then the last whitespace, and appends
+    an explicit truncation mark so a shortened string is visibly shortened.
+    A string with neither boundary (a long token or ``x``*3000) still gets the
+    hard cut, so the declared limit is always honoured and the result is never
+    longer than the input.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    keep = max(1, int(limit * _MIN_KEEP_RATIO))
+    for index in range(len(cut) - 1, keep - 1, -1):
+        if cut[index] in _SENTENCE_END:
+            return cut[: index + 1] + _TRUNCATION_MARK
+    for index in range(len(cut) - 1, keep - 1, -1):
+        if cut[index].isspace():
+            return cut[:index].rstrip() + _TRUNCATION_MARK
+    return cut
 
 
 def _max_length(child_schema: dict[str, Any]) -> int | None:

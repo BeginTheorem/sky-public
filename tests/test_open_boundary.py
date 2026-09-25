@@ -62,6 +62,66 @@ class IdeaArchiveTests(unittest.TestCase):
             self.assertEqual(store.idea_cells()[cell], 1)
             store.close()
 
+    def test_novelty_can_take_a_cell_from_an_equal_quality_incumbent(self) -> None:
+        """Exclusive epsilon-dominance: a strictly more novel idea wins a tie.
+
+        arXiv:1708.09251 sec. 3.1.2: a rule that needs the newcomer to be better
+        on every objective "prevents most new individuals from being added".
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            cell = "memory|memory-structure|paper"
+            stale = store.archive_idea(_idea(cell, quality=1.0, novelty=0.5, title="stale incumbent"))
+            self.assertIsNotNone(stale)
+            fresher = store.archive_idea(_idea(cell, quality=1.0, novelty=0.9, title="more novel"))
+            self.assertIsNotNone(fresher)
+            self.assertEqual(cast(dict, store.best_in_cell(cell))["idea_id"], fresher)
+            self.assertEqual(store.idea_cells()[cell], 1)
+            superseded = store.connection.execute(
+                "SELECT status FROM idea_archive WHERE idea_id=?", (stale,)
+            ).fetchone()[0]
+            self.assertEqual(superseded, "superseded")
+            store.close()
+
+    def test_quality_loss_beyond_epsilon_is_still_refused(self) -> None:
+        """The relaxation is bounded: novelty must not buy a large quality drop."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            cell = "reactor|control-logic|own-repo"
+            self.assertIsNotNone(store.archive_idea(_idea(cell, quality=1.0, novelty=0.9, title="incumbent")))
+            refused = store.archive_idea(_idea(cell, quality=0.5, novelty=1.0, title="much worse quality"))
+            self.assertIsNone(refused)
+            self.assertEqual(store.idea_cells()[cell], 1)
+            rejection = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='idea_archive_rejected' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()[0]
+            self.assertIn("candidate_novelty", rejection)
+            self.assertIn("incumbent_novelty", rejection)
+            store.close()
+
+    def test_an_identical_idea_does_not_churn_the_cell(self) -> None:
+        """No trade-off exists on an exact tie, so the cell must not rotate."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            cell = "tools|workflow|own-repo"
+            first = store.archive_idea(_idea(cell, quality=0.9, novelty=0.9, title="original"))
+            self.assertIsNotNone(first)
+            self.assertIsNone(store.archive_idea(_idea(cell, quality=0.9, novelty=0.9, title="duplicate")))
+            self.assertEqual(cast(dict, store.best_in_cell(cell))["idea_id"], first)
+            store.close()
+
+    def test_a_degenerate_incumbent_never_locks_a_cell(self) -> None:
+        """An incumbent that scores zero on both axes must not hold the cell."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            cell = "providers|workflow|own-repo"
+            blank = store.archive_idea(_idea(cell, quality=0.0, novelty=0.0, title="blank"))
+            self.assertIsNotNone(blank)
+            real = store.archive_idea(_idea(cell, quality=0.5, novelty=1.0, title="real idea"))
+            self.assertIsNotNone(real)
+            self.assertEqual(cast(dict, store.best_in_cell(cell))["idea_id"], real)
+            store.close()
+
     def test_materialize_idea_creates_a_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
@@ -396,7 +456,7 @@ class CriterionEpochTests(unittest.TestCase):
 
 class MetaLoopProtectionTests(unittest.TestCase):
     def test_meta_loop_paths_are_warned_not_hard_protected(self) -> None:
-        # Owner decision 2026-09-21: the meta-contour is open. A first submission
+        # Owner decision: the meta-contour is open. A first submission
         # of a meta-loop change is warned (never held or rejected), and only the
         # identical resubmission proceeds through the full gate.
         with tempfile.TemporaryDirectory() as directory:

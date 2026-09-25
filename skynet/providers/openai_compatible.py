@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import threading
 from collections.abc import Sequence
@@ -20,7 +21,10 @@ except ImportError:
 from ..models import ModelTurn, ToolCall
 from ..provider import Message, ToolSchema
 from ..time import utc_datetime_now
+from . import tor_control
 from .errors import ProviderError, tool_arguments
+
+log = logging.getLogger("skynet.providers.openai_compatible")
 
 # `urllib` has no SOCKS support, so the process-global socket factory is
 # patched for the duration of a proxy-scoped request. A depth counter keeps
@@ -110,6 +114,12 @@ class OpenAICompatibleProvider:
 
     def complete(self, messages: Sequence[Message], *, max_tokens: int, tools: Sequence[ToolSchema] = (), timeout_seconds: float | None = None) -> ModelTurn:
         effective_max_tokens = min(max_tokens, self.max_output_tokens) if self.max_output_tokens else max_tokens
+        if self.max_output_tokens and max_tokens > self.max_output_tokens:
+            # The clamp is invisible in the payload, so a provider ceiling lower
+            # than the requested budget used to be undiagnosable from outside.
+            # Log the gap here; the transport still records both numbers in
+            # ``fallback_selected``.
+            log.warning("%s output ceiling clamps %s -> %s tokens", self.name, max_tokens, effective_max_tokens)
         payload: dict[str, Any] = {"model": self.model, "messages": list(messages), "max_tokens": effective_max_tokens, "stream": False}
         if self.temperature is not None:
             payload["temperature"] = self.temperature
@@ -121,22 +131,36 @@ class OpenAICompatibleProvider:
         if self.api_key and "Authorization" not in headers:
             headers["Authorization"] = f"Bearer {self.api_key}"
         req = request.Request(f"{self.base_url.rstrip('/')}/chat/completions", data=json.dumps(payload).encode(), headers=headers, method="POST")
-        try:
-            with self._proxy_scope(), request.urlopen(req, timeout=timeout_seconds or self.timeout_seconds) as response:
-                data = json.load(response)
-        except error.HTTPError as exc:
+        # The retry is armed only when a Tor proxy is configured: a 403 through
+        # Tor is a dirty exit, not a rejected key. Without a proxy a 403 stays
+        # fatal and is classified on the first pass.
+        attempts = 2 if self.proxy_url else 1
+        data: dict[str, Any] | None = None
+        for attempt in range(attempts):
             try:
-                detail = exc.read().decode("utf-8", errors="replace")[:2000]
-            except OSError:
-                detail = "response body unavailable"
-            category, retryable, cooldown = self._classify_status(exc.code, detail)
-            if self.cooldown_overrides and exc.code in self.cooldown_overrides:
-                # An override may lengthen a short cooldown, but it must not
-                # shorten a computed one (e.g. quota-until-midnight).
-                cooldown = max(cooldown, self.cooldown_overrides[exc.code])
-            raise ProviderError(f"{self.name} request failed: HTTP {exc.code}: {detail}", category=category, retryable=retryable, cooldown_seconds=cooldown, provider=self.name, model=self.model, http_status=exc.code) from exc
-        except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-            raise ProviderError(f"{self.name} request failed: {exc}", category="network", retryable=True, cooldown_seconds=self.network_cooldown_seconds, provider=self.name, model=self.model) from exc
+                with self._proxy_scope(), request.urlopen(req, timeout=timeout_seconds or self.timeout_seconds) as response:
+                    data = json.load(response)
+                break
+            except error.HTTPError as exc:
+                if exc.code == 403 and attempt == 0 and tor_control.newnym():
+                    log.warning("%s got HTTP 403 through the proxy; rotated the Tor circuit and retrying once", self.name)
+                    continue
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:2000]
+                except OSError:
+                    detail = "response body unavailable"
+                category, retryable, cooldown = self._classify_status(exc.code, detail)
+                if self.cooldown_overrides and exc.code in self.cooldown_overrides:
+                    # An override may lengthen a short cooldown, but it must not
+                    # shorten a computed one (e.g. quota-until-midnight).
+                    cooldown = max(cooldown, self.cooldown_overrides[exc.code])
+                raise ProviderError(f"{self.name} request failed: HTTP {exc.code}: {detail}", category=category, retryable=retryable, cooldown_seconds=cooldown, provider=self.name, model=self.model, http_status=exc.code) from exc
+            except (error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                raise ProviderError(f"{self.name} request failed: {exc}", category="network", retryable=True, cooldown_seconds=self.network_cooldown_seconds, provider=self.name, model=self.model) from exc
+        if data is None:
+            # Only reachable if a rotation consumed the last attempt without a
+            # terminal error; treat it as an ordinary transient network failure.
+            raise ProviderError(f"{self.name} request failed: no response after circuit rotation", category="network", retryable=True, cooldown_seconds=self.network_cooldown_seconds, provider=self.name, model=self.model)
         return self._parse(data)
 
     def _parse(self, data: dict[str, Any]) -> ModelTurn:
@@ -148,6 +172,20 @@ class OpenAICompatibleProvider:
             reasoning_content = message.get("reasoning_content") or ""
             if not isinstance(reasoning_content, str):
                 reasoning_content = ""
+            if choice.get("finish_reason") == "length" and not text.strip() and not calls:
+                # A cut-off reply with nothing visible is a provider failure, not
+                # an answer: returning it as a success is what let the
+                # output ceiling freeze the planner for seven hours.
+                # A ``length`` stop with visible text is a long but real answer
+                # and stays valid.
+                raise ProviderError(
+                    f"{self.name} stopped at the output ceiling with no visible content",
+                    category="response_quality",
+                    retryable=True,
+                    cooldown_seconds=2.0,
+                    provider=self.name,
+                    model=self.model,
+                )
             if self.reject_reasoning_leakage and not calls and _looks_like_reasoning_leak(text, reasoning_content):
                 raise ProviderError(
                     f"{self.name} returned reasoning leakage instead of a final response",

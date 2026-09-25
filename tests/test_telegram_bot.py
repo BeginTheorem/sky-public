@@ -26,6 +26,7 @@ from skynet.telegram_bot import (
     redact,
     runtime_event_kind,
 )
+from skynet.time import display_timestamp
 
 try:
     importlib.import_module("skynet.reporting")
@@ -63,8 +64,12 @@ class TelegramBotTests(unittest.TestCase):
         invalid_time = format_runtime_record({"timestamp": "telegram-filter-test", "kind": "finish_report", "payload": {"text": "kept"}})
         self.assertIn("unknown time", invalid_time)
         self.assertIn("kept", invalid_time)
-        formatted_time = format_runtime_record({"timestamp": "2026-09-15T02:40:52Z", "kind": "finish_report", "payload": {}})
-        self.assertIn("02:40:52 [UTC", formatted_time)
+        stamp = "2026-09-15T02:40:52Z"
+        formatted_time = format_runtime_record({"timestamp": stamp, "kind": "finish_report", "payload": {}})
+        # The renderer uses the configured display zone; compare against the same
+        # helper instead of a hardcoded zone, so the assertion holds under any
+        # SKYNET_DISPLAY_TIMEZONE.
+        self.assertIn(display_timestamp(stamp), formatted_time)
 
     def test_authorization_requires_both_user_and_chat(self):
         bot = PrivateBot(cast(TelegramAPI, FakeAPI()), Path("state/skynet.sqlite3"), 7, 8, "skynet.service")

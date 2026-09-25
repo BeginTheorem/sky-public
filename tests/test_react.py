@@ -940,6 +940,93 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_invalid'").fetchone()[0], 0)
             store.close()
 
+    def test_unreadable_finish_carries_the_executed_evidence_instead_of_discarding_it(self) -> None:
+        """A degraded provider must not erase an episode's executed work.
+
+        Measured on the live ledger: three runs (9b944e12, 8869a882,
+        b01c5fdb) finished needs_recovery with ``failure=''`` and a report that
+        was the bare parser error "Finish Report invalid: structured model
+        response contains no acceptable JSON value", after 96, 28 and 49
+        successful tool results respectively. The refusal to read prose as
+        COMPLETED is deliberate and stays; what is removed is the erasure of the
+        execution record. The status remains NEEDS_RECOVERY.
+        """
+
+        class EmptyAfterTool:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                # Degraded provider: the closing turn AND the repair turn are empty.
+                return ModelTurn(text="", usage_tokens=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(EmptyAfterTool(), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            # The status is unchanged: an unreadable report is still not a verified completion.
+            self.assertEqual(result.status, RunStatus.NEEDS_RECOVERY)
+            # ...but the evidence the episode produced survives in the report.
+            carried = json.loads(result.report)
+            self.assertEqual(carried["status"], "NEEDS_RECOVERY")
+            self.assertIn("executed tool: fixture_tool", carried["evidence"])
+            self.assertTrue(carried["blocker"])
+            event = store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_evidence_carried'").fetchone()
+            self.assertIsNotNone(event)
+            self.assertEqual(json.loads(event[0])["tools"], ["fixture_tool"])
+            store.close()
+
+    def test_a_refused_tool_call_is_not_evidence_and_still_ends_bare(self) -> None:
+        """The control: a call that changed nothing must keep the bare rejection.
+
+        An unknown tool name and a policy denial both append a ``tool`` message,
+        so "a tool message exists" would carry evidence for work that never
+        happened. Only a successful call qualifies.
+        """
+
+        class UnknownToolThenEmpty:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("no_such_tool", {})], usage_tokens=1)
+                return ModelTurn(text="", usage_tokens=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(UnknownToolThenEmpty(), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.status, RunStatus.NEEDS_RECOVERY)
+            self.assertIn("Finish Report invalid", result.report)
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+            store.close()
+
+    def test_a_repairable_finish_is_still_repaired_and_never_marked_carried(self) -> None:
+        """The repair turn wins: carrying evidence must not shadow a real report."""
+
+        class RepairsOnSecondTry:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                if self.calls == 2:
+                    return ModelTurn(text="", usage_tokens=0)
+                return ModelTurn(text=FINISH_OK, usage_tokens=2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(RepairsOnSecondTry(), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            self.assertEqual(json.loads(result.report)["summary"], "done")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+            store.close()
+
     def test_inbox_is_read_once_per_step_boundary(self) -> None:
         # `_deliver_new_inbox` runs at every step boundary and used to issue
         # `pending_inbox` twice per step (once for delivery, once for the unread

@@ -120,7 +120,7 @@ class CoreTests(unittest.TestCase):
         patterns = [
             re.compile(r"\b192\.168\.\d{1,3}\.\d{1,3}\b"),
             re.compile(r"\b91\.218\.\d{1,3}\.\d{1,3}\b"),
-            re.compile(r"id_ed25519_\w+"),
+            re.compile(r"deploy_key_\d+_\d+_\d+_\d+"),
         ]
         offenders = []
         for path in sorted([root / "AGENTS.md", root / "SOUL.md", *root.glob("scripts/*.sh"), root / "config" / "skynet.env.example"]):

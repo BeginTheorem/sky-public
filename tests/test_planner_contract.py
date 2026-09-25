@@ -105,7 +105,7 @@ class ProtectedValidationStillBitesTests(unittest.TestCase):
             AutonomousPlanner._parse(text)
 
     def test_planner_contract_and_judge_are_both_open(self) -> None:
-        # Owner decision 2026-09-21: the judge is no longer hard-protected.
+        # Owner decision: the judge is no longer hard-protected.
         # The instrument stays outside the warn-set; the judge is inside it but
         # is only warned on first submission, never hard-held or rejected.
         self.assertNotIn("skynet/planner_contract.py", GATE_PROTECTED_PATHS)

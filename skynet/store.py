@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+# ``memory_provenance`` resolves a batch of source_run values with one lookup per
+# chunk; SQLite's default variable limit is 999, so the chunk stays well below it.
+PROVENANCE_LOOKUP_CHUNK = 400
+
 from .memory_store import MemoryStore, normalize_memory_kind
 from .models import AgentState, LifecycleState, RunRecord, RunStatus
 from .runtime_log import RuntimeLog
@@ -25,7 +29,7 @@ from .time import utc_datetime_now, utc_now
 # resurrection hard denylist (`policy_denied`, tools.py:190). Such a row must
 # therefore not count as a prior application. The hard marker was missing from
 # both effect-identity readers after commit 0ee707191708c0bf2f7fe4cca1367ce77902a6
-# fixed only the soft one; measured on the live ledger 2026-09-22 (generation
+# fixed only the soft one; measured on the live ledger (generation
 # 92), 10 rows carry `policy_denied` and all 10 are the first and only row of
 # their identity, so the omission is latent rather than active. Excluding both
 # changes 0 of the 42 announced identities and 0 same_run_repeat decisions.
@@ -38,7 +42,7 @@ _REFUSAL_RESULT_PREDICATE = " AND ".join(
 # no reader may count it as work. The label is derived from the same markers the
 # SQL predicate above reads, and both are kept: the label is what the writer
 # stamps from now on, the marker predicate is what the 63 refusal rows already
-# on disk (measured 2026-09-22, generation 93) are still recognised by.
+# on disk (measured, generation 93) are still recognised by.
 REFUSED_EFFECT_STATUS = "refused"
 
 SCHEMA = """
@@ -310,7 +314,7 @@ METRICS_RUN_ID = "metrics"
 #
 # The flag is per-process, and the reactor and the telegram bot are separate
 # processes: each starts with it unset, so the first writable open in *each* of
-# them ran the unconditional UPDATE. Measured 2026-09-21 (generation 51) on a
+# them ran the unconditional UPDATE. Measured (generation 51) on a
 # scratch store: the reactor claims a message (`delivering`, `claimed_at` set),
 # a second process opens the same file and the row is back to `pending` with
 # `claimed_at` untouched, and that process immediately re-claims it -- exactly
@@ -324,18 +328,35 @@ _INFLIGHT_LEASES_RECOVERED = False
 # disagree about which leases are live.
 OUTBOX_LEASE_SECONDS = 300.0
 
+# The run-count window that bounds how long a protected pointer's *evidence*
+# lives. It mirrors the reactor's ``transcript_retention_runs`` default and the
+# ``SKYNET_TRANSCRIPT_RETENTION_RUNS`` the CLI reads; production callers pass the
+# live setting explicitly so this value only covers direct StateStore use.
+DEFAULT_TRANSCRIPT_RETENTION_RUNS = int(os.getenv("SKYNET_TRANSCRIPT_RETENTION_RUNS", "200"))
+
 # Event kinds that survive every retention window: the post-mortem of a failed
 # experiment is exactly the set of things that went wrong.
 PROTECTED_EVENT_KINDS = frozenset({
     "doom_loop", "budget_exhausted", "emergency_finish", "watchdog_timeout",
     "owner_stop",
     "uncaptured_changes", "finish_invalid", "finish_failure", "restart_failed",
+    # The pointer to an episode whose report had to be reconstructed from its own
+    # tool calls: pruning it erases which runs lost their closing turn.
+    "finish_evidence_carried",
     # A Finish Report action contradicted by the run's own capability ledger:
     # the post-mortem must survive retention exactly like uncaptured_changes.
     "report_claim_unverified",
     "restart_requested", "restart_escalated", "restart_skipped", "cycle_error", "provider_lockout",
     "provider_failure", "provider_error_classified", "worktree_dirty_after_bash",
     "livelock_suspected", "memory_loop_failed", "memory_degraded", "policy_denied", "policy_soft_denied",
+    # The episode the memory loop could not capture. Retention must not erase
+    # the only pointer back to it: pruning this row deletes the work it names.
+    "memory_capture_pending",
+    # The end of that pointer's life. `pending_memory_captures` excludes a
+    # pointer once it carries a disposition, so without this row surviving
+    # retention the bound would be invisible: a re-attempt that failed again
+    # would look identical to one that was never made.
+    "memory_capture_released",
     "policy_override_confirmed", "registry_corrupted", "mcp_server_unavailable",
     "tool_name_collision", "outbox_dead_letter", "outbox_backlog_suppressed",
     "alert_raised", "task_gave_up", "success_criteria_failed", "goal_proposal_rejected",
@@ -343,6 +364,11 @@ PROTECTED_EVENT_KINDS = frozenset({
     # same empty portfolio; only these kinds tell them apart, so retention must not
     # drop the evidence that the planner failed.
     "planner_invalid_response", "planner_provider_error", "planner_output_truncated", "planner_fallback_capped",
+    # The backoff walk and the fallback creation/expiry sequence are the durable
+    # trail of a stall: together they show how long the safety net was capped
+    # and how the process kept sleeping. Retention must not erase the evidence
+    # of the deadlock before the fix is judged.
+    "planner_backoff", "planner_fallback_created",
     # The shape of the planner's own model turn: the only durable record that
     # separates an empty reply from one whose tokens went to the reasoning
     # channel, so retention must not erase the planner post-mortem.
@@ -354,17 +380,33 @@ PROTECTED_EVENT_KINDS = frozenset({
     # the acknowledgement of the identical resubmission are the durable trace
     # of the warn-once mechanism. The retired soft-denial/approval kinds stay
     # listed so history is never pruned.
+    # A maintenance/retention pass that raised. Each pass catches its own
+    # exception so the cycle cannot die, and until now the only trace was a
+    # journald warning (``deploy/skynet.service.in`` sends stdout there):
+    # measured on the live store, 0 durable rows name any retention failure, so
+    # a pass that failed or silently released rows was invisible to retention
+    # itself. The row is an instrument of the maintenance contour and must
+    # outlive the window it reports on.
+    "maintenance_failed",
     "gate_protected_warned", "gate_protected_warning_acknowledged",
     "gate_protected_soft_denied", "gate_protected_approved",
     # The A1-lite plan artifact is the measurement substrate for whether an
     # explicit plan improves a run; retention must not erase the evidence
     # before the owner can judge the experiment.
     "plan_recorded", "plan_observation",
+    # The append-only memory audit is the only durable trace of a memory change
+    # made outside a checkpoint; retention must not erase the observation.
+    "memory_audit_external_change", "memory_audit_anomaly",
+    # A chain that no longer verifies is the durable trace of a rewrite of the
+    # audit log itself; that observation is the whole point, so retention must
+    # not erase it.
+    "memory_audit_chain_broken",
     "memory_kinds_normalized", "improvement_proposals_reconciled",
     "improvement_environment_blocks_resolved",
     "recovery_reconciliation", "run_failure", "run_interrupted", "metrics_snapshot",
     "effect_reapplied",
     "provider_error", "provider_retry", "fallback_failure", "fallback_skipped",
+    "provider_output_truncated",
     # Chain-level diagnostics that used to be runtime-only: a dead or fully
     # cooling provider chain is exactly the post-mortem a failed experiment
     # depends on, so retention must not drop it.
@@ -386,9 +428,55 @@ PROTECTED_EVENT_KINDS = frozenset({
 # written with ``runtime_log.write`` (that would duplicate every row).
 DURABLE_PROVIDER_EVENT_KINDS = frozenset({
     "fallback_failure",
+    # The complement of ``fallback_failure``: a retry that answered. It shares
+    # the failure event's durability so `retry success rate` -- the metric the
+    # retry-amplification paper requires to reconstruct a retry storm
+    # (arXiv:2608.25403, sec. 8.1) -- is answerable from ``event_log`` alone
+    # instead of only from the rotating runtime projection.
+    "fallback_retry_recovered",
     "fallback_all_cooling",
+    # The chain-wide cooldown the fallback chose to wait out, and the near miss
+    # it refused to wait out. ``fallback_all_cooling`` says an episode was
+    # discarded; these two say whether the wait that exists to preserve it
+    # actually fired, which is the counterfactual the ablation needs.
+    "fallback_cooldown_wait",
+    "fallback_cooldown_wait_skipped",
     "provider_chain_reloaded",
+    # A reply cut off at the output ceiling is the post-mortem of an
+    # output-ceiling incident. It was the only record of the stall
+    # and it lived in the rotating runtime log, so neither retention nor any
+    # event-log reader could find it.
+    "provider_output_truncated",
 })
+
+
+def _model_evidence(value: Any, *, limit: int = 2000) -> str | None:
+    """Normalize a model-authored ``evidence`` field into a storable string.
+
+    The memory-loop response schema declares ``evidence`` on every candidate
+    (``skynet/model_contracts.py``: an array of strings), but this consolidation
+    path only ever read it for a *supersede* note and never wrote it to the new
+    row: the SQL statement behind it has no ``evidence`` column at all. Measured
+    on the live store: of 44 belief-kind rows written after commit
+    3c8f3fa, 39 carried no evidence, so a claim and its support were separable at
+    the moment of writing. The ``remember_memory`` path already stores evidence,
+    which is why the loss stayed invisible to ``MemoryTool``.
+
+    A model-authored field is untrusted: a list, a tuple or a bare string is
+    accepted, anything else yields ``None`` so the row is written unattributed
+    rather than with a fabricated citation. Empty text yields ``None`` too, so a
+    candidate that cites nothing keeps ``evidence IS NULL`` and stays visible to
+    the provenance counts in ``memory_audit.provenance_counts``.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+    elif isinstance(value, (list, tuple)):
+        text = "; ".join(str(part).strip() for part in value if str(part).strip())
+    else:
+        return None
+    if not text:
+        return None
+    return text[:limit]
 
 
 def _bounded_model_float(value: Any, *, default: float) -> float:
@@ -398,6 +486,53 @@ def _bounded_model_float(value: Any, *, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
+
+
+_ARCHIVE_EPSILON = 0.1
+
+
+def _admits_over_incumbent(
+    candidate_quality: float,
+    candidate_novelty: float,
+    incumbent_quality: float,
+    incumbent_novelty: float,
+    *,
+    epsilon: float = _ARCHIVE_EPSILON,
+) -> bool:
+    """Exclusive epsilon-dominance over (quality, novelty), Cully & Demiris.
+
+    arXiv:1708.09251 sec. 3.1.2 "The Archive": managing a collection by
+    replacing a member only when the newcomer is Pareto-superior "is very
+    difficult to reach, as the new individual should be both better and more
+    diverse than the previous one. This prevents most new individuals from
+    being added to the collection, which limits the quality of the produced
+    collections." Their softened rule admits a slightly worse candidate when it
+    is strictly more novel: x1 dominates x2 iff
+        N(x1) >= (1-eps) * N(x2)  and  Q(x1) >= (1-eps) * Q(x2)
+        and (N(x1)-N(x2)) * Q(x2) > -(Q(x1)-Q(x2)) * N(x2)
+    With novelty constant (as the archive call site currently passes), the
+    third condition collapses to the quality-only comparison, so this is a
+    strict relaxation of the previous rule: it can only ever add admissions,
+    never remove one, and never rotates a cell on an exact tie.
+    """
+    if incumbent_quality <= 0.0 and incumbent_novelty <= 0.0:
+        # A degenerate incumbent holds the cell without contributing anything;
+        # keeping it would make the cell permanently unreachable.
+        return True
+    if candidate_quality < (1.0 - epsilon) * incumbent_quality:
+        return False
+    if candidate_novelty < (1.0 - epsilon) * incumbent_novelty:
+        return False
+    improvement = (candidate_novelty - incumbent_novelty) * incumbent_quality + (
+        candidate_quality - incumbent_quality
+    ) * incumbent_novelty
+    if improvement > 0.0:
+        return True
+    # Equal novelty (including the no-signal case where both are zero) leaves
+    # the weighted term at zero, so a strictly better quality still wins the
+    # cell. This keeps the previous quality-only behaviour intact and means the
+    # relaxation can only ever ADD admissions, never remove one.
+    return candidate_quality > incumbent_quality
 
 
 class EventRepository:
@@ -1049,7 +1184,7 @@ class StateStore:
         exclusion is two-fold because the ledger holds rows from both eras:
         `status` names the refusals written since the label exists, and the
         marker predicate names those already on disk. Measured on the live
-        ledger 2026-09-22 (generation 93): of the 8 consumers of this table this
+        ledger (generation 93): of the 8 consumers of this table this
         is the only one that counted a refusal as an application, and 0 of the
         63 refusal rows belong to a claim tool, so the repair changes no verdict
         recorded so far - it closes the hole instead of altering history.
@@ -1098,7 +1233,7 @@ class StateStore:
     def snapshot_episode(self, run_id: str) -> dict[str, Any]:
         """Freeze one run's episode; the events are stored, the transcript is not.
 
-        Measured 2026-09-20 (generation 46, ``dbstat`` on a read-only copy of the
+        Measured (generation 46, ``dbstat`` on a read-only copy of the
         live ledger): the ``transcript`` part was 3.179 MB of the 13.700 MB of
         snapshot payload (23.2%), and the read-time rebuild reproduced all 43
         stored copies exactly (0 mismatches, both directions). The copy also had
@@ -1145,7 +1280,7 @@ class StateStore:
         before that decision keep a verbatim copy of a projection the
         ``transcript`` table already owns, and the read path returns early for
         an existing row -- so the copies are forward-only leftovers. Measured
-        2026-09-21 on the live ledger: 44 of 51 rows still carried the list
+        on the live ledger: 44 of 51 rows still carried the list
         form, 14.74 MB of the 16.78 MB of snapshot payload bytes, and all 44
         rebuilt byte-identically from ``transcript`` (0 mismatches). This
         rewrites exactly those rows to the pointer form, which is the eviction
@@ -1242,6 +1377,192 @@ class StateStore:
             raise RuntimeError("SQLite did not return a transcript sequence")
         return int(cursor.lastrowid)
 
+    def record_pending_memory_capture(self, run_id: str, *, error: str, transcript_rows: int, events: int) -> int:
+        """Persist the episode's memory work instead of discarding it.
+
+        A transient provider fault inside the post-episode Memory Loop (a
+        timeout, a network error, an unparseable reply) makes ``consolidate``
+        return a *degraded* result with zero candidates. The episode is over and
+        the loop is never retried, so every durable observation the episode
+        produced is lost -- `event_log` rows 16199-16205 on run ``e7e36432``
+        are that exact sequence: one provider fault, then
+        ``memory_loop_finished {memory_candidates: 0, degraded: true}`` on a run
+        that still committed as completed. This row is the recoverable pointer:
+        it names the run, the frozen episode snapshot and the transcript, so a
+        later pass (or the owner) can re-derive the memories from evidence that
+        still exists. It does not retry anything and it never fails the run.
+
+        Idempotent by run id plus kind: a repeated call updates the existing row
+        rather than appending a second pending record for the same episode.
+        """
+        existing = self.connection.execute(
+            "SELECT sequence FROM event_log WHERE kind='memory_capture_pending' AND run_id=? LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        snapshot = self.connection.execute(
+            "SELECT snapshot_id FROM episode_snapshots WHERE run_id=? LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        payload: dict[str, Any] = {
+            "run_id": run_id,
+            "error": str(error)[:1000],
+            "snapshot_id": str(snapshot["snapshot_id"]) if snapshot is not None else None,
+            "episode_events": int(events),
+            "transcript_rows": int(transcript_rows),
+        }
+        if existing is not None:
+            self.connection.execute(
+                "UPDATE event_log SET payload=? WHERE sequence=?",
+                (json.dumps(payload, ensure_ascii=False), int(existing["sequence"])),
+            )
+            return int(existing["sequence"])
+        return self.append_event("memory_capture_pending", payload, run_id)
+
+    def pending_memory_captures(self, limit: int = 25) -> list[dict[str, Any]]:
+        """Unresolved pending captures, oldest first.
+
+        A pointer whose payload carries a ``disposition`` has been reconciled
+        and is deliberately excluded: the disposition is what gives the pointer
+        a bounded lifetime. Without it ``memory_capture_pending`` was permanent
+        -- it is in ``PROTECTED_EVENT_KINDS`` and no code path ever resolved
+        ``snapshot_id`` or the pending ``run_id`` (measured generation 177,
+        read-only on the live ledger: 27 pointers, 0 naming any disposition, and
+        the evidence under them held past the run-count window with no reader).
+        """
+        rows = self.connection.execute(
+            "SELECT sequence, run_id, payload, created_at FROM event_log "
+            "WHERE kind='memory_capture_pending' AND run_id IS NOT NULL "
+            "AND json_type(payload, '$.disposition') IS NULL "
+            "ORDER BY sequence LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [
+            {
+                "sequence": int(row["sequence"]),
+                "run_id": str(row["run_id"]),
+                "payload": json.loads(row["payload"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def pending_capture_evidence(self, run_id: str) -> dict[str, int]:
+        """How much of the evidence a pending capture names still exists.
+
+        The pointer's whole purpose is that the frozen episode and the
+        transcript outlive the degraded loop; a resolution pass must be able to
+        tell "the evidence is here, re-derive it" from "the window took it".
+        """
+        return {
+            "snapshots": int(self.connection.execute("SELECT COUNT(*) FROM episode_snapshots WHERE run_id=?", (run_id,)).fetchone()[0]),
+            "transcript_rows": int(self.connection.execute("SELECT COUNT(*) FROM transcript WHERE run_id=?", (run_id,)).fetchone()[0]),
+        }
+
+    def _pending_capture_expiry(self, run_id: str, keep_runs: int) -> tuple[str, str, int]:
+        """When the evidence a protected pointer names leaves the run window.
+
+        NIST SP 800-92 section 5.4 makes disposal happen "when the required data
+        retention period has ended", so the end of the period must be *written*
+        when the pointer's life ends, not inferred by whoever looks later. The
+        period that governs a ``memory_capture_pending`` pointer is
+        ``prune_run_history``'s run-count window, so the bound is the run in
+        which this pointer's run leaves that window, dated at the inter-run
+        interval measured from the ledger itself.
+        """
+        window = max(1, int(keep_runs))
+        row = self.connection.execute("SELECT rowid FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            # Its run row is already gone: the window has taken it, so the bound
+            # is now and the record says why.
+            return utc_now(), "run_window_elapsed", window
+        rank = int(
+            self.connection.execute("SELECT COUNT(*) FROM runs WHERE rowid > ?", (int(row["rowid"]),)).fetchone()[0]
+        )
+        remaining = max(0, window - rank)
+        if remaining <= 0:
+            return utc_now(), "run_window_elapsed", window
+        pace = self.connection.execute(
+            "SELECT AVG(delta) FROM ("
+            "SELECT julianday(started_at) - julianday(LAG(started_at) OVER (ORDER BY rowid)) AS delta FROM runs)"
+        ).fetchone()[0]
+        if not pace or float(pace) <= 0.0:
+            # A ledger with one run has no inter-run interval to measure, so the
+            # date the window ends cannot be derived from it. The bound is still
+            # written, labelled as what it is rather than passed off as measured.
+            return utc_now(), "run_window_pace_unmeasured", window
+        expires = (utc_datetime_now() + timedelta(days=remaining * float(pace))).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        return expires, "run_window_end", window
+
+    def dispose_pending_memory_capture(
+        self, run_id: str, *, disposition: str, detail: str = "", memories: int = 0, keep_runs: int | None = None
+    ) -> bool:
+        """End a pending capture's life: record the outcome once, durably.
+
+        ``recaptured`` means the evidence was re-derived into memories;
+        ``unrecoverable`` means a re-attempt ran and degraded again (one attempt
+        only, so the pointer cannot spin); ``expired`` means the evidence had
+        already left the run-count window before any re-attempt. The pointer row
+        itself stays -- it is in ``PROTECTED_EVENT_KINDS`` and remains the audit
+        record of the episode whose Memory Loop was lost -- but it is no longer
+        *pending*, so ``pending_memory_captures`` stops returning it and the
+        attempt never repeats. Idempotent by run id: a second call for an
+        already-disposed pointer writes nothing.
+
+        Each disposition also writes ``expires_at`` (with the ``expiry_basis``
+        and ``expiry_keeps`` that produced it): NIST SP 800-92 section 5.4 ends
+        a retention period with a scheduled act, not with whoever reads next, so
+        the terminal record carries the bound itself. Measured live before this
+        change (generation 180, read-only copy, 165 runs): 2 terminal pointers,
+        0 naming an expiry, so the invariant "terminal-dispositioned protected
+        pointers with no written bound = 0" read 2.
+        """
+        bounded = str(disposition)[:40]
+        row = self.connection.execute(
+            "SELECT sequence, payload FROM event_log WHERE kind='memory_capture_pending' AND run_id=? LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        payload = json.loads(row["payload"])
+        if payload.get("disposition"):
+            return False
+        expires_at, basis, window = self._pending_capture_expiry(
+            run_id, DEFAULT_TRANSCRIPT_RETENTION_RUNS if keep_runs is None else keep_runs
+        )
+        payload.update(
+            {
+                "disposition": bounded,
+                "disposed_at": utc_now(),
+                # The bound NIST 800-92 section 5.4 requires: the record of the
+                # loss survives, and the moment its payload is scheduled to be
+                # gone is written down instead of implied by a later reader.
+                "expires_at": expires_at,
+                "expiry_basis": basis,
+                "expiry_keeps": window,
+                "disposal_detail": str(detail)[:500],
+                "memories_recovered": int(memories),
+            }
+        )
+        self.connection.execute(
+            "UPDATE event_log SET payload=? WHERE sequence=?",
+            (json.dumps(payload, ensure_ascii=False), int(row["sequence"])),
+        )
+        self.append_event(
+            "memory_capture_released",
+            {
+                "run_id": run_id,
+                "disposition": bounded,
+                "detail": str(detail)[:500],
+                "memories": int(memories),
+                "expires_at": expires_at,
+                "expiry_basis": basis,
+            },
+            run_id,
+        )
+        return True
+
     def prune_event_log(self, retention_days: int, *, protected_kinds: frozenset[str] = PROTECTED_EVENT_KINDS) -> int:
         """Drop routine events older than the window; never the safety record.
 
@@ -1263,7 +1584,7 @@ class StateStore:
         """Drop effect-idempotency rows older than the window.
 
         ``capability_effects`` was the one monotone table that had no retention
-        statement until this window was added. Re-measured 2026-09-20 (generation
+        statement until this window was added. Re-measured (generation
         39) on a read-only copy of the live ledger: 2281 rows / 6.12 MB of table
         pages, 13.69% of a 46.9 MB database, plus 729 KB of its own indexes
         (15.25% inclusive), growing ~126 rows/hour (~3,000 rows/day over an 18.1 h
@@ -1282,7 +1603,7 @@ class StateStore:
         this table are pruned by two *independent* windows
         (``event_retention_days`` / ``effect_retention_days``), and the age-only
         DELETE broke the invariant this table exists to support: measured
-        2026-09-20 (generation 43) on scratch copies of the live ledger, with the
+        (generation 43) on scratch copies of the live ledger, with the
         effects aged past a 30-day cutoff, the plain DELETE removed 2448 rows and
         left 2 dangling pointers -- every folded ``tool_result`` event carrying an
         ``effect_key`` pointed at a row that no longer existed. Reachable through
@@ -1349,8 +1670,16 @@ class StateStore:
             "AND idempotency_key NOT IN ("
             "SELECT json_extract(event.value, '$.payload.result.effect_key') "
             "FROM episode_snapshots, json_each(episode_snapshots.payload, '$.events') AS event "
-            "WHERE json_extract(event.value, '$.kind') = 'tool_result' "
-            "AND json_extract(event.value, '$.payload.result.effect_key') IS NOT NULL)",
+            "WHERE json_valid(event.value) "
+            "AND json_type(event.value) = 'object' "
+            "AND json_type(event.value, '$.payload') = 'object' "
+            "AND json_type(event.value, '$.payload.result') = 'object' "
+            "AND json_extract(event.value, '$.kind') = 'tool_result' "
+            "AND json_extract(event.value, '$.payload.result.effect_key') IS NOT NULL) "
+            "AND idempotency_key NOT IN ("
+            "SELECT node.value "
+            "FROM episode_snapshots, json_tree(episode_snapshots.payload, '$.events') AS node "
+            "WHERE node.key = 'effect_key' AND node.type = 'text')",
             (cutoff,),
         ).rowcount)
 
@@ -1359,6 +1688,75 @@ class StateStore:
 
         Audit data (event_log, checkpoints, memories, goals, tasks) is never
         pruned; only the per-run conversation history and episode snapshots.
+
+        ``memory_capture_pending`` is in ``PROTECTED_EVENT_KINDS``, so the row is
+        deliberately kept past every retention window -- but the evidence it
+        names was not. The row carries the ``run_id`` and ``snapshot_id`` of a
+        degraded episode whose only other record is the transcript and the
+        frozen snapshot, so a run-count prune that dropped both made the one
+        protected pointer to that work point at nothing. Measured (generation
+        172, read-only on a copy of the live ledger, 158 runs / 25 pending
+        captures): at the live first-fire boundary (``keep_runs=47`` on today's
+        ledger deletes exactly the 111 runs the ``N=311`` window will delete) 1
+        of the 25 already dangled -- the pointer resolved while its
+        ``snapshot_id`` matched 0 rows and its ``run_id`` had 0 transcript rows --
+        and at saturation all 25 do, ~15.8% of runs. The other two retention
+        paths were clean at their first fire (``prune_event_log`` removed
+        24,054 -> 2,221 rows and ``prune_capability_effects`` 9,011 -> 149, both
+        with 0 dangling addresses across all six holder classes), so only this
+        one needs the guard.
+
+        The guard generation 172 added for that was a tautology and held 0 rows.
+        A DELETE's ``run_id NOT IN (window)`` already excludes every address
+        inside the window, so an extra ``AND run_id NOT IN (pending AND
+        inside-window)`` can only subtract rows the first conjunct has already
+        removed. Measured (generation 179, read-only copy of the live ledger,
+        165 runs): sweeping EVERY ``keep_runs`` 1..165, the conjunct changes the
+        deletion set for 0 of the 165 values, and the pin set never exceeds the
+        28 pending pointers. The guard restored in generation 173 is the one
+        that fires: an unbounded pin was the defect, not a dangling address.
+
+        That bound was too generous: the pin held every pending capture forever,
+        not only the ones inside the window. Measured (generation 173, read-only
+        on a copy of the live ledger, 159 runs / 25 pending captures / 190 MB)
+        it holds 1,459 transcript rows (6.38 MB) and 25 snapshots (5.34 MB) --
+        11.72 MB, 12.7% of the 92.4 MB of evidence -- and nothing ever removes
+        the row, because ``memory_capture_pending`` is in
+        ``PROTECTED_EVENT_KINDS`` and no code path resolves ``snapshot_id`` or the
+        pending ``run_id``: the reactor, CLI, owner digest and deviations digest
+        only record or count the kind, and ``memory_capture_pending_failed`` is
+        itself unprotected. 33 of 153 completed memory loops were degraded, 25
+        left a pending row, arriving at ~5.14/day, so the pin grew ~2.4 MB/day
+        (~0.9 GB/year) while the run-count window it exists to serve keeps 200
+        runs. A second, unbounded retention class inside ``transcript`` is
+        exactly what this method exists to bound.
+
+        The pin therefore ends with the window: the pointer is held only while
+        its run is still inside ``keep_runs``. Once the run leaves, the pointer
+        row survives -- it is protected, and its run id, error and counts remain
+        the audit record -- but the evidence under it is released, the same way
+        ``prune_capability_effects`` releases its rows when the transcript that
+        named them is pruned. The bound is structural: at most ``keep_runs``
+        captures are pinned, the window this method already honours.
+
+        That rule is the log-management requirement the pointer exists to keep.
+        NIST SP 800-92 section 3.2 defines disposal as "removing all entries from
+        a log that precede a certain date and time" and section 5.4 makes the act
+        happen "when the required data retention period has ended", not when a
+        reader next asks -- so the payload a protected pointer names must be
+        cleared on schedule while the record of the loss stays readable. Measured
+        (generation 179, read-only on a copy of the live ledger, 165 runs / 27
+        open pointers, 12,949 transcript rows / 159 snapshots): the open pointers
+        pin 1,627 transcript rows (7,474,435 B) and 27 snapshots (6,321,504 B) =
+        13,795,939 B, oldest pointer rank 54 of the 200-run window and 2.03 days
+        old, so 0 are outside it yet and each is released as its run leaves. The
+        lifetime is 200 runs, measured at 31.7 runs/day over the live 5.20-day
+        history, i.e. ~6.3 days; generation 172's predicted release at a 15.8%
+        pending rate was 11,720,808 B, and today's 16.4% (27/165) gives
+        13,795,939 B. What actually ends the pin early is the resolution pass
+        ``Reactor._reconcile_pending_captures``: 1 of 28 pointers has ever been
+        dispositioned, so the class is bounded in design and, at this window, not
+        yet by practice.
         """
         if keep_runs <= 0:
             return {"transcript": 0, "episodes": 0}
@@ -1641,9 +2039,12 @@ class StateStore:
     def archive_idea(self, idea: Mapping[str, Any]) -> str | None:
         """Admit one idea under the MAP-Elites cell rule.
 
-        A cell keeps exactly one active occupant: the highest-quality idea. An
-        inferior newcomer is rejected instead of appended, which bounds the
-        archive and makes cell coverage impossible to inflate with duplicates.
+        A cell keeps exactly one active occupant, so the archive stays bounded
+        and cell coverage cannot be inflated with duplicates. Admission is
+        exclusive epsilon-dominance over quality AND novelty
+        (`_admits_over_incumbent`, arXiv:1708.09251 sec. 3.1.2): a candidate
+        that ties on quality but is more novel takes the cell, instead of being
+        discarded anonymously because quality alone did not strictly improve.
         """
         from uuid import uuid4
 
@@ -1652,13 +2053,19 @@ class StateStore:
         incumbent = self.best_in_cell(cell)
         idea_id = str(uuid4())
         now = utc_now()
+        novelty = float(idea.get("novelty", 0.0) or 0.0)
         if incumbent is not None:
-            if quality <= float(incumbent["quality"]):
+            incumbent_quality = float(incumbent["quality"])
+            incumbent_novelty = float(incumbent["novelty"])
+            if not _admits_over_incumbent(quality, novelty, incumbent_quality, incumbent_novelty):
                 self.append_event("idea_archive_rejected", {
                     "cell_key": cell,
-                    "reason": "incumbent is at least as good",
-                    "incumbent_quality": float(incumbent["quality"]),
+                    "reason": "incumbent is not strictly dominated",
+                    "incumbent_quality": incumbent_quality,
                     "candidate_quality": quality,
+                    "incumbent_novelty": incumbent_novelty,
+                    "candidate_novelty": novelty,
+                    "epsilon": _ARCHIVE_EPSILON,
                 })
                 return None
             self.connection.execute(
@@ -1685,7 +2092,7 @@ class StateStore:
                 idea_id, parent, depth, idea["subsystem"], idea["change_type"], idea["evidence_source"],
                 cell, idea["title"], idea.get("problem_description", ""), idea.get("hypothesis", ""),
                 idea.get("expected_new_fact", ""), idea.get("validation", ""), idea.get("inspiration_ref", ""),
-                quality, float(idea.get("novelty", 0.0) or 0.0),
+                quality, novelty,
                 idea.get("task_id"), idea.get("proposal_id"), now, now,
             ),
         )
@@ -1935,7 +2342,10 @@ class StateStore:
                 continue
             kind = normalize_memory_kind(str(item.get("kind", "observation")))
             confidence = _bounded_model_float(item.get("confidence", 0.5), default=0.5)
-            self.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES (lower(hex(randomblob(16))),?,?,?,?,?) ON CONFLICT(kind,content) DO UPDATE SET confidence=max(confidence, excluded.confidence), source_run=excluded.source_run, updated_at=excluded.updated_at", (kind, content.strip(), max(0.0, min(confidence, 1.0)), run_id, utc_now()))
+            # The candidate's own citation belongs on the row it supports, not
+            # only on the supersede note it may also carry.
+            row_evidence = _model_evidence(item.get("evidence"))
+            self.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at,evidence) VALUES (lower(hex(randomblob(16))),?,?,?,?,?,?) ON CONFLICT(kind,content) DO UPDATE SET confidence=max(confidence, excluded.confidence), source_run=excluded.source_run, updated_at=excluded.updated_at, evidence=COALESCE(excluded.evidence, memories.evidence)", (kind, content.strip(), max(0.0, min(confidence, 1.0)), run_id, utc_now(), row_evidence))
             added += 1
             memory_id = self.connection.execute("SELECT memory_id FROM memories WHERE kind=? AND content=?", (kind, content.strip())).fetchone()[0]
             memory_ids.append(str(memory_id))
@@ -1945,13 +2355,7 @@ class StateStore:
             if isinstance(supersedes_id, str) and supersedes_id:
                 exists = self.connection.execute("SELECT 1 FROM memories WHERE memory_id=?", (supersedes_id,)).fetchone()
                 if exists is not None:
-                    evidence = item.get("evidence")
-                    if isinstance(evidence, str) and evidence:
-                        note = evidence
-                    elif isinstance(evidence, list):
-                        note = "; ".join(str(part) for part in evidence)
-                    else:
-                        note = content.strip()
+                    note = row_evidence or content.strip()
                     self.supersede_memory(supersedes_id, str(memory_id), note)
                     superseded += 1
         return {"added": added, "superseded": superseded, "memory_ids": memory_ids}
@@ -2032,18 +2436,32 @@ class StateStore:
         content: str,
         evidence: str,
         confidence: float | None = None,
+        source_run: str | None = None,
     ) -> str:
         """Replace a memory with a corrected version, keeping the audit trail.
 
         The corrected memory is inserted as a fresh `active` row; the old row is
         marked `superseded`, linked via `superseded_by` and closed with
         `valid_to`. Raises `ValueError` if `memory_id` is unknown.
+
+        `source_run` attributes the successor to the run that made the
+        correction. When the caller passes none, the predecessor's attribution is
+        inherited: a correction must not launder away the only provenance the
+        fact had (measured: 8 of 33 live supersede pairs had a NULL
+        successor whose predecessor carried a run). An unknown run still yields
+        NULL rather than an invented id.
         """
-        row = self.connection.execute("SELECT kind, confidence FROM memories WHERE memory_id=?", (memory_id,)).fetchone()
+        row = self.connection.execute(
+            "SELECT kind, confidence, source_run FROM memories WHERE memory_id=?", (memory_id,)
+        ).fetchone()
         if row is None:
             raise ValueError(f"unknown memory_id: {memory_id}")
         base_confidence = row["confidence"] if confidence is None else confidence
-        new_id = self.remember_memory(content, kind=str(row["kind"]), confidence=base_confidence, evidence=evidence)
+        if source_run is None:
+            source_run = row["source_run"]
+        new_id = self.remember_memory(
+            content, kind=str(row["kind"]), confidence=base_confidence, evidence=evidence, source_run=source_run
+        )
         self.supersede_memory(memory_id, new_id, evidence)
         return new_id
 
@@ -2111,7 +2529,7 @@ class StateStore:
         (skynet/react.py), so the ledger deduplicates one *slot* and not one
         *call*. A run retried after a crash carries a fresh run_id and re-applies
         work the previous attempt already applied, and the same is true inside a
-        single run: measured 2026-09-20 with the real runner, an identical
+        single run: measured with the real runner, an identical
         run_id, step and call_id executes the tool once, while the identical
         run_id and step with a regenerated call_id executes it again - and a
         resumed model turn regenerates the call_id, because ToolCall.call_id is a
@@ -2122,7 +2540,7 @@ class StateStore:
         work after a real SIGKILL. The contract needs the *identity* of the call,
         not its slot, so this reads the stable pair (capability, arguments_hash)
         the ledger already stores. It reports the fact and does not act on it: on
-        the live database (re-measured 2026-09-20, generation 39: 2281 rows) 12
+        the live database (re-measured, generation 39: 2281 rows) 12
         call identities repeat across runs and 8 of those 12 hold different results - ``db(sql="SELECT * FROM
         agent_state")`` returned 9972 bytes in one run and 12114 in the next - so
         serving a recorded result for a repeated pair would answer a live question
@@ -2144,7 +2562,7 @@ class StateStore:
         # A policy warning is a refusal, not an application: ``skynet/tools.py``
         # returns the soft-denial result before running the command, so such a
         # run must not be reported as a run that already applied the call.
-        # Measured on the live ledger 2026-09-22, excluding them leaves all 40
+        # Measured on the live ledger, excluding them leaves all 40
         # announced identities and their ``previous_run_ids`` unchanged and
         # removes the warning-only false positives.
         rows = self.connection.execute(
@@ -2164,7 +2582,7 @@ class StateStore:
         soft-denial result before running the command, so a warning row must not
         count. Counting it made the one live ``same_run_repeat=true`` event a
         false positive (run 92e56e65, whose "prior application" was the warning
-        row), and on the live ledger 2026-09-22 it inflated the in-run repeat
+        row), and on the live ledger it inflated the in-run repeat
         census from the 2 identities that really executed twice to 16. The hard
         denylist (``policy_denied``) never executes either and is excluded by the
         same predicate (see ``_REFUSAL_RESULT_MARKERS``).
@@ -2172,7 +2590,7 @@ class StateStore:
         ``effect_reapplied_runs`` excludes the current run on purpose (it names
         the other runs a reader can compare against), so a call re-issued
         *inside* one run with a regenerated ``ToolCall.call_id`` was invisible to
-        every reader: measured on the live ledger 2026-09-22, 15 identities hold
+        every reader: measured on the live ledger, 15 identities hold
         two rows each inside a single run_id (14 bash, 1 read), all 15 pairs hold
         different results, and no durable event names any of them. This count is
         run-agnostic: it sees both cells of the RESUME CONTRACT's
@@ -2317,19 +2735,39 @@ class StateStore:
         task_id: str | None = None,
         goal_id: str | None = None,
         ttl_seconds: float = 86_400.0,
+        question_key: str | None = None,
     ) -> str:
         """Persist a question to the owner and queue it for delivery.
 
         Durable before anything else: a question that only exists in a prompt is
         lost the moment the run is interrupted. Delivery rides the existing
         outbox lease path, so there is still exactly one transport.
+
+        `question_key` is the CALL identity (`{run_id}:{step}:{call_id}`), and it
+        makes the whole call replayable. `react.py` writes `capability_effects`
+        only after the tool returns, so a crash in that window leaves the owner's
+        question queued with no cached result; the resumed run re-issues the
+        identical call and, with a fresh uuid4 as the key, asked the owner the
+        same question twice - reproduced with the real tool on a fresh store:
+        2 `user_questions` rows and 2 `user_question` outbox rows unpatched, 1
+        patched. This is the same crash-duplication cell as the owner message
+        (arXiv:2608.01710v1), where the row identity must be the call's durable
+        identity rather than a fresh issuance.
+
+        The call identity is NOT the row id. `telegram_bot.handle_answer` routes
+        `/answer <8-char prefix>` and reports an ambiguous prefix as an error, and
+        every call in one run shares the `{run_id}:` prefix - measured: two calls
+        from run 40c694f7 both render as `40c694f7` - so reusing the key as the id
+        would make the owner unable to answer either question. The id is derived
+        from the key instead (`ask-{sha256(key)[:16]}`), which is stable across
+        the replay and distinct per call.
         """
         from uuid import uuid4
 
-        question_id = str(uuid4())
+        question_id = f"ask-{hashlib.sha256(question_key.encode()).hexdigest()[:16]}" if question_key else str(uuid4())
         now_dt = utc_datetime_now()
-        self.connection.execute(
-            "INSERT INTO user_questions(question_id, run_id, task_id, goal_id, question, options, status, created_at, expires_at) "
+        inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO user_questions(question_id, run_id, task_id, goal_id, question, options, status, created_at, expires_at) "
             "VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)",
             (
                 question_id,
@@ -2341,7 +2779,11 @@ class StateStore:
                 utc_now(),
                 (now_dt + timedelta(seconds=max(1.0, ttl_seconds))).isoformat().replace("+00:00", "Z"),
             ),
-        )
+        ).rowcount
+        if not inserted:
+            # A replay of the same call: the row is already durable and queued, so
+            # this is not a new question and must not announce or queue one.
+            return question_id
         self.append_event(
             "question_asked",
             {"question_id": question_id, "question": question[:500], "options": options or []},
@@ -2350,6 +2792,7 @@ class StateStore:
         self.add_outbox(
             "user_question",
             {"question_id": question_id, "question": question, "options": options or [], "expires_at": (now_dt + timedelta(seconds=max(1.0, ttl_seconds))).isoformat().replace("+00:00", "Z")},
+            message_id=question_key,
         )
         return question_id
 
@@ -2497,6 +2940,33 @@ class StateStore:
             (max(1, limit),),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def memory_provenance(self, memories: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+        """Split a memory set into provenance that resolves and provenance that does not.
+
+        ``source_run`` is the only provenance a memory stores, and the retrieval
+        path does not consult it: a row reaches the prompt because it matches the
+        task query or because it is pinned. Counting the split turns
+        retrieval-time provenance into a metric instead of an inference, so a
+        future trust policy has an observable to move. A NULL or unknown
+        ``source_run`` counts as unresolvable, which is the conservative reading:
+        it is provenance that cannot be checked, not provenance that was checked
+        and passed.
+        """
+        rows = [row for row in memories if isinstance(row, Mapping)]
+        candidates = sorted({str(row.get("source_run")) for row in rows if row.get("source_run") is not None})
+        known: set[str] = set()
+        for index in range(0, len(candidates), PROVENANCE_LOOKUP_CHUNK):
+            chunk = candidates[index : index + PROVENANCE_LOOKUP_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            known.update(
+                str(row["run_id"])
+                for row in self.connection.execute(
+                    f"SELECT run_id FROM runs WHERE run_id IN ({placeholders})", chunk
+                ).fetchall()
+            )
+        resolvable = sum(1 for row in rows if str(row.get("source_run")) in known)
+        return {"total": len(rows), "resolvable": resolvable, "unresolvable": len(rows) - resolvable}
 
     def set_memory_pinned(self, memory_id: str, pinned: bool = True) -> bool:
         return bool(self.connection.execute(

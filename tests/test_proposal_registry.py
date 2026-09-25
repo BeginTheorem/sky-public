@@ -2,9 +2,42 @@ import json
 
 from skynet.proposal_registry import (
     EXHAUSTED_FAILURE_CLASS,
+    audit_promotion_liveness,
     resolve_exhausted_environment_blocks,
     sweep_environment_blocks,
 )
+
+
+def test_audit_reports_only_promotions_whose_commit_left_head():
+    """The invariant: a live-claiming record's commit must be an ancestor of HEAD.
+
+    reconcile_awaiting_reboot never revisits an 'accepted' row, so without this
+    check a promotion whose commit was dropped by an external rollback stays
+    'accepted' forever with no recorded rollback reason.
+    """
+    proposals = {
+        "live": {"status": "accepted", "commit": "aaa"},
+        "dropped": {"status": "accepted", "commit": "bbb"},
+        "awaiting": {"status": "awaiting_reboot", "promoted_commit": "bbb"},
+        "never_committed": {"status": "accepted"},
+        "rejected": {"status": "rejected", "commit": "bbb"},
+        "unreadable": {"status": "accepted", "commit": "ccc"},
+    }
+    history = {"aaa": True, "bbb": False, "ccc": None}
+    violations = audit_promotion_liveness(proposals, lambda commit: history[commit])
+    assert [item["proposal_id"] for item in violations] == ["dropped", "awaiting"]
+    assert violations[0]["status"] == "accepted"
+    assert violations[1]["commit"] == "bbb"
+
+
+def test_audit_is_silent_when_every_commit_is_an_ancestor():
+    proposals = {"p1": {"status": "accepted", "commit": "aaa"}, "p2": {"status": "rejected"}}
+    assert audit_promotion_liveness(proposals, lambda commit: True) == []
+
+
+def test_audit_ignores_non_dict_records_and_undecidable_ancestry():
+    proposals = {"junk": "not-a-record", "p1": {"status": "accepted", "commit": "aaa"}}
+    assert audit_promotion_liveness(proposals, lambda commit: None) == []
 
 
 def test_blocked_record_with_terminal_sibling_is_closed():

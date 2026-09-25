@@ -85,6 +85,17 @@ class RebootGuard:
             "proposal_id": str(request.get("proposal_id", "")),
             "started_at": utc_now(),
             "healthy_cycles": 0,
+            # The window size travels with the window: a reader of the durable
+            # bytes sees "N of M" and not a bare count, which is the same
+            # argument that put window_cycles on observe()'s return value.
+            "window_cycles": self.health_window_cycles,
+            # A window is open from the moment this file exists; "active" is
+            # written explicitly so a reader that only looks at the durable
+            # bytes (Reactor._reboot_outcome) can tell an open window from a
+            # finished one. Without it, an open guard had no "active" key at
+            # all, its "in_progress" branch was unreachable, and the start
+            # envelope reported no promotion while a promotion was mid-window.
+            "active": True,
             "failed": False,
             "release": request.get("health", {}).get("release") if isinstance(request.get("health"), dict) else None,
         }
@@ -111,22 +122,34 @@ class RebootGuard:
             self._quarantine(f"invalid reboot guard: {exc}")
             return {"active": False, "ok": True, "changed": True, "quarantined": True, "reason": f"invalid reboot guard: {exc}"}
         if guard.get("active") is False or guard.get("rolled_back"):
-            return {"active": False, "ok": not bool(guard.get("failed")), "completed": bool(guard.get("completed_at")), "rolled_back": bool(guard.get("rolled_back")), "proposal_id": guard.get("proposal_id"), "changed": False}
+            return {"active": False, "ok": not bool(guard.get("failed")), "completed": bool(guard.get("completed_at")), "rolled_back": bool(guard.get("rolled_back")), "commit": guard.get("commit"), "proposal_id": guard.get("proposal_id"), "window_cycles": self.health_window_cycles, "changed": False}
         if self._age_exceeded(guard):
             # A window nobody finished cannot be trusted either way; fail open,
             # keep the bytes for inspection, and let reconciliation decide the
             # proposal from git history.
             self._quarantine(f"stale reboot window older than {self.max_window_age_seconds:g}s")
-            return {"active": False, "ok": True, "changed": True, "quarantined": True, "reason": "stale reboot window", "commit": guard.get("commit"), "proposal_id": guard.get("proposal_id")}
+            return {"active": False, "ok": True, "changed": True, "quarantined": True, "reason": "stale reboot window", "commit": guard.get("commit"), "proposal_id": guard.get("proposal_id"), "window_cycles": self.health_window_cycles}
         if health.get("ok"):
             guard["healthy_cycles"] = int(guard.get("healthy_cycles", 0)) + 1
             if guard["healthy_cycles"] >= self.health_window_cycles:
                 guard["completed_at"] = utc_now()
                 guard["active"] = False
                 self._atomic_write(guard)
-                return {"active": False, "ok": True, "completed": True, "commit": guard.get("commit"), "proposal_id": guard.get("proposal_id"), "changed": True}
+                return {"active": False, "ok": True, "completed": True, "commit": guard.get("commit"), "proposal_id": guard.get("proposal_id"), "healthy_cycles": guard.get("healthy_cycles"), "window_cycles": self.health_window_cycles, "changed": True}
             self._atomic_write(guard)
-            return {"active": True, "ok": True, "healthy_cycles": guard["healthy_cycles"], "changed": True}
+            # The identity travels with every in-window observation: the
+            # supervisor records the returned dict as ``reboot_observation``,
+            # and a window that names neither its commit nor its proposal
+            # cannot be attributed to the promotion it is judging.
+            return {
+                "active": True,
+                "ok": True,
+                "commit": guard.get("commit"),
+                "proposal_id": guard.get("proposal_id"),
+                "healthy_cycles": guard["healthy_cycles"],
+                "window_cycles": self.health_window_cycles,
+                "changed": True,
+            }
         guard["failed"] = True
         guard["failure"] = health
         commit = str(guard["rollback_commit"])

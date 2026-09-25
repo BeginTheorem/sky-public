@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .model_contracts import FINISH_REPORT_SCHEMA, clamp_to_schema, parse_json_object, validate_shape
 from .models import AgentRunResult, ModelTurn, RunStatus, StartEnvelope
@@ -309,7 +309,25 @@ class ReActRunner:
                     start.run_id,
                 )
                 self._record_history(start.run_id, messages)
-                return AgentRunResult(RunStatus.NEEDS_RECOVERY, f"Provider unavailable: {str(exc)[:500]}", step, used_tokens, str(exc))
+                # A provider that dies mid-episode used to return this prose
+                # string as the whole report, erasing the tool calls the episode
+                # had already executed. That is the same erasure the unreadable-
+                # finish path was repaired for, at a second site: measured
+                # on the live ledger, 7 of the 11 needs_recovery runs
+                # died here with 26-85 successful tool calls each (a352322c: 74
+                # over 45 steps / 3.2M tokens; d01cecd8: 85 over 38) and a report
+                # naming none of them -- seven times the volume of the path just
+                # repaired. The status stays NEEDS_RECOVERY and the "Provider
+                # unavailable: ..." prefix is kept verbatim, because reactor.py
+                # persists this report and downstream readers match the prefix;
+                # only the loss of the execution record is removed.
+                return AgentRunResult(
+                    RunStatus.NEEDS_RECOVERY,
+                    self._provider_failure_report(f"Provider unavailable: {str(exc)[:500]}", start.run_id, messages),
+                    step,
+                    used_tokens,
+                    str(exc),
+                )
             model_seconds += turn_seconds
             used_tokens += turn.total_tokens
             # Persist the running totals each turn: the in-memory counters are
@@ -370,6 +388,8 @@ class ReActRunner:
                     self.store.append_event("finish_report", {"step": step + 1, "text": report, "usage_tokens": repair_usage, "repaired": True}, start.run_id)
                     return AgentRunResult(status, report, step + 1, used_tokens + repair_usage)
                 status, report = self._parse_finish_report(report, start.run_id)
+                if status == RunStatus.NEEDS_RECOVERY:
+                    status, report = self._carry_evidence_forward(report, start.run_id, messages)
                 return AgentRunResult(status, report, step + 1, used_tokens)
 
             if phase == "initial":
@@ -406,13 +426,17 @@ class ReActRunner:
                         start.run_id,
                     )
                     self._record_history(start.run_id, messages)
-                    return AgentRunResult(
-                        RunStatus.NEEDS_RECOVERY,
+                    # The queued call is refused, but the calls the episode
+                    # already executed must not vanish from its report: measured
+                    # in the sweep test, this exit discarded a successful tool
+                    # result before the carrier was wired in.
+                    status, report = self._carry_evidence_forward(
                         "ReAct time budget exhausted before tool execution",
-                        step + 1,
-                        used_tokens,
-                        "time budget",
+                        start.run_id,
+                        messages,
+                        situation="time_budget_before_tool",
                     )
+                    return AgentRunResult(status, report, step + 1, used_tokens, "time budget")
                 tool = self.tools.get(call.tool_name)
                 if tool is None:
                     result = {"ok": False, "error": f"unknown tool: {call.tool_name}"}
@@ -435,7 +459,7 @@ class ReActRunner:
                         # `previous_runs` is run-scoped by construction, so a call
                         # re-issued inside this run with a regenerated call_id was
                         # invisible: 15 of the live ledger's 58 repeated
-                        # identities repeat only inside one run (2026-09-22),
+                        # identities repeat only inside one run,
                         # 15/15 with differing results, and no event named any of
                         # them. The run-agnostic count is what makes that cell of
                         # the effect-exactly-once violation (arXiv:2608.03836v3)
@@ -458,8 +482,8 @@ class ReActRunner:
                         # common transition and more for a late-announced identity,
                         # so a reader that needs the current number of other runs
                         # re-derives it from `effect_reapplied_runs` with the
-                        # payload's `arguments_hash` (measured on the live ledger
-                        # 2026-09-20: 12 identities repeat across runs, and the
+                        # payload's `arguments_hash` (measured on the live ledger:
+                        # 12 identities repeat across runs, and the
                         # one-time event understates the worst of them, a `db` query
                         # applied by 10 runs, as 1).
                         if (previous_runs or prior_application_count) and not self.store.effect_reapplied_announced(call.tool_name, arguments_hash):
@@ -565,7 +589,14 @@ class ReActRunner:
                     )
         self._record_history(start.run_id, messages)
         self.store.append_event("budget_exhausted", {"budget": "steps", "steps": steps_limit}, start.run_id)
-        return AgentRunResult(RunStatus.NEEDS_RECOVERY, "ReAct step budget exhausted", steps_limit, used_tokens, "step budget")
+        # Measured on the unmodified tree: an episode that burned its step budget
+        # after a successful tool call (the live probe used two) returned this
+        # bare prose and named none of them. The statuses and the failure label
+        # are unchanged; only the executed-evidence record is no longer dropped.
+        status, report = self._carry_evidence_forward(
+            "ReAct step budget exhausted", start.run_id, messages, situation="step_budget"
+        )
+        return AgentRunResult(status, report, steps_limit, used_tokens, "step budget")
 
     def _context_budget_result(self, messages: list[Message], run_id: str, step: int, used_tokens: int) -> AgentRunResult:
         status, report, finish_usage = self._emergency_finish(messages, run_id)
@@ -580,12 +611,12 @@ class ReActRunner:
         finish_messages.append({"role": "system", "content": "Finish phase. Do not call tools. Return only one JSON object matching the Finish Report contract in the ReAct system prompt."})
         reserve = min(self.config.context_finish_reserve, max(0, self.config.max_tokens // 8))
         if self._request_tokens(finish_messages, []) + reserve >= self.config.max_tokens:
-            return self._local_finish(run_id, reason, "Finish context exceeded the per-request limit")
+            return self._local_finish(messages, run_id, reason, "Finish context exceeded the per-request limit")
         try:
             turn, _turn_seconds = self._complete_with_retry(finish_messages, max_tokens=self.config.output_tokens, tools=[], run_id=run_id, step=-1)
         except Exception as exc:
             self.store.append_event("finish_failure", {"error": str(exc)[:1000]}, run_id)
-            return self._local_finish(run_id, reason, f"Provider Finish failed: {str(exc)[:300]}")
+            return self._local_finish(messages, run_id, reason, f"Provider Finish failed: {str(exc)[:300]}")
         report = turn.text.strip()
         self._record_history(run_id, [*messages, {"role": "assistant", "content": report}])
         parsed_report = self._read_finish_report(report, run_id)
@@ -598,8 +629,11 @@ class ReActRunner:
                 self.store.append_event("finish_report", {"text": report, "usage_tokens": repair_usage, "forced": reason != "normal", "reason": reason, "repaired": True}, run_id)
                 return status, report, turn.total_tokens + repair_usage
             if not report:
-                return RunStatus.NEEDS_RECOVERY, f"Finish Report missing ({reason})", turn.total_tokens
+                status, carried = self._carry_evidence_forward(f"Finish Report missing ({reason})", run_id, messages)
+                return status, carried, turn.total_tokens
             status, report = self._parse_finish_report(report, run_id)
+            if status == RunStatus.NEEDS_RECOVERY:
+                status, report = self._carry_evidence_forward(report, run_id, messages)
             return status, report, turn.total_tokens
         status, report = parsed_report
         self.store.append_event("finish_report", {"text": report, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens, "forced": reason != "normal", "reason": reason}, run_id)
@@ -663,6 +697,149 @@ class ReActRunner:
         a run that executed nothing loses nothing by being retried normally.
         """
         return any(message.get("role") == "tool" for message in messages)
+
+    @staticmethod
+    def _succeeded_tool_names(messages: list[Message]) -> list[str]:
+        """The tools the episode actually ran successfully, in order.
+
+        Three conditions, each of which a weaker reading of "a tool ran" would
+        drop. Only a ``tool`` message proves execution, because an assistant
+        message carrying ``tool_calls`` is the request. A call the harness
+        refused -- an unknown tool name, a policy denial -- still appends a
+        ``tool`` message, so the result must also report ``ok`` as not False.
+        The name is taken from the request that preceded the result, not from
+        the payload, so a result cannot rename the tool that produced it.
+        """
+        names: list[str] = []
+        requested: list[str] = []
+        for message in messages:
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if isinstance(function, dict):
+                        requested.append(str(function.get("name", "")))
+            elif message.get("role") == "tool":
+                name = requested.pop(0) if requested else ""
+                try:
+                    payload = json.loads(str(message.get("content", "")))
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, dict) or payload.get("ok") is False:
+                    continue
+                if name:
+                    names.append(name)
+        return names
+
+    # Every non-COMPLETED AgentRunResult that can be reached after a successful
+    # tool call must route its report through this carrier (or through ``_finish``
+    # and ``_provider_failure_report``, which call it). The census of the sites is
+    # asserted by ``test_every_agent_run_result_exit_carries_executed_evidence``;
+    # this table is what makes a new situation a two-line addition instead of a
+    # fourth copy of the same reasoning.
+    EVIDENCE_CARRY_SITUATIONS: ClassVar[dict[str, tuple[str, str]]] = {
+        "finish_unreadable": (
+            "The closing turn was not a readable Finish Report and the repair turn failed",
+            "the model returned no readable Finish Report after two attempts",
+        ),
+        "provider_unavailable": (
+            "The model turn failed with the provider unavailable",
+            "the provider was unavailable and no readable report could be produced",
+        ),
+        "time_budget_before_tool": (
+            "The time budget was exhausted before the queued tool call could run",
+            "the model-time budget ended the episode before a tool call could be executed",
+        ),
+        "step_budget": (
+            "The step budget was exhausted before the episode could close",
+            "the step budget ended the episode before it returned a readable report",
+        ),
+        "harness_stop": (
+            "The harness stopped the cycle safely",
+            "the harness stopped the cycle before the model returned a readable report",
+        ),
+    }
+
+    def _carry_evidence_forward(
+        self, report: str, run_id: str, messages: list[Message], *, situation: str = "finish_unreadable"
+    ) -> tuple[RunStatus, str]:
+        """Close an unreadable episode without discarding the work it did.
+
+        The parser refuses prose and empty replies on purpose -- accepting any
+        text as COMPLETED closed tasks with no durable change -- but the refusal
+        used to replace the whole report with the parser's error string, so an
+        episode that had executed dozens of tool calls ended with a report that
+        named none of them. Measured on the live ledger: three runs
+        (9b944e12, 8869a882, b01c5fdb) finished needs_recovery with
+        ``failure=''`` and a report that was the bare string "Finish Report
+        invalid: structured model response contains no acceptable JSON value",
+        after 96, 28 and 49 successful tool results respectively. Only a
+        successful call counts: a refused or unknown-tool call changed nothing,
+        so its episode is the no-work control and keeps the bare rejection.
+
+        The status stays NEEDS_RECOVERY -- a report nobody could read is still
+        not a verified completion -- and only the evidence is carried over, so
+        this can lose no verification, only stop erasing an execution record.
+        An episode with no executed tool call is returned unchanged.
+        """
+        executed = self._succeeded_tool_names(messages)
+        if not executed:
+            return RunStatus.NEEDS_RECOVERY, report
+        evidence = [f"executed tool: {name}" for name in executed]
+        why, blocker = self.EVIDENCE_CARRY_SITUATIONS.get(
+            situation, self.EVIDENCE_CARRY_SITUATIONS["finish_unreadable"]
+        )
+        carried = json.dumps({
+            "status": "NEEDS_RECOVERY",
+            "summary": (
+                f"{why}; "
+                f"{len(executed)} tool call(s) did execute, so their evidence is carried forward "
+                f"instead of being discarded. Reported error: {report[:300]}"
+            ),
+            "evidence": evidence or ["no evidence recorded"],
+            "actions": [f"tool call: {name}" for name in executed],
+            "changes": [],
+            "tests": [],
+            "blocker": blocker,
+            "next_hypothesis": "retry the finish turn with the episode's tool results; the work itself already ran",
+        }, ensure_ascii=False)
+        self.store.append_event(
+            "finish_evidence_carried",
+            {
+                "tool_calls": len(executed),
+                "tools": executed[:20],
+                "reason": situation,
+                "parser_error": report[:300],
+            },
+            run_id,
+        )
+        return RunStatus.NEEDS_RECOVERY, carried
+
+    def _provider_failure_report(self, report: str, run_id: str, messages: list[Message]) -> str:
+        """Keep the ``Provider unavailable: ...`` text and stop erasing the work.
+
+        The prefix is preserved verbatim because ``reactor.py`` stores this
+        return value as the run row's report and downstream readers match the
+        prefix. What changes is that a report which carries executed evidence
+        becomes a readable JSON object naming the tools the episode had already
+        run, so a recovered episode holds its own record of what it did. An
+        episode with no successful tool call keeps the bare prose string, exactly
+        like the unreadable-finish control, and records no carried event.
+        """
+        if not self._succeeded_tool_names(messages):
+            return report
+        status, carried = self._carry_evidence_forward(report, run_id, messages, situation="provider_unavailable")
+        if status != RunStatus.NEEDS_RECOVERY:
+            return report
+        try:
+            data = json.loads(carried)
+        except ValueError:
+            return report
+        data["summary"] = f"{report}. {data['summary']}"
+        data["blocker"] = report
+        data["next_hypothesis"] = (
+            "retry the same episode once the provider is reachable; the tool work already ran and is recorded in evidence"
+        )
+        return json.dumps(data, ensure_ascii=False)
 
     def _repair_finish_report(
         self,
@@ -732,9 +909,15 @@ class ReActRunner:
         )
         return status, parsed_report, turn.total_tokens
 
-    def _local_finish(self, run_id: str, reason: str, detail: str) -> tuple[RunStatus, str, int]:
+    def _local_finish(self, messages: list[Message], run_id: str, reason: str, detail: str) -> tuple[RunStatus, str, int]:
         report = f"Finish Report (harness): cycle stopped safely. Reason: {reason}. {detail}. Full evidence remains in the durable event log."
         self.store.append_event("finish_report", {"text": report, "usage_tokens": 0, "forced": True, "local": True, "reason": reason}, run_id)
+        # A harness stop is not the episode's fault, but it is still a stop after
+        # work: measured in the sweep test, this exit discarded six successful
+        # tool results and returned the harness sentence alone. An episode with
+        # no executed tool call keeps that sentence verbatim.
+        _status, carried = self._carry_evidence_forward(report, run_id, messages, situation="harness_stop")
+        report = carried
         # A harness-generated stop is not verified work; keep the run
         # recoverable so the task is retried instead of silently completed.
         # The deferred-restart path upgrades this to COMPLETED only when a
@@ -1150,7 +1333,7 @@ class ReActRunner:
         nothing in the bounded form said where it went, so the removal was
         silent and the preview was the only surviving copy in the log.
 
-        Measured on the live ledger 2026-09-20 (generation 40): of 2347
+        Measured on the live ledger (generation 40): of 2347
         `tool_result` events, 142 were truncated, holding 528,000 bytes of
         preview; all 142 full results were still present in `capability_effects`
         and would have been reachable from an emitted key.
@@ -1159,7 +1342,7 @@ class ReActRunner:
         `tool_result` event carries it -- yet the step is not needed to recover a
         payload, because `call_id` is unique within a run and `record_effect`
         stores exactly one row per `run_id:step:call_id`. Re-measured
-        2026-09-20 (generation 42) on the 33 folded events emitted before this
+        (generation 42) on the 33 folded events emitted before this
         key existed: all 33 resolve by `(run_id, call_id)` alone, 0 ambiguous,
         0 missing. The emitted key therefore buys a direct row name instead of a
         two-column join; what it is actually required for is keeping the

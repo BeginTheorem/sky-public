@@ -22,6 +22,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         base_url: str,
         api_key: str,
         model: str,
+        name: str = "openrouter",
         timeout_seconds: float = 30.0,
         max_attempts: int = 3,
         retry_delay_seconds: float = 1.0,
@@ -30,7 +31,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         reject_reasoning_leakage: bool = False,
     ) -> None:
         super().__init__(
-            name="openrouter",
+            name=name,
             base_url=base_url,
             api_key=api_key,
             model=model,
@@ -163,10 +164,18 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                     content = delta.get("content")
                     if isinstance(content, str) and content:
                         text_parts.append(content)
-                    # Providers differ in the spelling of the reasoning channel
-                    # (``reasoning`` vs ``reasoning_content``). Read the aliases
-                    # first-non-empty-per-delta, so a provider that sends both
-                    # cannot have the same text counted twice.
+                    # OpenRouter names the reasoning channel differently from the
+                    # OpenAI-compatible spelling. Measured on the live wire
+                    # (175 chunks of one finish request): the delta
+                    # vocabulary is ``reasoning`` in 97 chunks plus
+                    # ``reasoning_details``, and ``reasoning_content`` never
+                    # appears. Reading only ``reasoning_content`` therefore left
+                    # ``ModelTurn.reasoning_content`` empty on every openrouter turn,
+                    # so a turn whose tokens went to the reasoning channel was
+                    # indistinguishable from one that returned nothing. The
+                    # aliases are read first-non-empty-per-delta so a provider
+                    # that sends both spellings cannot have the same text
+                    # counted twice.
                     for key in ("reasoning_content", "reasoning"):
                         reasoning = delta.get(key)
                         if isinstance(reasoning, str) and reasoning:
@@ -206,10 +215,13 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         if not saw_done and finish_reason is None:
             # A stream is terminated by *either* protocol terminator: the
             # ``[DONE]`` sentinel or a terminal ``finish_reason``. Requiring the
-            # sentinel alone discards a completed response whose tool calls and
-            # usage already arrived in full. A stream that closed with neither
-            # terminator was really cut off mid-generation, so that case stays a
-            # retryable transport failure.
+            # sentinel alone discarded a completed response whose tool calls and
+            # usage had already arrived in full. Live evidence: three
+            # ``fallback_failure`` records "openrouter SSE stream ended before
+            # [DONE]"; the last two ended the ReAct episode at
+            # step 24 and step 39 with ``needs_recovery``. A stream that closed
+            # with neither terminator really was cut off mid-generation, so that
+            # case stays a retryable transport failure.
             raise ProviderError(
                 "openrouter SSE stream ended before [DONE]",
                 category="network",
@@ -224,6 +236,19 @@ class OpenRouterProvider(OpenAICompatibleProvider):
             raise ProviderError("openrouter returned malformed streamed tool call", category="invalid_response", provider=self.name, model=self.model) from exc
         text = "".join(text_parts)
         reasoning_content = "".join(reasoning_parts)
+        if finish_reason == "length" and not text.strip() and not calls:
+            # The same guard as the OpenAI-compatible path: a ceiling stop with
+            # no visible content is a provider failure, not an answer. Measured
+            # on the live run: this provider stopped at completion_tokens 2240
+            # with an empty text and the ladder counted it as a success.
+            raise ProviderError(
+                "openrouter stopped at the output ceiling with no visible content",
+                category="response_quality",
+                retryable=True,
+                cooldown_seconds=2.0,
+                provider=self.name,
+                model=self.model,
+            )
         if self.reject_reasoning_leakage and not calls and _looks_like_reasoning_leak(text, reasoning_content):
             raise ProviderError(
                 "openrouter returned reasoning leakage instead of a final response",

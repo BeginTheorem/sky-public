@@ -6,25 +6,28 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock, current_thread, main_thread
 from typing import Any
 
 from . import metrics
 from .autonomous_planner import AutonomousPlanner
+from .checkpoints import CheckpointError, CheckpointManager
 from .dialogue import AcknowledgeInboxTool, AskUserTool, ReadInboxTool, SendMessageToUserTool
 from .judge_health import DEFAULT_COOLDOWN_SECONDS, DEFAULT_MIN_SAMPLES, DEFAULT_THRESHOLD, DEFAULT_WINDOW, check_judge_health, restart_boundary
 from .memory import MemoryLoop, MemoryResult
+from .memory_audit import checkpoint_memory_audit
 from .memory_store import MemoryStore
 from .memory_tool import MemoryTool
 from .model_contracts import SYSTEM, SYSTEM_MEMORY, SYSTEM_REACT
-from .models import AgentState, Budget, LifecycleState, ModelTurn, RunRecord, RunStatus, StartEnvelope
+from .models import AgentRunResult, AgentState, Budget, LifecycleState, ModelTurn, RunRecord, RunStatus, StartEnvelope
 from .plan_tool import PLAN_OBSERVATION_EVENT_KIND, RecordPlanTool, latest_recorded_plan, plan_preceded_first_mutation
 from .planner import PortfolioPlanner, hypothesis_fingerprint, structural_fingerprint
 from .provider import LLMProvider, Message, Tool, ToolSchema
@@ -75,7 +78,7 @@ REACT_LOOP_ROLE_SUFFIX = "You are the bounded Agent Run. The harness owns lifecy
 # Tools that always leave a `capability_effects` row (`react.py:398` records one
 # per executed call). A Finish Report `actions` entry naming one of these as the
 # instrument of the action, with no row for the run, is a contradicted claim and
-# not a summary style choice -- measured on 2026-09-21: run 6c5567e5 claimed
+# not a summary style choice -- measured: run 6c5567e5 claimed
 # send_message_to_user with zero ledger rows while every truthful claim had one.
 UNVERIFIED_CLAIM_TOOLS = frozenset({
     "send_message_to_user",
@@ -92,7 +95,7 @@ UNVERIFIED_CLAIM_PATTERNS = {
 # names a path with a slash and a file extension. The schema allows arbitrary
 # strings and the ReAct instruction tells the model NOT to list scratch
 # prototypes, so prose like "No durable code change: propose_self_improvement
-# was not called" is a denial, not a claim. Measured 2026-09-21: all four live
+# was not called" is a denial, not a claim. Measured: all four live
 # `uncaptured_changes` events were exactly such prose denials and two finished
 # tasks were reopened for them.
 _REPO_PATH_PATTERN = re.compile(r"(?:^|[\s(])(/?(?:[\w.-]+/)+[\w.-]+\.[A-Za-z0-9]+)(?::\d+)?")
@@ -122,7 +125,7 @@ class TurnShapeRecorder:
     turn it received: skynet/react.py:748 writes ``reasoning_chars`` for the ReAct
     loop and skynet/memory.py:150 writes ``text_chars``/``completion_tokens`` for
     the memory loop, but the planner parses only ``turn.text``. Measured on the
-    live ledger 2026-09-21: attempts ff4de96e (generation 76) and 2352db7e both
+    live ledger: attempts ff4de96e (generation 76) and 2352db7e both
     ended in ``planner_invalid_response`` with "reply preview: '', 0 chars" for
     the call AND its repair retry, and the post-mortem could not say whether the
     model returned nothing or spent its tokens on the provider's reasoning
@@ -274,6 +277,23 @@ class ReactorConfig:
     # carries a generation suffix, so without a cap the same template was
     # recreated every cycle; it may reappear only after this many generations.
     fallback_repeat_generations: int = 4
+    # The generation counter only advances after a *completed* run, so on the
+    # no-work path (planner failing, fallback capped) it freezes and a
+    # generation-only window can never expire. That locked the safety net out
+    # of the stall for seven hours. A wall-clock ceiling guarantees
+    # the cap releases even when the generation is stuck.
+    fallback_repeat_seconds: float = 900.0
+    # The watchdog only ever watched an *active* run, so "process alive but no
+    # run ever starts" had no observer: the stall ran seven hours
+    # with zero alerts. This is the wall-clock budget after which a live process
+    # that has completed no run since the last restart is escalated to the
+    # owner. A non-positive value disables the check.
+    stall_alert_seconds: float = 3600.0
+    # The outward valve was cadence-gated by the generation modulus alone, and
+    # the generation freezes on the no-work path exactly like the fallback cap
+    # did. A wall-clock floor opens the boundary even when no run completes, so
+    # a stalled organism can still be pulled out by an external look.
+    external_seek_min_seconds: float = 3600.0
     # A criterion epoch fixes what "good" means for a span of generations. The
     # boundary is only recorded for now: it gives a later, non-stationary
     # utility an anchor without changing the criterion itself.
@@ -439,10 +459,25 @@ class Reactor:
                 # Internal exhaustion is a signal to look outward, not to stop.
                 selected_work = self._seek_external_evidence(state, goals, reason="internal exhaustion")
             if selected_work is None:
+                # Per-cycle housekeeping and the judge check used to live only
+                # after a completed run, so a cycle that selected no work
+                # returned early and skipped them: the stall produced
+                # no judge event, no maintenance and no metrics for seven hours.
+                # Each is idempotent (daily markers, alert dedup), so running
+                # them here is safe and never double-runs within a cycle. The
+                # progress check is the one observer for "alive but not
+                # working", which the run watchdog structurally cannot see.
+                self._run_per_cycle_housekeeping()
+                self._check_progress_stall(state)
                 return self._sleep_without_work(state, "autonomous planner and bounded fallback produced no ready task")
             memory_query = self._memory_query(selected_work, inbox_events, state.next_plan)
             memory_context = self.store.search_memories(memory_query, limit=self.config.memory_inject_limit) if memory_query else []
             pinned_memories = self.store.pinned_memories(limit=self.config.pinned_memory_limit)
+            # Every memory that reaches the prompt is recorded together with its
+            # provenance: a NULL or unknown source_run is provenance that cannot
+            # be checked, and until now the retrieval path did not distinguish it
+            # from a memory this organism actually wrote.
+            injected_provenance = self.store.memory_provenance([*memory_context, *pinned_memories])
             start = StartEnvelope(
                 wake_cause=wake_cause,
                 observations=[{"kind": "durable_state", "generation": state.generation}],
@@ -470,6 +505,12 @@ class Reactor:
                     "query_terms_effective": len(MemoryStore._normalize_terms(memory_query)),
                     "hits": len(memory_context),
                     "pinned": len(pinned_memories),
+                    # Retrieval ignores provenance today, so the count of injected
+                    # memories whose source_run does not resolve is the observable
+                    # that makes that gap measurable instead of inferred.
+                    "injected_total": injected_provenance["total"],
+                    "injected_resolvable": injected_provenance["resolvable"],
+                    "injected_unresolvable": injected_provenance["unresolvable"],
                     "top_kinds": [item.get("kind") for item in memory_context[:3]],
                     # The fused scores are recorded because equal-K rank fusion
                     # compresses them into a near-flat band (measured spread
@@ -590,12 +631,36 @@ class Reactor:
             # is never reached. Record the degraded result here so retention
             # keeps the post-mortem that the runtime log alone carried.
             memory_degraded = memory_succeeded and str((memory_result.evaluation or {}).get("status") or "") == "degraded"
+            memory_capture_pending = False
             if memory_degraded:
+                memory_error = str((memory_result.evaluation or {}).get("error", ""))[:1000]
                 self.store.append_event(
                     "memory_degraded",
-                    {"error": str((memory_result.evaluation or {}).get("error", ""))[:1000]},
+                    {"error": memory_error},
                     start.run_id,
                 )
+                # The episode is over and this loop is never retried, so a
+                # degraded pass used to end with the whole episode's memory work
+                # simply dropped: run e7e36432 lost it to one provider fault.
+                # Leave a durable pointer to the evidence that still exists
+                # (the frozen episode snapshot and the transcript) so the
+                # capture is recoverable rather than gone. Best effort: failing
+                # to record the loss must never turn a completed run into a
+                # failed one.
+                try:
+                    self.store.record_pending_memory_capture(
+                        start.run_id,
+                        error=memory_error,
+                        transcript_rows=len(self.store.recent_transcript(start.run_id)),
+                        events=len(episode),
+                    )
+                    memory_capture_pending = True
+                except (OSError, RuntimeError, sqlite3.Error) as exc:
+                    self.store.append_event(
+                        "memory_capture_pending_failed",
+                        {"error": str(exc)[:500]},
+                        start.run_id,
+                    )
             if memory_succeeded and (memory_result.dropped_fields or memory_result.rejected_sections):
                 # A salvaged reply is not a degradation: record what the harness
                 # had to tolerate so a repeated undeclared key stays visible.
@@ -616,7 +681,19 @@ class Reactor:
                         start.run_id,
                     )
                     if memory_succeeded:
-                        self.store.append_event("memory_loop_finished", {"memory_candidates": len(memory_result.memory_candidates), "degraded": memory_degraded}, start.run_id)
+                        self.store.append_event(
+                            "memory_loop_finished",
+                            {
+                                "memory_candidates": len(memory_result.memory_candidates),
+                                "degraded": memory_degraded,
+                                # True only when the degraded pass left a
+                                # durable record naming the run it could not
+                                # capture; a reader must never infer a lost
+                                # episode from `degraded` alone.
+                                "pending_capture": memory_capture_pending,
+                            },
+                            start.run_id,
+                        )
                     consolidation = self.store.consolidate_versioned(snapshot["snapshot_id"], start.run_id, memory_result.memory_candidates)
                     memory_count = consolidation["memory_count"]
                     self.store.append_event("memory_consolidated", consolidation, start.run_id)
@@ -776,12 +853,111 @@ class Reactor:
                         })
                     if result.control_action.get("type") == "restart_after_checkpoint":
                         deferred_restart = dict(result.control_action)
-                        state.next_plan["self_improvement_recovery"] = {
+                        # The next start envelope carries the promotion-liveness
+                        # observation for this very window (``reboot_outcome``),
+                        # so asking for a re-verification the envelope already
+                        # answers is the confirmation tax this block was
+                        # measuring. Measured on the live event log:
+                        # 81 of 109 run_started envelopes carried the hint, each
+                        # in exactly the run the window covered, 20-39 event rows
+                        # after its own promotion. The hint is kept only when the
+                        # guard row cannot answer for itself.
+                        #
+                        # The verdict must be read for the window the block
+                        # NAMES. ``reboot_outcome`` was read at wake, so here it
+                        # still describes the window that was open *before* this
+                        # promotion: the run that promoted d275d4b8 read the
+                        # terminal window in front of it and wrote
+                        # ``resolved: false`` plus the imperative for a promotion
+                        # that was live -- its own start envelope (event_log
+                        # 17949) carried reboot_outcome outcome=in_progress,
+                        # head=d275d4b8, live=true. So the guard is re-read for
+                        # the promoted commit, and the wake observation is kept
+                        # only when there is no row to read.
+                        promotion_commit = str(deferred_restart.get("commit") or "")
+                        verdict = self._reboot_outcome(promotion_commit) if promotion_commit else {}
+                        # Whether the row that answered is about THIS promotion.
+                        # Truthiness is not the question: any guard row at all
+                        # made this True, so the window of the PREVIOUS promotion
+                        # answered for the new one. Measured on the live event
+                        # log: all 8 unresolved_because strings ever written are
+                        # that misattribution -- e.g. the promotion of 324d958a
+                        # was recorded resolved=false, live=false, "the reboot
+                        # window already ended (outcome=accepted)", while the row
+                        # that answered named the earlier commit e3fb1093 and
+                        # the promoted window was in fact open and live. A row
+                        # names the promotion only when it carries its commit.
+                        verdict_names_the_promotion = (
+                            bool(verdict)
+                            and str(verdict.get("commit") or "") == promotion_commit
+                        )
+                        if not verdict:
+                            verdict = reboot_outcome
+                        live = (
+                            verdict.get("outcome") == "in_progress"
+                            and verdict.get("live") is True
+                        )
+                        block: dict[str, Any] = {
                             "proposal_id": deferred_restart.get("proposal_id"),
                             "commit": deferred_restart.get("commit"),
-                            "next": "verify the promoted self-improvement after reboot",
-                            "checks": ["service starts", "database opens", "provider is reachable", "health window completes"],
+                            "resolved": live,
+                            "live": live,
                         }
+                        if live:
+                            # The verdict travels with the plan instead of a bare
+                            # boolean: the start path of THIS run already read
+                            # head == promoted commit, so the next run can read the
+                            # values back rather than re-deriving them with
+                            # `git rev-parse HEAD` (the confirmation tax measured:
+                            # 81 of 109 envelopes carried the hint).
+                            block["resolved_by"] = "reboot_outcome in this run's start envelope (head == promoted commit, live=true)"
+                            block["outcome"] = verdict.get("outcome")
+                            block["head"] = verdict.get("head")
+                            # The progress counters belong to the window they
+                            # were read from. A row that does not name the
+                            # promoted commit describes the window that closed
+                            # before it, so its "N of M healthy cycles" is not
+                            # this promotion's progress and is omitted rather
+                            # than reported as its own -- the same rule the
+                            # unresolved branch already applies to a
+                            # pre-``begin`` row. Measured on the live plan
+                            # ledger: all 11 resolved blocks carried the
+                            # previous window's ``healthy_cycles``.
+                            if verdict_names_the_promotion:
+                                cycles = verdict.get("window_cycles")
+                                if isinstance(cycles, int) and not isinstance(cycles, bool):
+                                    block["window_cycles"] = cycles
+                                healthy = verdict.get("healthy_cycles")
+                                if isinstance(healthy, int) and not isinstance(healthy, bool):
+                                    block["healthy_cycles"] = healthy
+                        else:
+                            # An unresolved block must not assert the verdict it
+                            # failed to observe (it used to claim
+                            # "outcome=in_progress, live=true" even here), and it
+                            # must say WHICH observation failed: no readable
+                            # window, a window that already ended, or an open
+                            # window naming a commit HEAD is not on.
+                            if not verdict:
+                                block["unresolved_because"] = "no reboot window is readable in state/reboot-guard.json"
+                            elif not verdict_names_the_promotion:
+                                block["unresolved_because"] = (
+                                    "no reboot window names the promoted commit "
+                                    f"{promotion_commit or 'unknown'}"
+                                )
+                            elif verdict.get("outcome") != "in_progress":
+                                block["unresolved_because"] = (
+                                    "the reboot window already ended "
+                                    f"(outcome={verdict.get('outcome')})"
+                                )
+                            else:
+                                block["unresolved_because"] = (
+                                    "the open reboot window names "
+                                    f"{verdict.get('commit')} but HEAD is "
+                                    f"{verdict.get('head') or 'unknown'}"
+                                )
+                            block["next"] = "verify the promoted self-improvement after reboot"
+                            block["checks"] = ["service starts", "database opens", "provider is reachable", "health window completes"]
+                        state.next_plan["self_improvement_recovery"] = block
                     # Shared context across cycles: the plan this run recorded is
                     # carried into the NEXT StartEnvelope (which serializes
                     # state.next_plan) under a distinct key, so it cannot clobber
@@ -868,15 +1044,24 @@ class Reactor:
                     if pruned["transcript"] or pruned["episodes"]:
                         self.store.append_event("history_pruned", {**pruned, "keep_runs": self.config.transcript_retention_runs}, start.run_id)
                     self.store.transition(state, LifecycleState.SLEEP, run_id=start.run_id, reason="checkpoint complete")
-            if self.config.metrics_snapshot_enabled:
-                self._record_daily_metrics()
-            # Retention and decay are maintenance, not metrics: gating them on
-            # the snapshot flag silently disabled them when snapshots were off.
-            self._maybe_run_daily_maintenance()
-            # The judge-health check is per-cycle, not daily: a broken planner
-            # contract must not degrade silently for a day. Its durable alert
-            # dedup window is the rate limit, and it never gates maintenance.
-            self._check_judge_health()
+            self._run_per_cycle_housekeeping()
+            # The memory audit is metadata-only and append-only: it records the
+            # fact, the time and the size of every memory change and never the
+            # content, so a change made outside this process is observable
+            # without the log becoming a channel back into the mind. It runs
+            # after maintenance so a decay pass is inside the checkpoint too,
+            # and an episode killed before reaching this line is exactly the
+            # case the next startup reports as a change.
+            audit = checkpoint_memory_audit(
+                self.store.connection,
+                Path(self.config.state_path).parent,
+                reason="episode_end",
+                run_id=start.run_id,
+                generation=state.generation,
+            )
+            if audit.get("status") != "recorded" or audit.get("chain_broken_at") is not None:
+                log.warning("memory audit checkpoint anomaly: %s", audit)
+                self.store.append_event("memory_audit_anomaly", audit, start.run_id)
             if deferred_restart:
                 self._request_self_improvement_restart(deferred_restart)
             return result.status
@@ -910,13 +1095,6 @@ class Reactor:
             raise
         finally:
             self._run_lock.release()
-
-    def _self_improvement_health(self) -> dict[str, object]:
-        state = self.store.state()
-        return {
-            "ok": state.lifecycle in HEALTHY_LIFECYCLES,
-            "lifecycle": state.lifecycle.value,
-        }
 
     def _apply_memory_updates(self, memory_result: MemoryResult, selected_work: dict[str, Any], run_id: str, result_status: RunStatus) -> None:
         task = selected_work.get("task") if selected_work.get("kind") == "task" else None
@@ -967,19 +1145,28 @@ class Reactor:
         return sorted(senses)
 
     def _external_seek_due(self, state: AgentState) -> bool:
-        """Cadence plus a durable cooldown: no in-memory counter to lose on restart."""
-        if state.generation % max(1, self.config.external_seek_every_generations) != 0:
-            return False
+        """Cadence plus a durable cooldown: no in-memory counter to lose on restart.
+
+        The generation modulus alone freezes on the no-work path, where the
+        counter never advances, so the valve is also opened by a wall-clock
+        floor. That is the same deadlock the fallback cap hit: a
+        cadence keyed on a counter that stops moving never expires, so a stalled
+        organism could never look outward. The cooldown still gates both paths.
+        """
+        cadence = max(1, self.config.external_seek_every_generations)
         row = self.store.connection.execute(
             "SELECT created_at FROM event_log WHERE kind='external_seek_created' ORDER BY sequence DESC LIMIT 1"
         ).fetchone()
         if row is None:
-            return True
+            return state.generation % cadence == 0
         try:
             last = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
         except (ValueError, TypeError):
             return True
-        return (utc_datetime_now() - last).total_seconds() >= self.config.external_seek_cooldown_seconds
+        elapsed = (utc_datetime_now() - last).total_seconds()
+        if elapsed < self.config.external_seek_cooldown_seconds:
+            return False
+        return state.generation % cadence == 0 or elapsed >= self.config.external_seek_min_seconds
 
     def _seek_external_evidence(self, state: AgentState, goals: list[dict[str, Any]], *, reason: str = "internal exhaustion") -> dict[str, Any] | None:
         """The harness opens the boundary on a cadence or on internal exhaustion.
@@ -1149,6 +1336,71 @@ class Reactor:
             state.next_plan = {"next": "run autonomous planning on next wake", "reason": reason}
             self.store.set_state(state)
             self.store.append_event("planner_backoff", {"reason": reason, "retry_count": state.retry_count, "delay_seconds": delay})
+
+    def _check_progress_stall(self, state: AgentState) -> None:
+        """Escalate a live process that has stopped completing runs.
+
+        The run watchdog only ever watches an *active* run, so a process that
+        never starts one has no observer at all: the stall ran for
+        seven hours with no alert and no judge event. This is the wall-clock
+        complement.
+
+        The reference is the later of this process's own start and the last
+        *completed* run. The process start comes from the durable
+        ``supervisor_start`` event, not from ``reboot-guard.json``: the guard is
+        written only for an organism-initiated reboot, so after a normal restart
+        it is left stale (measured: a guard from 03:06 while the process started
+        at 13:46), and using it would fire the alert on the first cycle of every
+        restart after an hour of downtime. A reactor driven without the
+        supervisor falls back to the guard and then to "no boundary". Only a
+        completed run counts as progress: runs that keep starting and failing
+        never complete, and that gap is exactly what this observer must close.
+        The alert's durable dedup window is the rate limit, so a stall cannot
+        spam the owner even though the check runs every no-work cycle.
+        """
+        if self.config.stall_alert_seconds <= 0:
+            return
+
+        def _parse(value: Any) -> datetime | None:
+            if value is None:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+        started = self.store.connection.execute(
+            "SELECT created_at FROM event_log WHERE kind='supervisor_start' ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        process_start = _parse(started["created_at"]) if started is not None else None
+        if process_start is None:
+            process_start = _parse(restart_boundary(Path(self.config.state_path).parent))
+        completed = self.store.connection.execute(
+            "SELECT finished_at FROM runs WHERE status='completed' AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
+        ).fetchone()
+        moments = [
+            moment
+            for moment in (process_start, _parse(completed["finished_at"]) if completed is not None else None)
+            if moment is not None
+        ]
+        if not moments:
+            return
+        elapsed = (utc_datetime_now() - max(moments)).total_seconds()
+        if elapsed < self.config.stall_alert_seconds:
+            return
+        self.store.raise_alert(
+            "no_progress_stall",
+            {
+                "seconds_since_progress": round(elapsed, 1),
+                "threshold_seconds": self.config.stall_alert_seconds,
+                "generation": state.generation,
+                "retry_count": state.retry_count,
+            },
+            severity="warning",
+            dedup_key="no-progress-stall",
+            dedup_window_seconds=max(3600.0, self.config.stall_alert_seconds),
+        )
 
     def _record_no_active_goal(self, state: AgentState, inbox_events: list[dict[str, Any]]) -> None:
         """Record an active-goal gap once per generation, never every tick.
@@ -1406,8 +1658,26 @@ class Reactor:
             "note": "modified tracked files block a proposal and are quarantined; revert or quarantine them before proposing",
         }
 
-    def _reboot_outcome(self) -> dict[str, Any]:
-        """Report how the organism's own last promotion ended."""
+    def _reboot_outcome(self, expected_commit: str | None = None) -> dict[str, Any]:
+        """Report how the organism's own last promotion ended.
+
+        An open window is reported as ``in_progress``, and the promoted commit
+        is checked against the tree actually running. Measured on
+        the live event log: of 81 promotions carrying a restart, 55 produced
+        no reboot_observation row at all and only 2 ever produced a terminal
+        one, yet 80 of 108 run envelopes carried the "verify the promoted
+        self-improvement after reboot" hint. The window was durable but
+        anonymous, so every cycle paid a re-verification it could not answer
+        from state.
+
+        ``RebootGuard.begin`` now writes ``active`` explicitly, which is what
+        makes the ``in_progress`` branch reachable: before that, an open guard
+        had no ``active`` key, so the branch could never fire and the organism
+        was never told a promotion was mid-window. ``head`` is read from the
+        same worktree the proposal path uses, so a ``stale`` window -- the
+        guard naming a commit the tree has moved past -- is visible rather than
+        inferred by re-checking git by hand each cycle.
+        """
         state_dir = Path(self.config.state_path).parent
         guard_path = state_dir / "reboot-guard.json"
         try:
@@ -1432,9 +1702,64 @@ class Reactor:
             "commit": guard.get("commit"),
             "healthy_cycles": guard.get("healthy_cycles"),
         }
+        cycles = guard.get("window_cycles")
+        if isinstance(cycles, int) and not isinstance(cycles, bool):
+            result["window_cycles"] = cycles
+        head = self._head_commit()
+        if head:
+            result["head"] = head
+        # ``expected_commit`` lets a caller ask about a window that is being
+        # opened right now: at that moment the row read above still describes
+        # the previous window, so the commit under test has to be named by the
+        # caller. ``result["commit"]`` keeps naming the row it actually read.
+        row_commit = str(guard.get("commit") or "")
+        commit = str(expected_commit or row_commit)
+        if expected_commit and expected_commit != row_commit:
+            result["promotion_commit"] = expected_commit
+        if commit and head:
+            # Equality is what "live" means here; ancestry is deliberately
+            # not decided in this observation, because a later promotion
+            # legitimately moves HEAD past an older accepted commit.
+            result["live"] = head == commit
+            if outcome == "in_progress" and head != commit:
+                result["stale"] = True
         if guard.get("rollback_error"):
             result["rollback_error"] = str(guard["rollback_error"])[:500]
         return result
+
+    def _head_commit(self) -> str:
+        """The commit the worktree is on, or "" when git cannot answer.
+
+        Reuses the same reader the rollback path uses rather than shelling out
+        a second time; a non-git root or a failing git call is reported as
+        "unknown" and never as a commit.
+        """
+        root = Path(self.config.self_improvement_root or Path.cwd())
+        if not (root / ".git").exists():
+            return ""
+        try:
+            return CheckpointManager(root).current_commit()
+        except (CheckpointError, OSError, subprocess.SubprocessError):
+            return ""
+
+    def _run_per_cycle_housekeeping(self) -> None:
+        """Metrics, daily maintenance and the judge check, on every cycle.
+
+        These used to run only after a completed run, so a cycle that selected
+        no work returned before reaching them and skipped all three. The
+        stall produced no judge event, no maintenance and no metrics
+        for seven hours because of that placement. Retention and decay are
+        maintenance, not metrics, so they are never gated on the snapshot flag.
+        The judge check is per-cycle, not daily: a broken planner contract must
+        not degrade silently for a day, and its durable alert dedup window is
+        the rate limit. Each call is idempotent within its day/alert window, so
+        both call sites may run it without a double effect.
+        """
+        if self.config.metrics_snapshot_enabled:
+            self._record_daily_metrics()
+        self._reconcile_pending_captures()
+        self._maybe_run_daily_maintenance()
+        self._check_judge_health()
 
     def _record_daily_metrics(self) -> None:
         """Persist one reproducible snapshot per UTC day into evaluations."""
@@ -1475,7 +1800,7 @@ class Reactor:
     def _check_judge_health(self) -> None:
         """Surface a broken planner contract to the owner instead of degrading silently.
 
-        Runs every cycle, not once a day: the 2026-09-20 incident degraded for a
+        Runs every cycle, not once a day: the incident degraded for a
         full day, and a daily check would have stayed blind for most of it. The
         alert's durable dedup window is the rate limit, so a per-cycle check
         cannot spam the owner. It reads ``planner_attempts`` only and never
@@ -1489,7 +1814,7 @@ class Reactor:
                 threshold=float(os.getenv("SKYNET_JUDGE_HEALTH_THRESHOLD", str(DEFAULT_THRESHOLD))),
                 cooldown_seconds=float(os.getenv("SKYNET_JUDGE_HEALTH_COOLDOWN_SECONDS", str(DEFAULT_COOLDOWN_SECONDS))),
                 # A window that reaches back before the last restart judges the
-                # previous process's code: on 2026-09-20 the promoted planner
+                # previous process's code: the promoted planner
                 # fix could not clear the alert because the pre-fix failures
                 # were still the newest rows. A missing guard yields None ("no
                 # boundary"), which keeps the whole window.
@@ -1521,6 +1846,131 @@ class Reactor:
             marker_path.write_text(json.dumps({"marker": today}), encoding="utf-8")
         except OSError as exc:
             log.warning("daily maintenance marker write failed: %s", exc, exc_info=True)
+            self._record_maintenance_failure("daily_maintenance_marker", exc)
+
+    def _record_maintenance_failure(self, pass_name: str, exc: BaseException) -> None:
+        """Make a swallowed maintenance/retention failure durable.
+
+        The five maintenance passes (retain/decay/compact plus the daily
+        marker write) each catch their own exception and only ``log.warning``.
+        The deployed unit sends the process log to journald
+        (``deploy/skynet.service.in: StandardOutput=journal``), so a failed or
+        silently-releasing pass left no durable record at all: measured on the
+        live store, 0 event_log rows name any retention failure. A single
+        durable event per failed pass keeps the class observable from the
+        organism's own history instead of only from a probe.
+        """
+        try:
+            self.store.append_event(
+                "maintenance_failed",
+                {
+                    "pass": pass_name,
+                    "error_class": type(exc).__name__,
+                    "error": str(exc)[:500],
+                },
+            )
+        except Exception:  # a record failure must never abort the pass
+            log.warning("maintenance failure could not be recorded: %s", pass_name, exc_info=True)
+    def _reconcile_pending_captures(self) -> None:
+        """Give a pending memory capture a bounded lifetime.
+
+        ``memory_capture_pending`` exists because a transient provider fault in
+        the Memory Loop made ``consolidate`` return a degraded result with zero
+        candidates and the loop is never retried, so a whole episode's durable
+        observations used to be dropped. The pointer recorded the loss -- but
+        nothing ever resolved it. Measured (generation 177, read-only on the
+        live ledger): 27 pointers, 0 naming any disposition, all 27 still naming
+        a resolvable snapshot and transcript, and no code path that reads
+        ``snapshot_id`` or the pending ``run_id``. The pointer was permanent, so
+        a fault lasting one episode left a forever-pending row and kept its
+        evidence past every retention window (11.72 MB behind 25 pointers,
+        generation 173).
+
+        This pass gives it a lifetime: at most one unresolved pointer left by an
+        *earlier* cycle is re-attempted through the Memory Loop. The recovery
+        uses its own episode id because the degraded pass already wrote a
+        zero-candidate ``memory_consolidations`` row for the original snapshot,
+        and ``consolidate_versioned`` would otherwise report ``replayed`` and
+        silently add nothing. A success records ``recaptured``; a second
+        degradation records ``unrecoverable``; a pointer whose evidence has left
+        the run-count window records ``expired``. Every disposition ends the
+        pending status, so the attempt happens at most once per pointer. The
+        episode that just finished is skipped: its pointer was written by this
+        cycle and its fault was already observed once.
+        """
+        try:
+            pending = self.store.pending_memory_captures(limit=1)
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            self._record_maintenance_failure("pending_memory_capture_lookup", exc)
+            return
+        if not pending:
+            return
+        row = pending[0]
+        latest_started = self.store.connection.execute(
+            "SELECT MAX(sequence) FROM event_log WHERE kind='run_started'"
+        ).fetchone()[0]
+        if latest_started is not None and int(row["sequence"]) > int(latest_started):
+            return
+        run_id = str(row["payload"].get("run_id") or row["run_id"])
+        evidence = self.store.pending_capture_evidence(run_id)
+        if evidence["snapshots"] <= 0:
+            self.store.dispose_pending_memory_capture(
+                run_id,
+                disposition="expired" if evidence["transcript_rows"] == 0 else "unrecoverable",
+                detail=f"no usable snapshot (transcript_rows={evidence['transcript_rows']})",
+                keep_runs=self.config.transcript_retention_runs,
+            )
+            return
+        try:
+            snapshot = self.store.snapshot_episode(run_id)
+            record = self.store.run_result(run_id) or {}
+            raw_status = str(record.get("status") or RunStatus.COMPLETED.value)
+            try:
+                stored_status = RunStatus(raw_status)
+            except ValueError:
+                stored_status = RunStatus.COMPLETED
+            finish = AgentRunResult(
+                status=stored_status,
+                report=str(record.get("report") or ""),
+                steps=int(record.get("steps") or 0),
+                usage_tokens=int(record.get("usage_tokens") or 0),
+                failure=str(record.get("failure") or ""),
+            )
+            recaptured = self.memory_loop.consolidate(
+                snapshot["events"],
+                finish,
+                self.config.system_prompt + "\n\n" + SYSTEM_MEMORY,
+                runtime_log=lambda kind, event_payload, **_: self.store.runtime_log.write(kind, event_payload),
+                chat_history=self.store.react_history_for_memory(run_id),
+            )
+        except Exception as exc:
+            self._record_maintenance_failure("pending_memory_capture_recapture", exc)
+            return
+        evaluation = recaptured.evaluation or {}
+        if str(evaluation.get("status") or "") == "degraded":
+            self.store.dispose_pending_memory_capture(
+                run_id,
+                disposition="unrecoverable",
+                detail=str(evaluation.get("error", ""))[:500],
+                keep_runs=self.config.transcript_retention_runs,
+            )
+            return
+        try:
+            with self.store.transaction():
+                outcome = self.store.consolidate_versioned(
+                    f"recapture:{snapshot['snapshot_id']}",
+                    run_id,
+                    list(recaptured.memory_candidates),
+                )
+                self.store.dispose_pending_memory_capture(
+                    run_id,
+                    disposition="recaptured",
+                    detail=f"memory_candidates={len(recaptured.memory_candidates)}",
+                    memories=int(outcome.get("memory_count") or 0),
+                    keep_runs=self.config.transcript_retention_runs,
+                )
+        except Exception as exc:
+            self._record_maintenance_failure("pending_memory_capture_consolidation", exc)
 
     def _run_daily_maintenance(self) -> None:
         """Retention and GC, once per day, so the state cannot grow forever."""
@@ -1550,6 +2000,7 @@ class Reactor:
                 )
         except Exception as exc:
             log.warning("event log retention failed: %s", exc, exc_info=True)
+            self._record_maintenance_failure("event_log_retention", exc)
         try:
             pruned_effects = self.store.prune_capability_effects(self.config.effect_retention_days)
             if pruned_effects:
@@ -1559,18 +2010,21 @@ class Reactor:
                 )
         except Exception as exc:
             log.warning("effect ledger retention failed: %s", exc, exc_info=True)
+            self._record_maintenance_failure("capability_effects_retention", exc)
         try:
             decayed = self.store.decay_memory_confidence()
             if decayed["faded"] or decayed["dropped"]:
                 self.store.append_event("memory_confidence_decayed", decayed)
         except Exception as exc:
             log.warning("memory confidence decay failed: %s", exc, exc_info=True)
+            self._record_maintenance_failure("memory_confidence_decay", exc)
         try:
             compacted = self.store.compact_episode_snapshots()
             if compacted["snapshots"]:
                 self.store.append_event("history_compacted", compacted)
         except Exception as exc:
             log.warning("episode snapshot compaction failed: %s", exc, exc_info=True)
+            self._record_maintenance_failure("episode_snapshot_compaction", exc)
 
     def _unverified_action_claims(self, run_id: str, report: str) -> list[dict[str, str]]:
         """Report `actions` that name a ledger-backed tool with no ledger row.
@@ -1825,7 +2279,7 @@ class Reactor:
         if window <= 0:
             return False
         row = self.store.connection.execute(
-            "SELECT payload FROM event_log WHERE kind='planner_fallback_created' ORDER BY sequence DESC LIMIT 1"
+            "SELECT payload, created_at FROM event_log WHERE kind='planner_fallback_created' ORDER BY sequence DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return False
@@ -1833,7 +2287,18 @@ class Reactor:
             last_generation = int(json.loads(row["payload"]).get("generation"))
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
-        return generation - last_generation < window
+        if generation - last_generation >= window:
+            return False
+        # The generation counter is frozen while no work is selected, so a
+        # generation-only window would never expire and the safety net would be
+        # locked out for good. Expire the cap by wall clock as well, or fail
+        # open if the timestamp is unreadable -- the safety net must not be
+        # silenceable by a bad event row.
+        try:
+            last = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        return (utc_datetime_now() - last).total_seconds() < self.config.fallback_repeat_seconds
 
     def _plan_select(self) -> tuple[PortfolioPlanner, dict[str, Any] | None]:
         """Compute a portfolio decision without writing it yet.
@@ -2049,7 +2514,7 @@ class Reactor:
             parts.append(str(previous.get("summary", "")))
         parts.append(str(next_plan.get("initial_prompt", "")))
         parts.append(str(next_plan.get("next", "")))
-        parts.append("autonomous planning next bounded work")
+        parts.append("autonomous planning")
         if goals:
             parts.append(str(goals[0].get("title", "")))
         return Reactor._join_query_parts(parts)
@@ -2079,12 +2544,19 @@ class Reactor:
             # 8 of 24 matched no memory at all. The situation-defining parts go
             # last so the window keeps them, and the goal title is the very last:
             # the task title is often longer, so appending it after the goal
-            # title left 0 of 66 goal-title terms inside the window (measured
-            # 2026-09-22).
+            # title left 0 of 66 goal-title terms inside the window.
             parts.append(str(task.get("expected_new_fact", "")))
             title = task.get("title") or goal.get("title") or selected_work.get("title", "")
             parts.append(str(title))
-            parts.append(str(goal.get("title", "")))
+            # The task envelope nests the goal title under `task["goal_title"]`:
+            # `pending_work[i]` carries only the keys `kind` and `task`, so the
+            # former `goal.get("title", "")` appended an EMPTY string on all 66
+            # live envelopes carrying a previous_outcome and the goal title never
+            # reached the recall window (full goal-title set retained 0/66,
+            # 39/255 individual goal terms; with this key it is 66/66 and
+            # 255/255). The goal title stays the very last part so the tail-24
+            # window keeps it.
+            parts.append(str(task.get("goal_title") or goal.get("title", "")))
         return Reactor._join_query_parts(parts)
 
     def close(self) -> None:

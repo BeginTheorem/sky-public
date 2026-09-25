@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -102,7 +103,11 @@ GATE_SELFCHECK_SNIPPET = (
     "print('gate-selfcheck-ok', real)"
 )
 DEFAULT_TEST_COMMAND: tuple[str, ...] = (sys.executable, "-m", "pytest", "-q")
-BLOCKED_FAILURE_CLASSES = frozenset({"administrative_test_failure", "environment_failure", "timeout", "worktree_quota"})
+# A payload damaged in transport is not a verdict about the change, so it
+# belongs in the retryable family beside the other environment conditions:
+# the same intended change must be submittable again once it arrives intact.
+PATCH_PAYLOAD_CORRUPT = "patch_payload_corrupt"
+BLOCKED_FAILURE_CLASSES = frozenset({PATCH_PAYLOAD_CORRUPT, "administrative_test_failure", "environment_failure", "timeout", "worktree_quota"})
 # An environment failure does not burn the fingerprint, so the identical change
 # is retryable once the environment is repaired. Without a ceiling that turns
 # into a per-cycle loop (worktree + a full gate run each time), so the same
@@ -125,7 +130,7 @@ DEFAULT_MAX_WORKTREES = 8
 # submission and only an identical resubmission reaches a stage.
 GATE_PROTECTED_ROOT_FILES = frozenset({"conftest.py", "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg"})
 # The meta-loop decides what the organism works on and how it is judged. Owner
-# decision 2026-09-21 opened it: these paths are warned, not held, so the
+# decision opened it: these paths are warned, not held, so the
 # organism can repair its own judge after an identical resubmission.
 GATE_PROTECTED_PATHS = frozenset({
     "skynet/self_improvement.py",
@@ -133,9 +138,13 @@ GATE_PROTECTED_PATHS = frozenset({
     "skynet/planner.py",
     "skynet/autonomous_planner.py",
     "skynet/metrics.py",
+    # The public-release sanitizer decides what leaves the repository and what
+    # the leak scanner forbids; a proposal must not weaken it silently.
+    "release/rules.toml",
+    "release/publish.py",
 })
 VENV_PYTHON_NAMES = frozenset({"python", "python3", ".venv/bin/python", "./.venv/bin/python", ".venv/bin/python3", "./.venv/bin/python3"})
-# The service exports provider-enable flags (paid-provider deploy) and the money
+# The service exports provider-enable flags (OpenRouter-only deploy) and the money
 # boost; the suite asserts the factory builds each provider from
 # SKYNET_PROVIDER_CHAIN, so inheriting them turns a code verdict into an
 # environment verdict and rejects every proposal on an untouched tree. The
@@ -146,6 +155,39 @@ GATE_SUITE_ENV_EXCLUSIONS = frozenset({
     "DEEPSEEK_ENABLED",
     "SKYNET_MONEY_BOOST",
 })
+
+
+def change_content_digest(root: str | Path, paths: Sequence[str]) -> str:
+    """Digest of *what* changed, not only *which* files changed.
+
+    The earlier digest was ``sha256`` over the sorted path names alone, so two
+    genuinely different patches to the same file were reported under the same
+    identity: the four type guards submitted (proposal
+    b1a54578) and the ``json_tree`` holder subquery submitted
+    (proposal 0d3b1925) are both ``skynet/store.py`` and therefore both
+    ``6248ede0...``, even though the second patch is not the first one. The
+    registry and the runtime log carry this value as the change identity, so a
+    path-only digest cannot distinguish two promotions of the same file.
+    Hashing each path with its post-change bytes keeps the value derived from
+    what was actually written while staying deterministic across git worktree
+    roots. A path that is absent after the change (a deletion) still
+    contributes its name, so deletes and creates do not collapse into the
+    empty digest. The durable dedup key is ``change_fingerprint`` (see
+    ``propose_self_improvement``), which is already content-derived; this value
+    is the human-readable identity recorded beside it.
+    """
+    base = Path(root)
+    hasher = hashlib.sha256()
+    for relative in sorted(set(paths)):
+        hasher.update(relative.encode("utf-8"))
+        hasher.update(b"\0")
+        try:
+            payload = (base / relative).read_bytes()
+        except OSError:
+            payload = b""
+        hasher.update(payload)
+        hasher.update(b"\0")
+    return hasher.hexdigest()
 
 
 def gate_suite_environment() -> dict[str, str]:
@@ -194,6 +236,64 @@ def check_registry_integrity(path: str | Path) -> list[tuple[str, str]]:
         elif failure_class in ANCHOR_REASON_CODES:
             violations.append((str(proposal_id), f"failure_class={failure_class} without a persisted reason_code"))
     return violations
+
+
+_PATCH_FILE_START = re.compile(r"^(diff --git |--- )")
+_PATCH_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def patch_structure_error(patch: str) -> str | None:
+    """Return why *patch* is not a well-formed unified diff, else ``None``.
+
+    Only the payload's shape is judged; ``git apply`` stays the authority on
+    whether the hunks match the tree. A diff damaged in tool-call transport
+    keeps its headers, so git answers "corrupt patch at line N" -- a statement
+    about the payload, not about the change. Measured on the runtime log
+    (11 patch payloads, 2026-09-25): all 11 arrive malformed, and proposal
+    701d3510, the only submission carrying a byte-correct locally validated
+    file, was recorded as a verdict about its change after dying here.
+    Separating the two lets the damaged case be retried instead of burning
+    the change fingerprint.
+    """
+    if not patch.strip():
+        return "patch is empty"
+    if not patch.endswith("\n"):
+        return "patch is not terminated: the payload was truncated in tool-call transport"
+    lines = patch.splitlines()
+    if not any(_PATCH_FILE_START.match(line) for line in lines):
+        return "patch carries no file header ('diff --git' or '--- ')"
+    starts = [index for index, line in enumerate(lines) if _PATCH_HUNK_HEADER.match(line)]
+    if not starts:
+        return "patch carries no hunk header"
+    for position, start in enumerate(starts):
+        header = _PATCH_HUNK_HEADER.match(lines[start])
+        if header is None:  # pragma: no cover - starts was built from this match
+            continue
+        declared_old = int(header.group(2) or 1)
+        declared_new = int(header.group(4) or 1)
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        old = new = 0
+        for line in lines[start + 1 : end]:
+            if line.startswith("\\"):
+                # "\ No newline at end of file" annotates the previous body line.
+                continue
+            if line.startswith(("diff --git ", "@@")):
+                break
+            if line.startswith("+"):
+                new += 1
+            elif line.startswith("-"):
+                old += 1
+            elif line.startswith(" ") or line == "":
+                old += 1
+                new += 1
+            else:
+                return f"hunk at line {start + 1} carries an unparseable body line: {line[:40]!r}"
+        if (old, new) != (declared_old, declared_new):
+            return (
+                f"hunk at line {start + 1} declares -{declared_old} +{declared_new} but carries "
+                f"-{old} +{new}; the payload was truncated or rewritten in tool-call transport"
+            )
+    return None
 
 
 def classify_failure(error: BaseException | str) -> str:
@@ -497,6 +597,25 @@ class SelfImprovementManager:
         self._write_proposals(proposals)
         self._cleanup_worktree(str(proposal.get("worktree", "")))
 
+    def _head_is_ancestor_of(self, commit: str) -> bool:
+        """Is HEAD still an ancestor of ``commit``, i.e. was it left behind?
+
+        A commit that is not an ancestor of HEAD is only *evidence of a
+        rollback* when HEAD is still an ancestor of it: the tree moved
+        backwards below that commit. The startup rollback script enforces the
+        same one-way rule before it resets anything. Conservative on purpose:
+        every answer other than a clean "HEAD is an ancestor" reads as ``False``,
+        so an undecidable git call withholds the verdict instead of inventing one.
+        """
+        try:
+            check = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", "HEAD", commit],
+                cwd=self.root, capture_output=True, text=True, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return check.returncode == 0
+
     def reconcile_awaiting_reboot(self) -> list[dict[str, object]]:
         """Resolve proposals left awaiting_reboot when no reboot guard exists.
 
@@ -544,6 +663,13 @@ class SelfImprovementManager:
                 )
                 continue
             in_history = check.returncode == 0
+            # Not-an-ancestor is necessary but not sufficient for a rollback:
+            # only when HEAD is still an ancestor of the commit did the tree
+            # move *backwards* below it. A commit on an unrelated line of
+            # history (rewritten elsewhere) satisfies neither direction, and
+            # writing it down as rolled_back would record a decision the
+            # evidence never made.
+            lost_to_rollback = in_history is False and self._head_is_ancestor_of(commit)
             if status == "promoting":
                 # A crash between the fast-forward merge and the reboot request
                 # leaves the promotion merged but unrecorded. Ancestry decides:
@@ -554,14 +680,37 @@ class SelfImprovementManager:
                     record["promoted_commit"] = commit
                     self._write_recovery_request(proposal_id, commit, str(record.get("base_commit", "")))
                     resolved.append({"proposal_id": proposal_id, "status": "awaiting_reboot", "request_recreated": True})
-                else:
+                elif lost_to_rollback:
                     record["status"] = "validated"
                     self._cleanup_worktree(str(record.get("worktree", "")))
                     resolved.append({"proposal_id": proposal_id, "status": "validated", "reason": "promotion interrupted before the merge"})
+                else:
+                    # Undecidable: the commit is neither reachable from HEAD nor
+                    # contains it, so "not merged" cannot be told from "merged
+                    # and then rolled back". Re-promoting on that guess could
+                    # duplicate work; the row is left for a decidable review.
+                    log.warning(
+                        "cannot decide interrupted promotion %s: %s is neither an ancestor nor a descendant of HEAD",
+                        proposal_id, commit,
+                    )
+                    continue
                 changed = True
                 continue
-            record["status"] = "accepted" if in_history else "rolled_back"
-            record["reboot_result"] = {"completed": in_history, "rolled_back": not in_history, "reconciled": True}
+            if in_history:
+                record["status"] = "accepted"
+                record["reboot_result"] = {"completed": True, "rolled_back": False, "reconciled": True}
+            elif lost_to_rollback:
+                record["status"] = "rolled_back"
+                record["reboot_result"] = {"completed": False, "rolled_back": True, "reconciled": True}
+            else:
+                # A missing commit plus an unrelated line of history is not proof
+                # of a rollback; recording one would make the registry assert a
+                # fact git never established.
+                log.warning(
+                    "cannot reconcile %s: %s is neither an ancestor nor a descendant of HEAD; withholding the rollback verdict",
+                    proposal_id, commit,
+                )
+                continue
             self._cleanup_worktree(str(record.get("worktree", "")))
             resolved.append({"proposal_id": proposal_id, "status": record["status"]})
             changed = True
@@ -915,7 +1064,14 @@ class SelfImprovementManager:
             target.write_text(content, encoding="utf-8")
             normalized.append(path.as_posix())
         if self.runtime_log is not None:
-            self.runtime_log.write("proposal_files_applied", {"proposal_id": proposal.proposal_id, "files": sorted(normalized)})
+            self.runtime_log.write(
+                "proposal_files_applied",
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "files": sorted(normalized),
+                    "change_digest": change_content_digest(proposal.worktree, normalized),
+                },
+            )
         return normalized
 
     def apply_changes(self, proposal: ImprovementProposal, changes: Sequence[Mapping[str, object]]) -> dict[str, object]:
@@ -966,6 +1122,27 @@ class SelfImprovementManager:
                 content = change.get("content", change.get("new", ""))
                 if not isinstance(content, str):
                     raise SelfImprovementError("patch content must be text")
+
+                # An insert whose join point carries no newline on either side
+                # fuses the anchor's last line with the inserted text's first
+                # line, e.g. "...unconstrained.- Author of ...". That is a
+                # fragmented-hunk defect of the edit format rather than a
+                # verdict on the idea: edit-format studies that vary the hunk
+                # measure fragmented hunks as the failure mode
+                # (arXiv:2604.27296v1 sec. 3.3), and wrapped prose here makes
+                # the no-newline case common (106 of 160 historical insert
+                # edits in state/runtime.jsonl carry this shape). Refuse it as
+                # its own reason code before writing, so the fix is a newline
+                # and not an identical resubmission.
+                if operation in {"insert_before", "insert_after"}:
+                    joins_forward = operation == "insert_after" and not old.endswith("\n") and not content.startswith("\n")
+                    joins_backward = operation == "insert_before" and not content.endswith("\n") and not old.startswith("\n")
+                    if joins_forward or joins_backward:
+                        raise SelfImprovementError(
+                            f"{operation} would join the anchor and the inserted text onto one line: "
+                            f"neither side carries a newline, so add a leading or trailing one (path: {relative})",
+                            reason_code="anchor_boundary_join",
+                        )
                 if operation == "replace":
                     replacement = content
                 elif operation == "insert_before":
@@ -980,7 +1157,7 @@ class SelfImprovementManager:
             changed.append(path.as_posix())
         if not changed:
             raise SelfImprovementError("proposal has no changes")
-        digest = hashlib.sha256("\n".join(sorted(changed)).encode()).hexdigest()
+        digest = change_content_digest(proposal.worktree, changed)
         if self.runtime_log is not None:
             self.runtime_log.write("proposal_changes_applied", {"proposal_id": proposal.proposal_id, "files": sorted(set(changed)), "change_digest": digest, "anchor_repairs": repairs})
         result: dict[str, object] = {"files": sorted(set(changed)), "change_digest": digest}
@@ -1000,6 +1177,12 @@ class SelfImprovementManager:
             raise SelfImprovementError("patch must not be empty", reason_code="patch_apply_failed")
         if self._contains_control(patch.replace("\n", "").replace("\r", "")):
             raise SelfImprovementError("patch contains control characters", reason_code="patch_apply_failed")
+        structure_error = patch_structure_error(patch)
+        if structure_error is not None:
+            raise SelfImprovementError(
+                f"patch payload is structurally damaged: {structure_error}",
+                reason_code=PATCH_PAYLOAD_CORRUPT,
+            )
         try:
             completed = subprocess.run(
                 ["git", "apply", "--whitespace=nowarn", "--index"],
@@ -1023,7 +1206,7 @@ class SelfImprovementManager:
                 "patch applied but the changed paths could not be read; refusing the proposal",
                 reason_code="patch_apply_failed",
             )
-        digest = hashlib.sha256("\n".join(sorted(changed)).encode()).hexdigest()
+        digest = change_content_digest(proposal.worktree, changed)
         if self.runtime_log is not None:
             self.runtime_log.write("proposal_patch_applied", {"proposal_id": proposal.proposal_id, "files": sorted(set(changed)), "change_digest": digest})
         return sorted(set(changed))
@@ -1497,7 +1680,25 @@ class SelfImprovementManager:
             "hypothesis": metadata.get("hypothesis", {}),
         }
         self._emit("gate_protected_warned", payload)
-        self._alert_owner("gate_protected_warned", payload)
+        # The durable event above keeps the whole hypothesis; the owner alert
+        # must not. The hypothesis contract carries a mandatory
+        # ``rollback_condition`` field, so sending it verbatim put the word
+        # "rollback" in front of the owner on every protected-path warning and
+        # made a warning look like an emergency rollback of the tree (measured:
+        # 9 such alerts, 2745-4471 rendered characters each, up to 9
+        # occurrences of "rollback"). The alert states the condition and what it
+        # did -- and did not -- do; the contract stays in the event and in
+        # state/self-improvement-proposals.json, both reachable on demand.
+        self._alert_owner(
+            "gate_protected_warned",
+            {
+                "proposal_id": proposal.proposal_id,
+                "paths": record["protected_paths"],
+                "change_fingerprint": fingerprint,
+                "reason": payload["reason"],
+                "effect": "no change applied to the main worktree; an identical resubmission runs the full gate",
+            },
+        )
         if self.runtime_log is not None:
             self.runtime_log.write("proposal_warned", {"proposal_id": proposal.proposal_id, "paths": record["protected_paths"], "change_fingerprint": fingerprint})
         return self._warned_result(fingerprint, offenders)
@@ -1635,15 +1836,32 @@ class SelfImprovementManager:
             if fallback and self.runtime_log is not None:
                 self.runtime_log.write("test_command_fallback", {"proposal_id": proposal.proposal_id, "default_command": list(DEFAULT_TEST_COMMAND)})
             if patch:
-                applied_paths = self.apply_patch(proposal, patch)
-                applied: dict[str, object] | None = {"files": applied_paths, "change_digest": hashlib.sha256("\n".join(applied_paths).encode()).hexdigest()}
+                applied_paths = list(self.apply_patch(proposal, patch))
+                applied: dict[str, object] | None = {"files": applied_paths, "change_digest": change_content_digest(proposal.worktree, applied_paths)}
             elif changes:
                 applied = self.apply_changes(proposal, changes)
                 files_value = applied.get("files")
                 applied_paths = [str(item) for item in files_value] if isinstance(files_value, list) else []
             else:
                 applied = None
-                applied_paths = self.apply_files(proposal, files)
+                applied_paths = []
+            # `files` is a separate channel and must apply on EVERY path, after
+            # the edits so a patch is still applied to a pristine tree. The
+            # branches above used to be `if patch / elif changes / else` with
+            # `apply_files` only in the `else`, so a proposal carrying BOTH new
+            # files and anchor changes applied only the changes. Measured on
+            # generation 186: proposal 073938d987a64ff0ba9b7a7da8a460db
+            # submitted `files={"tests/test_executed_evidence_invariant.py":
+            # ...}` with nine anchor changes; the tool result named only
+            # skynet/react.py, the registry recorded files_changed: 1, and the
+            # promoted commit 9088322 contains no test file -- the gate passed
+            # while half the proposal was silently discarded, and because
+            # `applied_paths` omitted the file the gate-protected check never
+            # saw it either (arXiv:1907.04055v1: most failures are not timely
+            # detected and silently propagate across components). The union
+            # below is what the ignored-path and gate-protected checks read.
+            if files:
+                applied_paths = list(dict.fromkeys([*applied_paths, *self.apply_files(proposal, files)]))
             commit = self.validate_and_commit(proposal, test_command, applied_paths=applied_paths, fingerprint=fingerprint)
             self._record_validated(proposal, commit, test_command, fallback=fallback)
             record = self._read_proposals()[proposal.proposal_id]
@@ -1764,13 +1982,17 @@ class SelfImprovementTool:
             if self.manager.runtime_log is not None:
                 self.manager.runtime_log.write("proposal_rejected", {"error": error_msg, "failure_class": "invalid_payload", "hypothesis": hypothesis})
             return self._failure_result(error_msg, "invalid_payload", do_not_retry_unchanged=True)
-        if files and not changes and not patch.strip():
-            existing = [path for path in files if (self.manager.root / path).exists()]
-            if existing:
-                error_msg = f"use exact-anchor changes for existing files: {', '.join(existing)}"
-                if self.manager.runtime_log is not None:
-                    self.manager.runtime_log.write("proposal_rejected", {"error": error_msg, "failure_class": "invalid_payload"})
-                return self._failure_result(error_msg, "invalid_payload", do_not_retry_unchanged=True)
+        # The `files` channel is new-content-only and that stays true on every
+        # path: with `changes` or `patch` present this guard used to be skipped,
+        # so a `files` entry naming an existing path would have overwritten it
+        # without an anchor instead of being refused. Measured in the regression
+        # test, the combined form silently clobbered the file.
+        existing = [path for path in files if (self.manager.root / path).exists()]
+        if existing:
+            error_msg = f"use exact-anchor changes for existing files: {', '.join(existing)}"
+            if self.manager.runtime_log is not None:
+                self.manager.runtime_log.write("proposal_rejected", {"error": error_msg, "failure_class": "invalid_payload"})
+            return self._failure_result(error_msg, "invalid_payload", do_not_retry_unchanged=True)
         try:
             requested_test_command = arguments.get("test_command")
             if isinstance(requested_test_command, str):

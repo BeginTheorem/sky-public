@@ -13,7 +13,7 @@ from typing import cast
 from unittest.mock import patch
 
 from skynet.memory import MemoryLoop
-from skynet.memory_store import KIND_ALIASES, MEMORY_KINDS, MemoryStore, normalize_memory_kind
+from skynet.memory_store import _RRF_MAX_LIFT, KIND_ALIASES, MEMORY_KINDS, MemoryStore, normalize_memory_kind
 from skynet.models import AgentRunResult, ModelTurn, RunStatus
 from skynet.store import StateStore
 
@@ -130,6 +130,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(cast(dict, provider.payload)["chat_history"][-1]["content"], "recent")
         self.assertEqual(cast(dict, provider.payload)["short_memory"][0]["kind"], "short_memory_truncated")
         self.assertEqual(cast(dict, provider.payload)["short_memory"][-1]["content"], "latest")
+    def test_memory_loop_shortens_an_item_larger_than_its_own_budget(self) -> None:
+        """One oversized newest item must not set the prompt size.
+
+        The running-total guard compares only *later* items against the limit,
+        so the first (newest) item was admitted whole however large it was. On
+        the live ledger that made 27 of the 29 degraded Memory-Loop episodes
+        send 460k-char transcript rows against a 48,000-char limit. The bounded
+        rule keeps the newest item, shortened and marked, inside its budget.
+        """
+        from skynet.memory import MemoryLoop
+
+        class CapturingProvider:
+            def __init__(self) -> None:
+                self.payload = None
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.payload = json.loads(messages[1]["content"])
+                return ModelTurn(text='{"memory_candidates": [], "next_plan": {}}')
+
+        provider = CapturingProvider()
+        huge = "z" * 400_000
+        MemoryLoop(provider, episode_char_budget=20_000).consolidate(
+            [{"kind": "tool_result", "payload": huge}],
+            AgentRunResult(RunStatus.COMPLETED, "report"),
+            "system",
+            chat_history=[{"role": "user", "content": huge}],
+        )
+        payload = cast(dict, provider.payload)
+        episode_chars = len(json.dumps(payload["episode"], ensure_ascii=False))
+        chat_chars = len(json.dumps(payload["chat_history"], ensure_ascii=False))
+        self.assertLessEqual(episode_chars, 20_000, f"episode sent {episode_chars} chars against a 20,000 budget")
+        self.assertLessEqual(chat_chars, 48_000, f"chat_history sent {chat_chars} chars against a 48,000 budget")
+        self.assertIn("truncated by the memory-loop budget", json.dumps(payload["chat_history"]))
     def test_memory_loop_degrades_on_non_json_provider_response(self) -> None:
         from skynet.memory import MemoryLoop
 
@@ -365,6 +398,44 @@ class MemoryRetrievalTests(unittest.TestCase):
             ])
             ids = [item["memory_id"] for item in store.search_memories("alpha beta gamma delta", limit=10)]
             self.assertLess(ids.index("m-fresh"), ids.index("m-stale"))
+            store.close()
+
+    def test_rrf_bounds_a_non_relevance_lift_to_one_slot(self) -> None:
+        # The intentional lift above must not become unbounded. `recency` and
+        # `confidence` are non-relevance axes, so a memory may rise at most
+        # `_RRF_MAX_LIFT` slots above its own BM25 rank. Measured on 82 real
+        # labelled planner queries, the old unbounded lift scored held-out
+        # hit@5 0.102 / MRR 0.082 against 0.343 / 0.214 with the bound.
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            rows = [("m-weak", "fact", "alpha note", 0.99, "2026-12-01T00:00:00Z")]
+            rows.extend(
+                (
+                    f"m-lex-{index:02d}", "fact",
+                    f"alpha beta gamma delta epsilon zeta item{index}",
+                    0.05, f"2018-01-{index + 1:02d}T00:00:00Z",
+                )
+                for index in range(12)
+            )
+            _seed_memories(store, rows)
+            query = "alpha beta gamma delta epsilon zeta"
+            match = " OR ".join(f'"{term}"' for term in query.split())
+            lexical_ranks = [row[0] for row in store.connection.execute(
+                "SELECT m.memory_id FROM memories_fts"
+                " JOIN memories m ON m.memory_id = memories_fts.memory_id"
+                " WHERE memories_fts MATCH ? AND m.status='active'"
+                " ORDER BY bm25(memories_fts), m.memory_id LIMIT 100", (match,))]
+            ids = [item["memory_id"] for item in store.search_memories(query, limit=20)]
+            # m-weak is newest and most confident but matches only one term;
+            # BM25 puts it last of the thirteen.
+            self.assertEqual(lexical_ranks[-1], "m-weak")
+            lexical_rank = lexical_ranks.index("m-weak")  # 0-based
+            self.assertEqual(lexical_rank + 1, 13)
+            # The invariant: no memory may sit more than `_RRF_MAX_LIFT` places
+            # above where BM25 put it. Unbounded, m-weak lands 6th of 20; here it
+            # cannot pass slot 13 - 1 - _RRF_MAX_LIFT.
+            self.assertIn("m-weak", ids)
+            self.assertGreaterEqual(ids.index("m-weak"), lexical_rank - _RRF_MAX_LIFT)
             store.close()
 
     def test_rrf_more_matching_terms_wins_on_equal_metadata(self) -> None:

@@ -94,6 +94,102 @@ class DialogueTests(unittest.TestCase):
             self.assertEqual(store.open_questions(), [])
             store.close()
 
+    def test_replayed_message_call_does_not_queue_a_second_owner_message(self) -> None:
+        """A crash between the outbox write and the effect commit must not duplicate.
+
+        `react.py` writes `capability_effects` only after the tool returns, so the
+        window between `add_outbox` and `record_effect` is real. On the resumed
+        run the identical call is re-issued because no cached result exists; if
+        the outbox row is keyed by a fresh uuid, a second owner message is queued
+        and delivered. The call's effect key must be the row identity instead.
+        Measured on a fresh store: 2 pending rows unpatched, 1 with the stable key
+        (arXiv:2608.01710v1, semantic replay / durable token-independent state).
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            tool = SendMessageToUserTool(store)
+            effect_key = "run-a:7:call_1"
+            first = tool.execute({"message": "still working", "severity": "info"}, idempotency_key=effect_key)
+            # Simulated crash here: no `record_effect`, so the resumed run finds
+            # no cached result and re-issues the identical call.
+            self.assertIsNone(store.effect(effect_key))
+            second = tool.execute({"message": "still working", "severity": "info"}, idempotency_key=effect_key)
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            pending = [message for message in store.pending_outbox() if message["kind"] == "agent_message"]
+            self.assertEqual(len(pending), 1, "one owner message per call identity, not one per issuance")
+            self.assertEqual(pending[0]["payload"].get("idempotency_key"), effect_key)
+            store.close()
+
+    def test_distinct_message_calls_still_queue_distinct_messages(self) -> None:
+        """The dedup is per call identity: a genuinely new call must still be sent."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            tool = SendMessageToUserTool(store)
+            tool.execute({"message": "first", "severity": "info"}, idempotency_key="run-a:7:call_1")
+            tool.execute({"message": "second", "severity": "info"}, idempotency_key="run-a:8:call_2")
+            pending = [message for message in store.pending_outbox() if message["kind"] == "agent_message"]
+            self.assertEqual(len(pending), 2, "distinct calls are distinct effects")
+            store.close()
+
+    def test_replayed_question_call_does_not_ask_the_owner_twice(self) -> None:
+        """A crash between the outbox write and the effect commit must not duplicate.
+
+        `react.py` writes `capability_effects` only after the tool returns, so the
+        resumed run re-issues the identical call with no cached result. With a
+        fresh uuid4 as the row key the owner is asked twice; measured on a fresh
+        store: 2 `user_questions` rows and 2 `user_question` outbox rows
+        unpatched, 1 patched (arXiv:2608.01710v1, semantic replay).
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            tool = AskUserTool(store)
+            effect_key = "run-a:9:call_1"
+            first = tool.execute({"question": "continue?", "options": ["yes", "no"]}, idempotency_key=effect_key)
+            # Simulated crash here: no `record_effect`, so the resumed run finds
+            # no cached result and re-issues the identical call.
+            self.assertIsNone(store.effect(effect_key))
+            second = tool.execute({"question": "continue?", "options": ["yes", "no"]}, idempotency_key=effect_key)
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertEqual(first["question_id"], second["question_id"])
+            self.assertEqual(len(store.open_questions(limit=10)), 1, "one question per call identity")
+            queued = [row for row in store.pending_outbox() if row["kind"] == "user_question"]
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0]["message_id"], effect_key)
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='question_asked'").fetchone()[0], 1
+            )
+            store.close()
+
+    def test_a_derived_question_id_keeps_the_answer_prefix_routable(self) -> None:
+        """The call identity must not become the row id: `/answer <prefix>` routes.
+
+        Every call in one run shares the `{run_id}:` prefix, so using the effect
+        key as `question_id` would make every question in a run render the same
+        8-character prefix and `telegram_bot.handle_answer` would reject both as
+        ambiguous. The id is derived from the key instead and stays distinct.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            # A wide cap keeps the open-question guard out of the way: the point
+            # here is the id derivation, not the cap (which the replay also
+            # respects: at the cap a replayed call is refused, never duplicated).
+            tool = AskUserTool(store, max_open=5)
+            ids = [
+                tool.execute({"question": f"q{index}"}, idempotency_key=f"run-a:{index}:call_{index}")["question_id"]
+                for index in range(3)
+            ]
+            self.assertEqual(len({value[:8] for value in ids}), 3, "distinct calls need distinct answer prefixes")
+            self.assertTrue(all(value.startswith("ask-") for value in ids))
+            # The derived id is stable for the same call, so a replay resolves to
+            # the same question and the owner's answer still lands.
+            replayed = tool.execute({"question": "q0"}, idempotency_key="run-a:0:call_0")["question_id"]
+            self.assertEqual(replayed, ids[0])
+            self.assertTrue(store.answer_question(ids[0], "yes"))
+            self.assertEqual(len(store.open_questions(limit=10)), 2)
+            store.close()
+
     def test_read_inbox_returns_pending_owner_messages_without_consuming_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = self._store(directory)

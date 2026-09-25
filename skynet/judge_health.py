@@ -1,7 +1,7 @@
 """Read-only health of the protected planner contract, surfaced to the owner.
 
 The judge's decisions are closed to self-improvement, and that is correct. But
-it produced a failure mode nobody anticipated: on 2026-09-20 the planner failed
+it produced a failure mode nobody anticipated: the planner failed
 15 of 18 attempts with ``structured model response must be a JSON object``
 because its decoder destroyed a legitimate top-level JSON array, and the empty
 portfolio it returned was indistinguishable from "nothing to do". The organism
@@ -36,7 +36,7 @@ DECIDED_PLANNER_STATUSES = frozenset({
 })
 # Statuses that mean the planner did not reach a decision: the reply could not
 # be decoded, or the provider could not answer. Either way ``generate()``
-# returns ``[]``, which is exactly the masked condition the 2026-09-20 incident
+# returns ``[]``, which is exactly the masked condition the incident
 # produced. The payload names the class so a provider outage is not misreported
 # as a contract break.
 FAILED_PLANNER_STATUSES = frozenset({"invalid_response", "provider_error", "output_truncated"})
@@ -65,7 +65,7 @@ def restart_boundary(state_dir: Path | str | None) -> str | None:
 
     The watchdog exists to notice a planner that is broken *now*. A window that
     reaches back before the last restart derives its verdict from attempts made
-    by code that is no longer running: on 2026-09-20 the promoted contract fix
+    by code that is no longer running: the promoted contract fix
     could not clear the alert because the nine failures that triggered it
     (``event_log`` seq 6477, generations 14..43) were still the newest rows in
     ``planner_attempts`` afterwards, so every cycle re-derived rate 0.182.

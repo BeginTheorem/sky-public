@@ -398,6 +398,100 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(result["healthy_cycles"], 1)
             self.assertFalse(result.get("quarantined", False))
 
+    def test_open_reboot_window_names_the_promoted_commit(self) -> None:
+        """An un-finished window must not be anonymous.
+
+        Measured on the live event log: 81 promotions carried
+        restart_after_checkpoint, 55 of their windows produced no
+        reboot_observation row at all, and only 2 of the 32 rows that exist
+        named the promoted commit -- both on the terminal branch. The
+        still-open branch returned no commit and no proposal_id, so
+        ``reboot_observation`` (payload = {health, result}) could not be
+        attributed to the promotion it was judging. This pins the identity
+        travelling with every in-window observation.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            guard = RebootGuard(state, health_window_cycles=3)
+            guard._atomic_write({
+                "commit": "abcdef1",
+                "rollback_commit": "abcdef2",
+                "proposal_id": "proposal-x",
+                "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "healthy_cycles": 0,
+                "active": True,
+                "failed": False,
+            })
+            first = guard.observe({"ok": True})
+            self.assertTrue(first["active"])
+            self.assertEqual(first["commit"], "abcdef1")
+            self.assertEqual(first["proposal_id"], "proposal-x")
+            second = guard.observe({"ok": True})
+            self.assertTrue(second["active"])
+            self.assertEqual(second["healthy_cycles"], 2)
+            self.assertEqual(second["commit"], "abcdef1")
+            terminal = guard.observe({"ok": True})
+            self.assertTrue(terminal["completed"])
+            self.assertEqual(terminal["commit"], "abcdef1")
+            self.assertEqual(terminal["proposal_id"], "proposal-x")
+            # A closed window still answers with the same identity.
+            closed = guard.observe({"ok": True})
+            self.assertFalse(closed["active"])
+            self.assertEqual(closed["commit"], "abcdef1")
+            self.assertEqual(closed["proposal_id"], "proposal-x")
+
+    def test_open_reboot_window_reports_its_size_not_only_the_count(self) -> None:
+        """healthy_cycles alone cannot be read as "1 of N" without N.
+
+        The live rows record healthy_cycles 1 or 2 and never 3, and the window
+        size (health_window_cycles, default 3) was in no durable row, so
+        "the window is still open" and "the window silently shrank" were the
+        same observation. This pins the size travelling with the count.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            guard = RebootGuard(state, health_window_cycles=2)
+            guard._atomic_write({
+                "commit": "abcdef1",
+                "rollback_commit": "abcdef2",
+                "proposal_id": "proposal-x",
+                "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "healthy_cycles": 0,
+                "active": True,
+                "failed": False,
+            })
+            opening = guard.observe({"ok": True})
+            self.assertTrue(opening["active"])
+            self.assertEqual((opening["healthy_cycles"], opening["window_cycles"]), (1, 2))
+            closing = guard.observe({"ok": True})
+            self.assertTrue(closing["completed"])
+            self.assertEqual((closing["healthy_cycles"], closing["window_cycles"]), (2, 2))
+
+    def test_begin_marks_the_window_active_in_the_durable_bytes(self) -> None:
+        """Reactor._reboot_outcome reads the guard file, not the return value.
+
+        Its ``in_progress`` branch tested ``guard.get("active")``, but
+        ``begin`` never wrote that key -- only a later ``observe`` did, and it
+        writes it only when the window closes. So an open window was invisible
+        to the start envelope and the branch was unreachable. Measured live:
+        18 of 108 run envelopes carried a reboot_outcome observation, and all
+        18 read ``accepted``; none ever read ``in_progress``.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            request = state / "reboot-request.json"
+            request.write_text(
+                json.dumps({"commit": "abcdef1", "rollback_commit": "abcdef2", "proposal_id": "proposal-x"}),
+                encoding="utf-8",
+            )
+            guard = RebootGuard(state)
+            self.assertIsNotNone(guard.begin(request))
+            persisted = json.loads((state / "reboot-guard.json").read_text(encoding="utf-8"))
+            self.assertTrue(persisted["active"])
+            self.assertEqual(persisted["commit"], "abcdef1")
+            self.assertEqual(persisted["proposal_id"], "proposal-x")
+            self.assertNotIn("completed_at", persisted)
+
 
 class RollbackFailureTests(unittest.TestCase):
     def _guard_with_failed_health(self, state: Path, rollback):

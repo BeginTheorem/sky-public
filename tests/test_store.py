@@ -370,6 +370,142 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(kinds, protected)
             store.close()
 
+    def test_pending_memory_capture_survives_retention_and_is_idempotent(self) -> None:
+        # The record exists precisely because the episode's memories are gone:
+        # pruning it would delete the only pointer back to still-existing
+        # evidence (the frozen snapshot and the transcript).
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            first = store.record_pending_memory_capture("run-a", error="boom", transcript_rows=4, events=9)
+            again = store.record_pending_memory_capture("run-a", error="boom again", transcript_rows=5, events=9)
+            self.assertEqual(first, again, "a repeated record for one run updates instead of appending")
+            rows = store.connection.execute("SELECT sequence, payload FROM event_log WHERE kind='memory_capture_pending'").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("boom again", rows[0]["payload"])
+            store.record_pending_memory_capture("run-b", error="other", transcript_rows=1, events=2)
+            store.append_event("planner_decision", {"routine": True})
+            store.connection.execute("UPDATE event_log SET created_at='2020-01-01T00:00:00Z'")
+            self.assertEqual(store.prune_event_log(30), 1, "only the routine event is pruned")
+            kinds = {row[0] for row in store.connection.execute("SELECT kind FROM event_log")}
+            self.assertEqual(kinds, {"memory_capture_pending"})
+            store.close()
+    def test_pending_capture_pin_is_bounded_by_the_run_count_window(self) -> None:
+        # The pin must hold the evidence of a pending capture while its run is
+        # inside the run-count window (generation 172: without that, the prune
+        # orphaned the protected pointer), and it must release it once the run
+        # leaves the window (generation 173: held forever, the pin grew 11.72 MB
+        # = 12.7% of all evidence with no reader of snapshot_id anywhere in the
+        # code, ~2.4 MB/day). The pointer row itself survives either way: it is
+        # in PROTECTED_EVENT_KINDS and is the audit record of the lost episode.
+        from skynet.models import Budget, RunRecord
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            for index in range(5):
+                run_id = f"run-{index:03d}"
+                store.create_run(RunRecord(run_id, 1, RunStatus.COMPLETED, utc_now(), Budget()))
+                store.append_transcript("react_history", {"messages": [{"role": "user", "content": "x"}]}, run_id)
+                store.snapshot_episode(run_id)
+            # One pending capture still inside the window, one outside it.
+            store.record_pending_memory_capture("run-000", error="provider timeout", transcript_rows=1, events=1)
+            store.record_pending_memory_capture("run-004", error="provider timeout", transcript_rows=1, events=1)
+            store.connection.commit()
+            payloads = {
+                json.loads(row[0])["run_id"]: json.loads(row[0])
+                for row in store.connection.execute("SELECT payload FROM event_log WHERE kind='memory_capture_pending'")
+            }
+
+            pruned = store.prune_run_history(3)
+            self.assertGreater(pruned["transcript"], 0, "the window must actually prune")
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM event_log WHERE kind='memory_capture_pending'"
+                ).fetchone()[0],
+                2,
+                "the protected pointer rows survive retention by design, inside the window or not",
+            )
+            inside = payloads["run-004"]
+            self.assertEqual(
+                store.connection.execute(
+                    "SELECT COUNT(*) FROM episode_snapshots WHERE snapshot_id=?", (inside["snapshot_id"],)
+                ).fetchone()[0],
+                1,
+                "a pending capture inside the window keeps the snapshot it names",
+            )
+            self.assertGreater(
+                store.connection.execute("SELECT COUNT(*) FROM transcript WHERE run_id='run-004'").fetchone()[0],
+                0,
+                "a pending capture inside the window keeps its transcript",
+            )
+            # Outside the window the pin is spent: the audit row stays, the
+            # evidence it named is reclaimed with the rest of that run.
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM episode_snapshots WHERE run_id='run-000'").fetchone()[0],
+                0,
+                "the pin must not outlive the run-count window",
+            )
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM transcript WHERE run_id='run-000'").fetchone()[0],
+                0,
+                "the transcript of a run outside the window is reclaimed",
+            )
+            # Bounded, not cumulative: the audit row is still there and still
+            # names the run whose evidence was released.
+            audit = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='memory_capture_pending' AND run_id='run-000'"
+            ).fetchone()
+            self.assertIsNotNone(audit, "the audit row survives the release of its evidence")
+            self.assertIn("provider timeout", audit[0])
+            store.close()
+
+    def test_disposition_gives_a_pending_capture_a_bounded_lifetime(self) -> None:
+        # The pointer is the audit record of a lost Memory Loop, but nothing ever
+        # ended its life: measured generation 177 on the live ledger, 27 pointers
+        # and 0 names in any disposition. A resolution pass must be able to tell
+        # "still pending" from "already resolved" so the re-attempt cannot spin.
+        from skynet.models import Budget, RunRecord
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.create_run(RunRecord("run-a", 1, RunStatus.COMPLETED, utc_now(), Budget()))
+            store.record_pending_memory_capture("run-a", error="provider timeout", transcript_rows=3, events=5)
+            self.assertEqual(
+                [row["run_id"] for row in store.pending_memory_captures()],
+                ["run-a"],
+                "an unresolved pointer is pending",
+            )
+            self.assertTrue(
+                store.dispose_pending_memory_capture("run-a", disposition="recaptured", detail="1 candidate", memories=1)
+            )
+            self.assertEqual(store.pending_memory_captures(), [], "a disposed pointer is no longer pending")
+            released = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='memory_capture_released'"
+            ).fetchall()
+            self.assertEqual(len(released), 1, "the release is recorded exactly once")
+            self.assertEqual(json.loads(released[0]["payload"])["disposition"], "recaptured")
+            pointer = json.loads(
+                store.connection.execute(
+                    "SELECT payload FROM event_log WHERE kind='memory_capture_pending'"
+                ).fetchone()["payload"]
+            )
+            self.assertEqual(pointer["disposition"], "recaptured")
+            self.assertEqual(pointer["memories_recovered"], 1)
+            self.assertIn("provider timeout", pointer["error"], "the audit row still names the original fault")
+            self.assertFalse(
+                store.dispose_pending_memory_capture("run-a", disposition="unrecoverable"),
+                "a second disposition of the same pointer is a no-op",
+            )
+            # Both ends of the lifetime survive retention: the release is the
+            # durable record that the bound actually operated.
+            store.append_event("planner_decision", {"routine": True})
+            store.connection.execute("UPDATE event_log SET created_at='2020-01-01T00:00:00Z'")
+            store.prune_event_log(30)
+            kinds = {row[0] for row in store.connection.execute("SELECT kind FROM event_log")}
+            self.assertEqual(kinds, {"memory_capture_pending", "memory_capture_released"})
+            store.close()
+
     def test_hot_query_paths_are_indexed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
@@ -826,4 +962,107 @@ class CoreTests(unittest.TestCase):
             self.assertIsNotNone(store.effect(key), "the address in the retained snapshot must resolve")
             store.connection.execute("DELETE FROM episode_snapshots WHERE run_id='run-1'")
             self.assertEqual(store.prune_capability_effects(30), 1, "with the snapshot gone the pin releases")
+            store.close()
+
+class MemoryCandidateEvidenceTests(unittest.TestCase):
+    """The memory loop's own `evidence` field must reach the row it supports.
+
+    `model_contracts.MEMORY_RESPONSE_SCHEMA` declares `evidence` on every
+    candidate, but `_consolidate_candidates` only read it to build a supersede
+    note and never wrote it to the new row, so a consolidated claim arrived
+    without its support (measured: of 44 belief-kind rows written
+    after commit 3c8f3fa, 39 carried no evidence). `remember_memory` stored
+    evidence, which is why `MemoryTool` never exposed the loss.
+    """
+
+    def test_candidate_evidence_is_stored_on_the_new_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.consolidate(
+                "run-1",
+                [
+                    {
+                        "kind": "measurement",
+                        "content": "a measured claim",
+                        "confidence": 0.9,
+                        "evidence": ["commit 9b36ef50", "measured 2026-09-22"],
+                    }
+                ],
+            )
+            row = store.connection.execute(
+                "SELECT evidence, source_run FROM memories WHERE content=?", ("a measured claim",)
+            ).fetchone()
+            self.assertEqual(row["evidence"], "commit 9b36ef50; measured 2026-09-22")
+            self.assertEqual(row["source_run"], "run-1")
+            store.close()
+
+    def test_a_candidate_without_evidence_is_left_unattributed_not_invented(self) -> None:
+        # An absent, empty or non-string citation must stay NULL: a fabricated
+        # citation is worse than none, and NULL is what the provenance counts in
+        # memory_audit read as "not written by the live memory tool".
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            for content, evidence in (("no field", None), ("empty list", []), ("junk", 42)):
+                item: dict[str, object] = {"kind": "fact", "content": content}
+                if evidence is not None:
+                    item["evidence"] = evidence
+                store.consolidate("run-1", [item])
+            rows = {
+                row["content"]: row["evidence"]
+                for row in store.connection.execute("SELECT content, evidence FROM memories")
+            }
+            self.assertEqual(rows, {"no field": None, "empty list": None, "junk": None})
+            store.close()
+
+    def test_repeat_consolidation_does_not_erase_a_stored_citation(self) -> None:
+        # The insert upserts on (kind, content); a later repeat that omits the
+        # citation must not blank the one already on the row.
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.consolidate("run-1", [{"kind": "fact", "content": "same claim", "evidence": "commit abc1234"}])
+            store.consolidate("run-2", [{"kind": "fact", "content": "same claim"}])
+            row = store.connection.execute(
+                "SELECT evidence FROM memories WHERE content=?", ("same claim",)
+            ).fetchone()
+            self.assertEqual(row["evidence"], "commit abc1234")
+            store.close()
+
+
+class ResilienceDiagnosticsTests(unittest.TestCase):
+    """The incident was invisible in the durable record; pin the fix."""
+
+    def test_provider_output_truncated_is_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.record_provider_event("provider_output_truncated", {"provider": "nemotron", "text_chars": 0})
+            rows = store.connection.execute(
+                "SELECT COUNT(*) FROM event_log WHERE kind='provider_output_truncated'"
+            ).fetchone()[0]
+            self.assertEqual(rows, 1)
+            store.close()
+
+    def test_the_stall_trail_survives_retention(self) -> None:
+        from skynet.store import PROTECTED_EVENT_KINDS
+
+        for kind in ("planner_backoff", "planner_fallback_created", "provider_output_truncated"):
+            self.assertIn(kind, PROTECTED_EVENT_KINDS)
+
+    def test_work_mix_counts_created_tasks_by_area(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("a goal")
+            store.add_task("t1", goal_id, area="validation")
+            store.add_task("t2", goal_id, area="validation")
+            store.add_task("t3", goal_id, area="engineering")
+            mix = metrics.work_mix(store.connection, "1970-01-01T00:00:00Z")
+            self.assertEqual(mix["total"], 3)
+            self.assertEqual(mix["by_area"], {"validation": 2, "engineering": 1})
+            store.close()
+
+    def test_snapshot_carries_the_work_mix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            data = metrics.snapshot(store, since_days=1.0)
+            self.assertIn("work_mix", data)
+            self.assertIn("by_area", data["work_mix"])
             store.close()

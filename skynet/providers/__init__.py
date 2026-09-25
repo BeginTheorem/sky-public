@@ -89,10 +89,15 @@ def build_provider() -> FallbackProvider:
                     api_key=key, model=os.getenv("NEMOTRON_MODEL", os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b")),
                     timeout_seconds=float(os.getenv("NEMOTRON_TIMEOUT_SECONDS", os.getenv("NVIDIA_TIMEOUT_SECONDS", "120"))),
                     max_output_tokens=int(os.getenv("NEMOTRON_MAX_OUTPUT_TOKENS", os.getenv("NVIDIA_MAX_OUTPUT_TOKENS", "8192"))),
-                    temperature=1.0, top_p=0.95, reject_reasoning_leakage=True,
+                    # No leak guard: nemotron returns reasoning in ``content`` on
+                    # the no-tools planner path, and the guard turned a parseable
+                    # reply into ``response_quality`` provider errors on the live
+                    # switch. The ReAct Finish-Report parser already
+                    # refuses prose, so the provider-level guard only hurts.
+                    temperature=1.0, top_p=0.95,
                     proxy_url=os.getenv("NEMOTRON_PROXY_URL", os.getenv("NVIDIA_PROXY_URL", "")) or None,
                 ))
-        elif name in {"openrouter"}:
+        elif name in {"openrouter", "open_router"}:
             key = os.getenv("OPENROUTER_API_KEY", "")
             if _provider_enabled("openrouter", False) and key:
                 providers.append(OpenRouterProvider(
@@ -105,6 +110,24 @@ def build_provider() -> FallbackProvider:
                     # The idle timeout is the hang budget: it only fires on
                     # silence, so a long active reasoning stream is not cut off.
                     # The overall deadline is off unless an operator sets it.
+                    chunk_timeout_seconds=float(os.getenv("OPENROUTER_CHUNK_TIMEOUT_SECONDS", "900")),
+                    stream_deadline_seconds=_optional_seconds(os.getenv("OPENROUTER_STREAM_DEADLINE_SECONDS", "0")),
+                ))
+        elif name in {"openrouter_glm", "open_router_glm"}:
+            # A second rung on the same openrouter endpoint: the primary
+            # ``openrouter`` rung is DeepSeek, this one is the backup model.
+            # Distinct ``name`` keeps their cooldowns independent, so a bad
+            # DeepSeek window does not bench the backup.
+            key = os.getenv("OPENROUTER_API_KEY", "")
+            if _provider_enabled(name, False) and key:
+                providers.append(OpenRouterProvider(
+                    name="openrouter_glm",
+                    base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                    api_key=key,
+                    model=os.getenv("OPENROUTER_GLM_MODEL", "z-ai/glm-5.3-flash"),
+                    timeout_seconds=float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "30")),
+                    max_attempts=int(os.getenv("OPENROUTER_MAX_ATTEMPTS", "1")),
+                    retry_delay_seconds=float(os.getenv("OPENROUTER_RETRY_DELAY_SECONDS", "1")),
                     chunk_timeout_seconds=float(os.getenv("OPENROUTER_CHUNK_TIMEOUT_SECONDS", "900")),
                     stream_deadline_seconds=_optional_seconds(os.getenv("OPENROUTER_STREAM_DEADLINE_SECONDS", "0")),
                 ))
@@ -131,6 +154,11 @@ def build_provider() -> FallbackProvider:
         strike_delay_seconds=float(os.getenv("SKYNET_PROVIDER_STRIKE_DELAY", "30")),
         state_path=Path(state_path) if state_path else None,
         ladder_deadline_seconds=float(os.getenv("SKYNET_PROVIDER_LADDER_DEADLINE", "600")),
+        # A chain-wide cooldown whose earliest horizon is this short is waited
+        # out once per call instead of discarding the episode with zero strikes
+        # (measured: 5 of 21 needs_recovery runs, 12.2-30.0s horizons). "0"
+        # restores the raise-immediately behaviour.
+        max_wait_for_cooldown_seconds=float(os.getenv("SKYNET_PROVIDER_COOLDOWN_WAIT", "30")),
         active_names=active_chain_names,
     )
 
@@ -181,6 +209,9 @@ _ENABLE_FLAGS: dict[str, tuple[str, ...]] = {
     "nemotron": ("NEMOTRON_ENABLED", "NVIDIA_ENABLED"),
     "nvidia_nemotron": ("NEMOTRON_ENABLED", "NVIDIA_ENABLED"),
     "openrouter": ("OPENROUTER_ENABLED",),
+    "open_router": ("OPENROUTER_ENABLED",),
+    "openrouter_glm": ("OPENROUTER_ENABLED",),
+    "open_router_glm": ("OPENROUTER_ENABLED",),
     "openai": ("OPENAI_ENABLED",),
     "generic": ("OPENAI_ENABLED",),
 }
@@ -195,10 +226,15 @@ def _provider_enabled(name: str, default: bool) -> bool:
     return default
 
 
-# Provider's default chain. Every implementation stays in place, not deleted:
-# enabling or disabling one is an environment decision (`*_ENABLED=false`,
-# `SKYNET_PROVIDER_CHAIN=...`), so the chain changes without a code change.
-DEFAULT_CHAIN = "openrouter,nvidia_deepseek,nemotron,ollama"
+# Provider archive: the organism runs on the paid openrouter provider
+# only. The other implementations are kept in place, not deleted — disabling is
+# an environment decision (`*_ENABLED=false`, `SKYNET_PROVIDER_CHAIN=openrouter`) so
+# they can be re-enabled without a code change when the paid budget ends.
+DEFAULT_CHAIN = "openrouter,openrouter_glm,nvidia_deepseek,nemotron,ollama"
+
+# Providers that are only active while money-boost is on: the paid openrouter
+# rungs. The backup-model rung is gated exactly like the primary one.
+PAID_PROVIDER_NAMES = frozenset({"openrouter", "open_router", "openrouter_glm", "open_router_glm"})
 
 
 def active_chain_names() -> list[str]:
@@ -210,7 +246,7 @@ def active_chain_names() -> list[str]:
     """
     chain = _split(os.getenv("SKYNET_PROVIDER_CHAIN", DEFAULT_CHAIN)) or _split(DEFAULT_CHAIN)
     if not _money_boost_enabled():
-        chain = [name for name in chain if name not in {"openrouter"}]
+        chain = [name for name in chain if name not in PAID_PROVIDER_NAMES]
     return [name for name in chain if _provider_enabled(name, True)]
 
 

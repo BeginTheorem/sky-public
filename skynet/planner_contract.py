@@ -3,7 +3,7 @@
 This module is deliberately **not** in the
 ``self_improvement.GATE_PROTECTED_PATHS`` warn-set. It is the *instrument* the planner
 uses to talk to the model — the system prompt, the payload instruction, the
-repair instruction and the text-to-value decoder. The 2026-09-20 incident is
+repair instruction and the text-to-value decoder. The incident is
 the evidence for why an instrument must stay repairable by the organism itself:
 the decoder destroyed a legitimate top-level JSON array and 15 of 18 planner
 attempts failed for a day, while the empty portfolio it returned was
@@ -26,6 +26,7 @@ Each proposal must contain goal_id, title, problem, hypothesis, expected_new_fac
 The proposal must be useful without user input, have observable validation, and be smaller than a broad project.
 Do not repeat completed, blocked, exhausted, pending, or rejected work. Do not generate numbered pass/iteration/cycle variants.
 Do not execute tools or describe tool calls. Allowed kind values: engineering, research, validation, recovery, observation, self_improvement.
+Prefer at most one validation or observation proposal per reply. The remaining proposals should be engineering or research that leaves the harness able to do something it could not do before; a validation that only re-checks existing behaviour, or an observation that only re-reads the organism, is the least valuable work available.
 For kind=research, set inspiration_ref to the external source (arXiv id, repository URL, or page URL) and make expected_new_fact the distilled, testable claim taken from it; a research proposal without a source will be rejected.
 Prefer proposals that occupy an empty descriptor cell: the payload lists cell_coverage, and an idea in an unexplored subsystem/change-type/evidence-source combination outranks a third variation of an already-worked one.
 A proposal may name parent_idea_id to develop an archived idea instead of starting from nothing."""
@@ -69,7 +70,7 @@ def _describe_decode_failure(text: str, exc: ValueError) -> ValueError:
     """``exc`` with a bounded preview of ``text`` appended to its message.
 
     The reply is the evidence a decode failure is judged against, and it was
-    recorded nowhere: the 2026-09-21T01:25:27Z retry failure (attempt
+    recorded nowhere: the retry failure (attempt
     ``4216e797``) left only "structured model response contains no acceptable
     JSON value", so prose and a reply cut off at the output ceiling were
     indistinguishable after the fact — the ``finish_reason`` telemetry that

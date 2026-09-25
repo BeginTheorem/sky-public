@@ -43,6 +43,9 @@ DEVIATION_KINDS = (
     "livelock_suspected",
     "memory_loop_failed",
     "memory_degraded",
+    # An episode whose memory work was lost and left recoverable: it counts as a
+    # way the cycle went wrong, so the deviations digest must show it.
+    "memory_capture_pending",
     "policy_denied",
     "policy_soft_denied",
     "gate_protected_warned",
@@ -110,6 +113,25 @@ def deviations(connection: sqlite3.Connection, since: str) -> dict[str, int]:
         (since, *DEVIATION_KINDS),
     )
     return {str(row["kind"]): int(row["n"]) for row in rows}
+
+
+def work_mix(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
+    """Accepted-proposal mix by kind, so metabolic drift becomes a number.
+
+    ``tasks.area`` carries the proposal kind (``record_planner_proposal`` passes
+    it through), so the distribution of tasks created over the window is the
+    closest durable proxy for what the organism chose to spend its cycles on. An
+    audit of the first 34 self-improvement commits found the work substantive but
+    mostly self-verification; this turns that ratio into a measurement instead of
+    an impression.
+    """
+    rows = _rows(
+        connection,
+        "SELECT area, COUNT(*) AS n FROM tasks WHERE created_at >= ? GROUP BY area ORDER BY n DESC",
+        (since,),
+    )
+    counts = {str(row["area"]): int(row["n"]) for row in rows}
+    return {"total": sum(counts.values()), "by_area": counts}
 
 
 def provider_failures(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
@@ -308,12 +330,20 @@ def memory_health(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
         (since, MEMORY_RETRIEVAL_KIND),
     )
     hits: list[int] = []
+    injected: list[int] = []
+    unresolvable: list[int] = []
     for row in retrieval:
         try:
             payload = json.loads(row["payload"])
         except (TypeError, json.JSONDecodeError):
             continue
         hits.append(int(payload.get("hits", 0) or 0))
+        # Rows written before the provenance fields exist are skipped rather
+        # than read as zero, which would look like a clean corpus.
+        if "injected_total" not in payload:
+            continue
+        injected.append(int(payload.get("injected_total", 0) or 0))
+        unresolvable.append(int(payload.get("injected_unresolvable", 0) or 0))
     return {
         "memories": total,
         "distinct_kinds": len(kinds),
@@ -322,6 +352,13 @@ def memory_health(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
         "retrieval_samples": len(hits),
         "retrieval_median_hits": _median(hits),
         "retrieval_zero_hit_runs": sum(1 for item in hits if item == 0),
+        # The retrieval path injects a memory because it matches or because it is
+        # pinned, never because its provenance resolves; these counts are the
+        # first measurement of that gap and the baseline any trust policy must move.
+        "retrieval_injected_samples": len(injected),
+        "retrieval_injected": sum(injected),
+        "retrieval_unresolvable_injected": sum(unresolvable),
+        "retrieval_unresolvable_ratio": round(sum(unresolvable) / sum(injected), 4) if sum(injected) else None,
     }
 
 
@@ -421,6 +458,7 @@ def snapshot(
         "window_days": round(since_days, 3),
         "since": since,
         "outcomes": outcome_mix(connection, since),
+        "work_mix": work_mix(connection, since),
         "deviations": deviations(connection, since),
         "providers": provider_failures(connection, since),
         "livelock": livelock_streaks(connection, since),
@@ -505,12 +543,14 @@ def format_report(data: dict[str, Any], *, max_chars: int = 3800) -> str:
     )
     memory = data.get("memory", {})
     lines.append(
-        "memory: total={total} kinds={kinds} pinned={pinned} median_hits={hits} zero_hit_runs={zero}".format(
+        "memory: total={total} kinds={kinds} pinned={pinned} median_hits={hits} zero_hit_runs={zero} "
+        "unresolvable_injected={unresolvable}".format(
             total=memory.get("memories", 0),
             kinds=memory.get("distinct_kinds", 0),
             pinned=memory.get("pinned", 0),
             hits=memory.get("retrieval_median_hits"),
             zero=memory.get("retrieval_zero_hit_runs", 0),
+            unresolvable=memory.get("retrieval_unresolvable_injected"),
         )
     )
     delivery = data.get("delivery", {})

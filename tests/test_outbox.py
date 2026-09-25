@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -220,6 +222,136 @@ class OutboxDrainerTests(unittest.TestCase):
         self.assertIn("/logs", raw)
 
 
+# A crash between the `delivering` write and the terminal write is the one window
+# in which the outbox can lose a verified message. The two child processes below
+# reproduce exactly that window: the first claims the row and exits with
+# ``os._exit`` before ``mark_delivered``/``mark_failed``, the second is a fresh
+# process whose first writable open of the same file is startup recovery.
+SEEDER = """
+import json, os, sys
+from datetime import timedelta
+from pathlib import Path
+from skynet.store import StateStore
+from skynet.time import utc_datetime_now
+
+db, mode = Path(sys.argv[1]), sys.argv[2]
+store = StateStore(db)
+store.add_outbox("agent_response", {"run_id": "stranded-" + mode, "status": "completed",
+                                    "report": json.dumps({"summary": "stranded-" + mode})})
+claimed = store.claim_outbox(limit=5)
+if len(claimed) != 1:
+    raise SystemExit("expected exactly one claim, got %r" % (claimed,))
+message_id = claimed[0]["message_id"]
+if mode == "expired":
+    stale = (utc_datetime_now() - timedelta(seconds=3600)).isoformat().replace("+00:00", "Z")
+    store.connection.execute("UPDATE outbox SET claimed_at=? WHERE message_id=?", (stale, message_id))
+elif mode == "null":
+    store.connection.execute("UPDATE outbox SET claimed_at=NULL WHERE message_id=?", (message_id,))
+store.connection.commit()
+print("seeded " + message_id, flush=True)
+os._exit(0)
+"""
+
+RESTARTER = """
+import json, sys
+from datetime import timedelta
+from pathlib import Path
+from skynet.outbox import OutboxDrainer
+from skynet.store import StateStore
+from skynet.time import utc_datetime_now
+
+class Recorder:
+    def __init__(self):
+        self.sent = []
+    def send(self, text):
+        self.sent.append(text)
+
+db, mode = Path(sys.argv[1]), sys.argv[2]
+store = StateStore(db)
+def snapshot():
+    return dict(store.connection.execute(
+        "SELECT delivery_state, claimed_at, attempts, delivered_at FROM outbox").fetchone())
+after_open = snapshot()
+transport = Recorder()
+drainer = OutboxDrainer(store, transport, batch=5, backlog_limit=0)
+drains = [drainer.drain(), drainer.drain()]
+sends_before_late = len(transport.sent)
+late_drains = None
+if mode == "fresh" and snapshot()["delivery_state"] == "delivering":
+    stale = (utc_datetime_now() - timedelta(seconds=3600)).isoformat().replace("+00:00", "Z")
+    store.connection.execute("UPDATE outbox SET claimed_at=?", (stale,))
+    store.connection.commit()
+    late_drains = [drainer.drain(), drainer.drain()]
+print(json.dumps({"after_open": after_open, "drains": drains,
+                  "sends_before_late": sends_before_late,
+                  "late_drains": late_drains, "after": snapshot(),
+                  "total_sends": len(transport.sent)}))
+store.close()
+"""
+
+
+class OutboxLeaseStrandingTests(unittest.TestCase):
+    """The verdict for a row a dead sender left in `delivering`.
+
+    Measured with this probe: an expired lease is returned to
+    `pending` by startup recovery and delivered exactly once; a lease inside the
+    window is left alone (no reset, no send) and is picked up once the window
+    passes; a NULL `claimed_at` is recovered too. Nothing is stranded.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def _run(self, db, mode, snippet):
+        child_environment = os.environ.copy()
+        child_environment["PYTHONPATH"] = str(self.ROOT)
+        return subprocess.run(
+            [sys.executable, "-c", snippet, str(db), mode],
+            cwd=str(self.ROOT), env=child_environment, capture_output=True, text=True, timeout=120,
+        )
+
+    def _crash_with_lease(self, db, mode):
+        result = self._run(db, mode, SEEDER)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("seeded", result.stdout)
+
+    def _restart_and_drain(self, db, mode):
+        result = self._run(db, mode, RESTARTER)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_expired_lease_after_a_dead_sender_is_delivered_exactly_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "state.sqlite3"
+            self._crash_with_lease(db, "expired")
+            verdict = self._restart_and_drain(db, "expired")
+            self.assertEqual(verdict["after_open"]["delivery_state"], "pending")
+            self.assertEqual(verdict["drains"], [1, 0])
+            self.assertEqual(verdict["after"]["delivery_state"], "delivered")
+            self.assertEqual(verdict["total_sends"], 1)
+
+    def test_live_lease_is_not_reset_and_is_not_stranded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "state.sqlite3"
+            self._crash_with_lease(db, "fresh")
+            verdict = self._restart_and_drain(db, "fresh")
+            self.assertEqual(verdict["after_open"]["delivery_state"], "delivering")
+            self.assertEqual(verdict["drains"], [0, 0])
+            self.assertEqual(verdict["sends_before_late"], 0)
+            self.assertEqual(verdict["late_drains"], [1, 0])
+            self.assertEqual(verdict["after"]["delivery_state"], "delivered")
+            self.assertEqual(verdict["total_sends"], 1)
+
+    def test_null_claimed_at_lease_is_reclaimed_at_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "state.sqlite3"
+            self._crash_with_lease(db, "null")
+            verdict = self._restart_and_drain(db, "null")
+            self.assertEqual(verdict["after_open"]["delivery_state"], "pending")
+            self.assertEqual(verdict["drains"], [1, 0])
+            self.assertEqual(verdict["total_sends"], 1)
+            self.assertEqual(verdict["after"]["delivery_state"], "delivered")
+
+
 class AlertScriptTests(unittest.TestCase):
     SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "alert.sh"
 
@@ -256,6 +388,17 @@ class AlertScriptTests(unittest.TestCase):
             }
             result = subprocess.run(["bash", str(self.SCRIPT), "skynet.service", "unit failed"], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0)
+
+    def test_canonical_allowed_chat_id_is_used(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env, record = self._fake_curl_env(
+                Path(directory),
+                {"SKYNET_TELEGRAM_BOT_TOKEN": "123:secret", "SKYNET_TELEGRAM_ALLOWED_CHAT_ID": "42"},
+            )
+            result = subprocess.run(["bash", str(self.SCRIPT), "skynet.service", "unit failed"], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertNotIn("skipped", result.stderr)
+            self.assertTrue(record.exists(), "the canonical chat-id key must reach curl")
 
     def test_token_never_appears_in_argv(self):
         with tempfile.TemporaryDirectory() as directory:

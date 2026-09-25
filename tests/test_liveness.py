@@ -8,11 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 from helpers import FixtureTool
 
 from skynet.dialogue import AcknowledgeInboxTool
-from skynet.models import ModelTurn, RunStatus, ToolCall
+from skynet.metrics import format_report, memory_health
+from skynet.models import AgentRunResult, ModelTurn, RunStatus, ToolCall
 from skynet.planner import PortfolioPlanner
 from skynet.reactor import Reactor, ReactorConfig
 from skynet.time import parse_timestamp, utc_datetime_now
@@ -502,6 +504,521 @@ class LivenessTests(unittest.TestCase):
             self.assertEqual(observations["reboot_outcome"]["proposal_id"], "p1")
             reactor.close()
 
+    def test_start_envelope_reports_an_open_window_as_in_progress_and_live(self) -> None:
+        """A promotion mid-window must be visible without re-checking git by hand.
+
+        Measured on the live event log: 81 promotions carried
+        restart_after_checkpoint, only 2 ever reached a terminal
+        reboot_observation row, yet 80 of 108 run envelopes carried the
+        "verify the promoted self-improvement after reboot" hint. The window
+        was durable but unreadable: ``begin`` wrote no ``active`` key, so
+        ``_reboot_outcome``'s ``in_progress`` branch could not fire and no
+        envelope ever saw ``in_progress`` (18 of 18 read ``accepted``).
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": head, "rollback_commit": head,
+                    "healthy_cycles": 1, "active": True, "failed": False,
+                    "started_at": "2026-09-18T00:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            reactor.tick("test")
+            payload = json.loads(
+                reactor.store.connection.execute(
+                    "SELECT payload FROM event_log WHERE kind='run_started' ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()[0]
+            )
+            observations = {item["kind"]: item for item in payload["observations"]}
+            outcome = observations["reboot_outcome"]
+            self.assertEqual(outcome["outcome"], "in_progress")
+            self.assertEqual(outcome["proposal_id"], "p1")
+            self.assertEqual(outcome["commit"], head)
+            self.assertEqual(outcome["head"], head)
+            self.assertTrue(outcome["live"])
+            self.assertNotIn("stale", outcome)
+            reactor.close()
+
+    def test_recovery_hint_yields_to_the_envelope_it_would_ask_about(self) -> None:
+        """A resolved window must not also be handed to the next run as a hint.
+
+        Measured on the live event log: 81 of 109 run_started
+        envelopes carried "verify the promoted self-improvement after reboot",
+        and each of those runs was exactly the run the reboot window covered --
+        it paid a `git rev-parse HEAD` re-verification although the envelope
+        already carried outcome=in_progress, live=true. The hint is now emitted
+        only when the window cannot answer for itself.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": head, "rollback_commit": head,
+                    "healthy_cycles": 1, "active": True, "failed": False,
+                    "started_at": "2026-09-18T00:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            with patch.object(reactor.runner, "run", return_value=AgentRunResult(
+                status=RunStatus.COMPLETED,
+                report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                steps=1,
+                usage_tokens=1,
+                control_action={"type": "restart_after_checkpoint", "proposal_id": "p1", "commit": head},
+            )):
+                reactor.tick("test")
+            # The block is written into the durable plan the NEXT start envelope
+            # serializes, so read it from the store, not from this run's envelope.
+            block = reactor.store.state().next_plan["self_improvement_recovery"]
+            self.assertTrue(block["resolved"])
+            self.assertNotIn("next", block, "the envelope already answers the question, so no hint is emitted")
+            self.assertNotIn("verify the promoted self-improvement after reboot", json.dumps(reactor.store.state().next_plan))
+            # The observation and the decision to skip the hint travel together:
+            # the same envelope that now carries the answer carries the outcome.
+            payload = json.loads(
+                reactor.store.connection.execute(
+                    "SELECT payload FROM event_log WHERE kind='run_started' ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()[0]
+            )
+            outcome = {item["kind"]: item for item in payload["observations"]}["reboot_outcome"]
+            self.assertEqual((outcome["outcome"], outcome["live"]), ("in_progress", True))
+            reactor.close()
+
+    def test_recovery_hint_survives_when_no_window_can_answer_it(self) -> None:
+        """No guard row means nothing to read, so the re-verification stays."""
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            with patch.object(reactor.runner, "run", return_value=AgentRunResult(
+                status=RunStatus.COMPLETED,
+                report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                steps=1,
+                usage_tokens=1,
+                control_action={"type": "restart_after_checkpoint", "proposal_id": "p1", "commit": "abc1234"},
+            )):
+                reactor.tick("test")
+            plan = reactor.store.state().next_plan
+            block = plan["self_improvement_recovery"]
+            self.assertFalse(block["resolved"])
+            self.assertEqual(block["next"], "verify the promoted self-improvement after reboot")
+            self.assertEqual(block["checks"], ["service starts", "database opens", "provider is reachable", "health window completes"])
+            payload = json.loads(
+                reactor.store.connection.execute(
+                    "SELECT payload FROM event_log WHERE kind='run_started' ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()[0]
+            )
+            self.assertNotIn("reboot_outcome", {item["kind"] for item in payload["observations"]})
+            reactor.close()
+
+    def test_resolved_recovery_block_carries_the_verdict_instead_of_asserting_it(self) -> None:
+        """The plan the next run reads must carry the values it would re-derive.
+
+        Measured: the block said ``resolved: true`` and claimed
+        "outcome=in_progress, live=true (head == promoted commit)" as prose, but
+        carried neither the observed outcome, nor head, nor how far the window
+        had run -- so the next run could only take the claim on trust.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": head, "rollback_commit": head,
+                    "healthy_cycles": 1, "window_cycles": 3, "active": True,
+                    "failed": False, "started_at": "2026-09-18T00:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            with patch.object(reactor.runner, "run", return_value=AgentRunResult(
+                status=RunStatus.COMPLETED,
+                report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                steps=1,
+                usage_tokens=1,
+                control_action={"type": "restart_after_checkpoint", "proposal_id": "p1", "commit": head},
+            )):
+                reactor.tick("test")
+            block = reactor.store.state().next_plan["self_improvement_recovery"]
+            print("resolved block:", json.dumps(block, sort_keys=True))
+            self.assertTrue(block["resolved"])
+            self.assertTrue(block["live"])
+            self.assertEqual(block["outcome"], "in_progress")
+            self.assertEqual(block["head"], head)
+            self.assertEqual(block["commit"], head)
+            self.assertEqual(block["healthy_cycles"], 1)
+            self.assertEqual(block["window_cycles"], 3)
+            self.assertNotIn("next", block)
+            self.assertNotIn("checks", block)
+            reactor.close()
+
+    def test_recovery_block_never_asserts_a_verdict_it_did_not_observe(self) -> None:
+        """An unresolved block used to carry resolved_by claiming live=true.
+
+        Read: with ``resolved: false`` the block still read
+        "reboot_outcome in the next start envelope: outcome=in_progress,
+        live=true (head == promoted commit)" -- the exact claim the branch had
+        just failed to establish. A reader that trusts ``resolved_by`` would
+        believe the promotion was verified when it was not.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            with patch.object(reactor.runner, "run", return_value=AgentRunResult(
+                status=RunStatus.COMPLETED,
+                report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                steps=1,
+                usage_tokens=1,
+                control_action={"type": "restart_after_checkpoint", "proposal_id": "p1", "commit": "abc1234"},
+            )):
+                reactor.tick("test")
+            block = reactor.store.state().next_plan["self_improvement_recovery"]
+            print("unresolved block:", json.dumps(block, sort_keys=True))
+            self.assertFalse(block["resolved"])
+            self.assertNotIn("resolved_by", block)
+            self.assertIn("no reboot window is readable", block["unresolved_because"])
+            # The historical hint and its four checks survive unchanged.
+            self.assertEqual(block["next"], "verify the promoted self-improvement after reboot")
+            self.assertEqual(block["checks"], ["service starts", "database opens", "provider is reachable", "health window completes"])
+            reactor.close()
+
+    def test_unresolved_recovery_block_names_a_window_on_a_commit_head_is_not_on(self) -> None:
+        """The three ways a window can fail to answer are distinguished."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            stale = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "tracked.py").write_text("two\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "later"], cwd=root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": stale, "rollback_commit": stale,
+                    "healthy_cycles": 1, "active": True, "failed": False,
+                    "started_at": "2026-09-18T00:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            with patch.object(reactor.runner, "run", return_value=AgentRunResult(
+                status=RunStatus.COMPLETED,
+                report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                steps=1,
+                usage_tokens=1,
+                control_action={"type": "restart_after_checkpoint", "proposal_id": "p1", "commit": stale},
+            )):
+                reactor.tick("test")
+            block = reactor.store.state().next_plan["self_improvement_recovery"]
+            print("stale-window block:", json.dumps(block, sort_keys=True))
+            self.assertFalse(block["resolved"])
+            self.assertFalse(block["live"])
+            self.assertIn(stale, block["unresolved_because"])
+            self.assertIn(head, block["unresolved_because"])
+            # A guard row written before ``begin`` recorded the window size has no
+            # ``window_cycles`` key; the block must omit it rather than invent one.
+            self.assertNotIn("window_cycles", block)
+            self.assertEqual(block["next"], "verify the promoted self-improvement after reboot")
+            reactor.close()
+
+    def test_recovery_block_reads_the_verdict_of_the_window_it_names(self) -> None:
+        """The block's verdict must describe the window the block names.
+
+        Read (event_log 17949): run b59054c5 started while the
+        window in front of it was terminal, promoted d275d4b8, and wrote
+        ``resolved: false`` plus the "verify the promoted self-improvement after
+        reboot" imperative for it -- although d275d4b8 was live, as the very next
+        start envelope's reboot_outcome (outcome=in_progress, head=d275d4b8,
+        live=true) shows. The verdict was computed from the wake-time
+        observation, which describes the *previous* window, and then attached to
+        a different commit. ``reboot_outcome`` is therefore re-read for the
+        promoted commit, so a promotion that is live is not handed back as an
+        unverified hint.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            old_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            # The window in front of this run is terminal: its envelope reads
+            # outcome=accepted, which is exactly why the verdict used to be false.
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": old_head, "rollback_commit": old_head,
+                    "healthy_cycles": 3, "window_cycles": 3, "active": False,
+                    "failed": False, "completed_at": "2026-09-22T20:50:24Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            promoted: dict[str, str] = {}
+
+            def promotion(*_args, **_kwargs):
+                """What a real promotion does: commit, then open a fresh window."""
+                (root / "tracked.py").write_text("two\n", encoding="utf-8")
+                subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+                subprocess.run(["git", "commit", "-qm", "promoted"], cwd=root, check=True)
+                new_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+                promoted["head"] = new_head
+                (root / "reboot-guard.json").write_text(
+                    json.dumps({
+                        "proposal_id": "p2", "commit": new_head, "rollback_commit": old_head,
+                        "healthy_cycles": 1, "window_cycles": 3, "active": True,
+                        "failed": False, "release": None,
+                        "started_at": "2026-09-22T21:49:44Z",
+                    }),
+                    encoding="utf-8",
+                )
+                return AgentRunResult(
+                    status=RunStatus.COMPLETED,
+                    report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                    steps=1,
+                    usage_tokens=1,
+                    control_action={"type": "restart_after_checkpoint", "proposal_id": "p2", "commit": new_head},
+                )
+
+            with patch.object(reactor.runner, "run", side_effect=promotion):
+                reactor.tick("test")
+            block = reactor.store.state().next_plan["self_improvement_recovery"]
+            print("block after a live promotion:", json.dumps(block, sort_keys=True))
+            self.assertTrue(block["resolved"], "the promotion is live, so the block must not ask for re-verification")
+            self.assertTrue(block["live"])
+            self.assertEqual(block["commit"], promoted["head"])
+            self.assertEqual(block["head"], promoted["head"])
+            self.assertEqual(block["outcome"], "in_progress")
+            self.assertNotIn("next", block)
+            self.assertNotIn("checks", block)
+            self.assertNotIn("unresolved_because", block)
+            reactor.close()
+
+    def test_resolved_recovery_block_omits_a_progress_count_it_did_not_read(self) -> None:
+        """Progress counters belong to the window they were read from.
+
+        Measured on the live plan ledger: all 11 resolved
+        ``self_improvement_recovery`` blocks carried the *previous* window's
+        ``healthy_cycles``. The shape is ordinary -- the promotion commits, and
+        its own guard row is written only by the next startup, so the row
+        readable at block-emission time names the commit promoted *before* this
+        one (event_log 23247: block commit 661c05d4, the row it read named
+        76e07b58 with healthy_cycles=2, and the block reported 2 of 3). The
+        committed window had run zero cycles. ``live`` is a fact about HEAD and
+        stays true, but "N of M healthy cycles" is a claim about the named
+        window's progress.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            previous = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            # The row in front of this run is OPEN and names the PREVIOUS
+            # promotion, two-thirds of the way through its own window.
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": previous, "rollback_commit": previous,
+                    "healthy_cycles": 2, "window_cycles": 3, "active": True,
+                    "failed": False, "started_at": "2026-09-24T14:30:00Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            promoted: dict[str, str] = {}
+
+            def promotion(*_args, **_kwargs):
+                """A promotion commits; its own guard row waits for the restart."""
+                (root / "tracked.py").write_text("two\n", encoding="utf-8")
+                subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+                subprocess.run(["git", "commit", "-qm", "promoted"], cwd=root, check=True)
+                promoted["head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+                return AgentRunResult(
+                    status=RunStatus.COMPLETED,
+                    report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                    steps=1,
+                    usage_tokens=1,
+                    control_action={"type": "restart_after_checkpoint", "proposal_id": "p2", "commit": promoted["head"]},
+                )
+
+            with patch.object(reactor.runner, "run", side_effect=promotion):
+                reactor.tick("test")
+            block = reactor.store.state().next_plan["self_improvement_recovery"]
+            print("block after promoting past an open window:", json.dumps(block, sort_keys=True))
+            self.assertTrue(block["resolved"])
+            self.assertTrue(block["live"])
+            self.assertEqual(block["commit"], promoted["head"])
+            self.assertEqual(block["head"], promoted["head"])
+            self.assertNotEqual(block["commit"], previous)
+            # 2 of 3 belongs to the window that named ``previous``, not to this one.
+            self.assertNotIn("healthy_cycles", block)
+            self.assertNotIn("window_cycles", block)
+            reactor.close()
+
+    def test_recovery_block_never_blames_a_window_it_did_not_read(self) -> None:
+        """A window that names a different commit must not be reported as this one's.
+
+        Measured on the live event log: all 8 ``unresolved_because`` strings ever
+        written are the same misattribution, "the reboot window already ended
+        (outcome=accepted)" -- including event_log 22361, where the row that
+        answered named the *previous* promotion (e3fb1093) while the window for
+        the promotion under test (324d958a) had not opened yet. The flag that
+        gates the honest message was ``bool(verdict)``, i.e. True for any row at
+        all, so the branch "no reboot window names the promoted commit" was
+        unreachable and the block asserted a fact about a window it never read.
+        That false reason is what the planner turned into a queued
+        re-verification task.
+
+        This test reproduces the live shape exactly: a terminal window in front
+        of the run naming the base commit, and a promotion whose own window has
+        not been opened yet.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            old_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            # The window in front of this run already ended, and it names the
+            # PREVIOUS promotion's commit.
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": old_head, "rollback_commit": old_head,
+                    "healthy_cycles": 3, "window_cycles": 3, "active": False,
+                    "failed": False, "completed_at": "2026-09-24T11:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            promoted: dict[str, str] = {}
+
+            def promotion(*_args, **_kwargs):
+                """A promotion commits, but its window opens only at the restart."""
+                (root / "tracked.py").write_text("two\n", encoding="utf-8")
+                subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+                subprocess.run(["git", "commit", "-qm", "promoted"], cwd=root, check=True)
+                promoted["head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+                return AgentRunResult(
+                    status=RunStatus.COMPLETED,
+                    report=json.dumps({"status": "COMPLETED", "summary": "promoted"}),
+                    steps=1,
+                    usage_tokens=1,
+                    control_action={"type": "restart_after_checkpoint", "proposal_id": "p2", "commit": promoted["head"]},
+                )
+
+            with patch.object(reactor.runner, "run", side_effect=promotion):
+                reactor.tick("test")
+            block = reactor.store.state().next_plan["self_improvement_recovery"]
+            print("block with no window for the promotion:", json.dumps(block, sort_keys=True))
+            self.assertFalse(block["resolved"])
+            self.assertEqual(block["commit"], promoted["head"])
+            self.assertIn(promoted["head"], block["unresolved_because"])
+            self.assertNotIn("already ended", block["unresolved_because"])
+            self.assertNotIn(old_head, block["unresolved_because"])
+            # The historical hint and its four checks survive unchanged.
+            self.assertEqual(block["next"], "verify the promoted self-improvement after reboot")
+            self.assertEqual(block["checks"], ["service starts", "database opens", "provider is reachable", "health window completes"])
+            reactor.close()
+
+    def test_start_envelope_names_a_window_the_tree_has_moved_past(self) -> None:
+        """An open window naming a commit HEAD is not on is reported, not hidden.
+
+        This is the observable the deferred-restart confirmation tax was paid
+        for: without it, the only way to learn whether the promoted commit is
+        the running one was to re-run ``git rev-parse HEAD`` by hand in a later
+        run.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "tracked.py").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            stale = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "tracked.py").write_text("two\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "later"], cwd=root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            self.assertNotEqual(head, stale)
+            (root / "reboot-guard.json").write_text(
+                json.dumps({
+                    "proposal_id": "p1", "commit": stale, "rollback_commit": stale,
+                    "healthy_cycles": 1, "active": True, "failed": False,
+                    "started_at": "2026-09-18T00:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            reactor = self._reactor(directory, ProseProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            reactor.tick("test")
+            payload = json.loads(
+                reactor.store.connection.execute(
+                    "SELECT payload FROM event_log WHERE kind='run_started' ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()[0]
+            )
+            observations = {item["kind"]: item for item in payload["observations"]}
+            outcome = observations["reboot_outcome"]
+            self.assertEqual(outcome["outcome"], "in_progress")
+            self.assertEqual(outcome["commit"], stale)
+            self.assertEqual(outcome["head"], head)
+            self.assertFalse(outcome["live"])
+            self.assertTrue(outcome["stale"])
+            reactor.close()
+
     def test_planner_memory_query_is_derived_from_the_situation(self) -> None:
         # The planner used to search a fixed phrase that recalled nothing about
         # the actual goal or the previous outcome.
@@ -547,6 +1064,44 @@ class LivenessTests(unittest.TestCase):
             self.assertIn("hits", payload)
             self.assertIn("query_terms", payload)
             self.assertIn("pinned", payload)
+            # Every injected memory in this fixture has no resolvable provenance,
+            # and the payload must say so instead of leaving it to be inferred.
+            self.assertEqual(payload["injected_total"], payload["hits"] + payload["pinned"])
+            self.assertEqual(payload["injected_resolvable"], 0)
+            self.assertEqual(payload["injected_unresolvable"], payload["injected_total"])
+            # The same counts reach the digest, so the gap is readable without
+            # re-deriving it from the raw payloads.
+            health = memory_health(reactor.store.connection, "1970-01-01T00:00:00Z")
+            self.assertEqual(health["retrieval_injected"], payload["injected_total"])
+            self.assertEqual(health["retrieval_unresolvable_injected"], payload["injected_unresolvable"])
+            self.assertIn("unresolvable_injected=", format_report({"memory": health}))
+            reactor.close()
+
+    def test_memory_provenance_splits_resolvable_from_unknown(self) -> None:
+        """A NULL or unknown source_run is provenance that cannot be checked.
+
+        Retrieval injects on match or pin alone, so the split has to be counted
+        explicitly: a future trust policy needs this number to move, and an
+        unreadable provenance must not be counted as a verified one.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, ProseProvider())
+            store = reactor.store
+            store.connection.execute(
+                "INSERT INTO runs(run_id, attempt, status, started_at, budget) VALUES('run-known',1,'running','2026-01-01T00:00:00Z','{}')"
+            )
+            known = store.remember_memory("a memory from a known run", kind="fact", source_run="run-known")
+            unknown = store.remember_memory("a memory from an unknown run", kind="fact", source_run="ghost-run")
+            orphan = store.remember_memory("a memory with no provenance at all", kind="fact", source_run=None)
+            rows = [
+                dict(row)
+                for row in store.connection.execute(
+                    "SELECT memory_id, source_run FROM memories WHERE memory_id IN (?,?,?)", (known, unknown, orphan)
+                ).fetchall()
+            ]
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(store.memory_provenance(rows), {"total": 3, "resolvable": 1, "unresolvable": 2})
+            self.assertEqual(store.memory_provenance([]), {"total": 0, "resolvable": 0, "unresolvable": 0})
             reactor.close()
 
     @staticmethod

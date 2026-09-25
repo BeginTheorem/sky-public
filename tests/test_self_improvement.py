@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from helpers import commit_all, git_repo
 
+from skynet.outbox import render_alert
 from skynet.recovery import RebootGuard, RecoveryError
 from skynet.self_improvement import (
     DEFAULT_TEST_COMMAND,
@@ -23,7 +24,9 @@ from skynet.self_improvement import (
     SelfImprovementTool,
     classify_failure,
     gate_suite_environment,
+    patch_structure_error,
 )
+from skynet.store import StateStore
 from skynet.time import utc_now
 
 
@@ -154,7 +157,7 @@ class CoreTests(unittest.TestCase):
                 manager.apply_changes(proposal, [{"path": "module.py", "operation": "replace", "old": "value", "new": "x"}])
             manager.discard(proposal)
     def test_self_improvement_replace_keeps_line_boundaries(self) -> None:
-        # The 2026-09-22 proposal_failed rows carried store.py with the import
+        # The proposal_failed rows carried store.py with the import
         # line concatenated with itself ("utc_nowfrom .time import ..."). The
         # applier is an exact single-match string replace, so a replacement must
         # never splice the anchor into its neighbours: pin that boundary here.
@@ -1289,6 +1292,44 @@ class CoreTests(unittest.TestCase):
             self.assertFalse((root / "tests" / "test_new.py").exists())
             self.assertEqual((root / "module.py").read_text(encoding="utf-8"), "value = 1\n")
 
+    def test_protected_warning_alert_carries_no_rollback_condition(self) -> None:
+        # The owner reported "a pile of warnings pointing at an emergency
+        # rollback of the work tree". The alert payload embedded the whole
+        # hypothesis contract, whose mandatory ``rollback_condition`` field is
+        # the only source of the word "rollback" in a warning that rolls nothing
+        # back. Measured on the live store: 9 such alerts, 2745-4471
+        # rendered characters, up to 9 "rollback" occurrences.
+        with tempfile.TemporaryDirectory() as directory:
+            # The store lives outside the repo: a sqlite file inside it would be
+            # an untracked path and the proposal boundary refuses a dirty tree.
+            root = Path(directory) / "repo"
+            root.mkdir()
+            manager, metadata = self._protected_repo(str(root))
+            store = StateStore(Path(directory) / "state.sqlite3")
+            manager.set_store(store)
+            change = {"path": "tests/test_new.py", "operation": "create", "content": "def test_new():\n    assert True\n"}
+            warned = manager.propose_files({}, (sys.executable, "-c", "pass"), changes=[change], metadata=metadata)
+            self.assertTrue(warned["warned"], warned)
+            row = store.connection.execute(
+                "SELECT payload FROM alerts WHERE kind='gate_protected_warned'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            payload = json.loads(row["payload"])
+            rendered = render_alert(
+                {"kind": "gate_protected_warned", "severity": "warning", "occurrences": 1, "payload": payload}
+            )
+            self.assertNotIn("rollback", rendered.lower(), rendered)
+            self.assertNotIn("hypothesis", payload)
+            # The negative control: the durable event keeps the contract, so the
+            # information is not lost, only the misleading alert is.
+            event = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='gate_protected_warned'"
+            ).fetchone()
+            self.assertIsNotNone(event)
+            self.assertIn("rollback_condition", event["payload"])
+            self.assertIn("tests/test_new.py", json.dumps(payload))
+            store.close()
+
     def _protected_repo(self, directory: str) -> tuple[SelfImprovementManager, dict[str, object]]:
         root = Path(directory)
         git_repo(root)
@@ -1392,6 +1433,119 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(record["status"], "awaiting_reboot")
             self.assertIn("module.py", cast(dict, result["applied"])["files"])
             manager._cleanup_worktree(str(record["worktree"]))
+
+    def test_reconcile_marks_rolled_back_only_when_head_is_behind_the_commit(self) -> None:
+        """The discriminating predicate: not-an-ancestor is not a rollback.
+
+        A rollback moves the tree *backwards* below the promoted commit, so the
+        commit contains HEAD. A commit on an unrelated line of history contains
+        HEAD as little as it is contained by it, and calling that a rollback
+        would assert a fact git never established.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "a.txt").write_text("a\n", encoding="utf-8")
+            commit_all(root, "base")
+            (root / "a.txt").write_text("b\n", encoding="utf-8")
+            promoted = commit_all(root, "promoted")
+            subprocess.run(["git", "branch", "keep", promoted], cwd=root, check=True)
+            subprocess.run(["git", "reset", "--hard", "HEAD~1"], cwd=root, check=True)
+            # an unrelated root, sharing no ancestry with HEAD either way
+            subprocess.run(["git", "checkout", "-q", "--orphan", "orph"], cwd=root, check=True)
+            (root / "b.txt").write_text("x\n", encoding="utf-8")
+            subprocess.run(["git", "add", "b.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "orphan"], cwd=root, check=True)
+            orphan = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            subprocess.run(["git", "checkout", "-q", "master"], cwd=root, check=True)
+            state = root / "state"
+            state.mkdir()
+            (state / "self-improvement-proposals.json").write_text(json.dumps({
+                "rolled": {"status": "awaiting_reboot", "promoted_commit": promoted, "worktree": ""},
+                "unrelated": {"status": "awaiting_reboot", "promoted_commit": orphan, "worktree": ""},
+            }), encoding="utf-8")
+            manager = _manager(root)
+            resolved = manager.reconcile_awaiting_reboot()
+            by_id = {entry["proposal_id"]: entry["status"] for entry in resolved}
+            self.assertEqual(by_id.get("rolled"), "rolled_back")
+            # The negative control must NOT be written down as a rollback; it is
+            # left awaiting review instead of being marked rolled_back.
+            self.assertNotIn("unrelated", by_id)
+            record = manager._read_proposals()["unrelated"]
+            self.assertEqual(record["status"], "awaiting_reboot")
+            self.assertNotIn("reboot_result", record)
+
+    def test_reconcile_does_not_re_promote_an_undecidable_interrupted_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "a.txt").write_text("a\n", encoding="utf-8")
+            commit_all(root, "base")
+            subprocess.run(["git", "checkout", "-q", "--orphan", "orph"], cwd=root, check=True)
+            (root / "b.txt").write_text("x\n", encoding="utf-8")
+            subprocess.run(["git", "add", "b.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "orphan"], cwd=root, check=True)
+            orphan = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            subprocess.run(["git", "checkout", "-q", "master"], cwd=root, check=True)
+            state = root / "state"
+            state.mkdir()
+            (state / "self-improvement-proposals.json").write_text(json.dumps({
+                "p1": {"status": "promoting", "promoted_commit": orphan, "base_commit": orphan, "worktree": ""},
+            }), encoding="utf-8")
+            manager = _manager(root)
+            resolved = manager.reconcile_awaiting_reboot()
+            self.assertEqual(resolved, [])
+            self.assertEqual(manager._read_proposals()["p1"]["status"], "promoting")
+
+    def test_damaged_patch_payload_is_retryable_not_a_verdict(self) -> None:
+        """A payload the transport truncated must not burn the change fingerprint.
+
+        Measured on the runtime log: every patch payload ever submitted (11 of
+        11, 2026-09-25) arrives structurally malformed, and proposal 701d3510 --
+        the only submission carrying a byte-correct, locally validated file --
+        was recorded as a verdict about its change. A payload that cannot be a
+        well-formed diff is an environment condition, so the same intended change
+        stays submittable.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            commit_all(root, "base")
+            manager = SelfImprovementManager(root, root.parent / "worktrees")
+            truncated = (
+                "diff --git a/module.py b/module.py\n"
+                "--- a/module.py\n"
+                "+++ b/module.py\n"
+                "@@ -1,3 +1,3 @@\n"
+                " value = 1\n"
+                "+value = 2"
+            )
+            with self.assertRaises(SelfImprovementError):
+                manager.propose_files({}, (sys.executable, "-c", "pass"), patch=truncated, metadata=self._proposal_metadata())
+            record = next(iter(manager._read_proposals().values()))
+            self.assertEqual(record["failure_class"], "patch_payload_corrupt")
+            self.assertEqual(record["status"], "blocked_by_environment")
+
+    def test_structural_check_separates_damage_from_a_real_non_match(self) -> None:
+        """The shape check must flag transport damage and pass a valid diff on."""
+        good = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n"
+        self.assertIsNone(patch_structure_error(good))
+        self.assertIsNone(patch_structure_error(good.rstrip("\n") + "\n"))
+        # Multi-file payloads and the "no newline at end of file" marker are
+        # well-formed and must reach git apply unchanged.
+        multi = good + "diff --git a/y.py b/y.py\nnew file mode 100644\n--- /dev/null\n+++ b/y.py\n@@ -0,0 +1,2 @@\n+one\n+two\n"
+        self.assertIsNone(patch_structure_error(multi))
+        marker = 'diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n'
+        self.assertIsNone(patch_structure_error(marker))
+        # Damage: unterminated, and a hunk body that ends early.
+        self.assertIsNotNone(patch_structure_error(good.rstrip("\n")))
+        self.assertIsNotNone(patch_structure_error(good + "@@ -9,4 +9,4 @@\n-one\n+two\n"))
+        # An empty payload and prose without a file header are rejected too, so
+        # the check cannot be satisfied by "not terminated" alone.
+        self.assertEqual(patch_structure_error(""), "patch is empty")
+        self.assertEqual(patch_structure_error("   \n\n"), "patch is empty")
+        self.assertIn("no file header", str(patch_structure_error("just prose, no diff at all\n")))
 
     def test_failed_patch_is_rejected_with_patch_apply_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
