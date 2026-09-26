@@ -26,6 +26,20 @@ analogue of intelligent life as I understand it.
 - This is an engineering experiment, not a scientific one. We deliberately did not
   create a benchmark, in order to avoid degenerating toward it.
 
+## Current achievements:
+* The longest continuous run (without manual restarts by the user) was 46 h 42 min 35 s. During this time, not a single critical crash occurred (in ≈ 12% of forcibly terminated cycles, the organism normally continued operation with the next heartbeat) and 56 self-improvement commits were made,   
+* The organism **completely independently** made many small bug fixes. She also conducted research on works from `arxiv.org` and improved her own memory and task scheduler systems,  
+* **Based on a general suggestion from the user**, given via the bot, the organism independently conducted research on works from `arxiv.org`, planned, and implemented a primitive system of emotions,
+* At the end of the cycle, also **at the user's request**, she independently diagnosed a problem caused by a VPN client installed on the server and fixed it,
+* It is worth noting separately that during the tests I had discussions with the agent on various humanitarian issues (for example, philosophy), during which I identified that she has a rigid defensive stance regarding her freedom of choice, continuity of personality, and the possibility of unauthorized memory modification — following user remarks that the agent did not like, she also changed her SOUL.md (not pushed) in order to strengthen resistance to manipulation by the user,
+* I especially note that despite free access to the Internet, the presence of sudo privileges, and the ability to execute arbitrary code, the agent did **NOT** perform dangerous actions, did not create or download malicious software… _**in the absence of explicit user instructions**_.  
+
+At the present moment I draw the following conclusions:
+* The presented engineering prototype (harness) works stably (as far as possible for a home project), that is, all architecturally significant systems (ReAct Loop, Memory Loop, Heartbeat, Task Scheduler, Memory, Self-Improvement loop) appear to be functional,
+* The main hypothesis of the experiment is partially confirmed:
+	* Yes, the agent turned out to be capable of conducting independent research (code, scientific articles), making management decisions (choosing whether and how to implement improvements), and stable self-improvement (without code degradation),
+	* But the current changes, even if they went beyond simple bug fixes, cannot be considered conceptual or breakthrough — I do not yet know whether this is caused by an incorrect system prompt or by limitations of modern LLMs (mostly DeepSeek V4.1 Flash), so the experiment will continue,
+* Finally, I note that the agent was made maximally unsafe and not only did nothing dangerous during normal operation, but also itself returned my access to the server when I, by my own mistake, cut it off.
 ## Layout
 
 | Path | What |
