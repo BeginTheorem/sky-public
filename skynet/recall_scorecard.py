@@ -18,8 +18,9 @@ figures were read under, so a reproduction is scored against the reader the
 figure came from rather than today's reader.
 
 Run 1 replays that recorded configuration, run 2 drops the constant phrase
-(reproducing memory ``d8f164cc0336d7d3a923aeee2aec3342``) and run 3 uses the
-shipped query. Every number comes from the ledger through shipped code paths, so
+(reproducing memory ``d8f164cc0336d7d3a923aeee2aec3342``), run 3 uses the shipped
+query and run 4 does it through the injected-run reader instead of the planner one.
+Every number comes from the ledger through shipped code paths, so
 the scorecard cannot agree with an implementation it does not run, and the ledger
 is opened read-only: this module writes nothing.
 
@@ -31,6 +32,18 @@ a read-only copy of the live ledger, the undecided figures are decidable at 6
 governing top-3 (gap +0.0096) and both constant-tail shares (exact matches) have no
 n at all -- the two rates are closer together than the band, so no larger fixture set
 would change the verdict.
+
+The query itself is a choice, so a verdict is only meaningful with its reader named.
+The planner layout is built by ``_query`` and mirrors ``Reactor._planner_memory_query``;
+the query whose hits actually enter an agent run's prompt is assembled by
+``Reactor._memory_query``, where the run's StartEnvelope is built. They take different
+parts from the same situation -- the injected layout has no constant phrase and no
+fixture summary, but adds the task title -- so run 4 replays the fixtures through the
+shipped injected-run assembler as well, and the layout block prints every recorded
+figure scored against both readers, the margin (observed minus recorded rate) each one
+shows, and how many figures change verdict between them. A frozen fixture carries no
+owner inbox message and no acceptance criterion, so those two slots of the injected
+layout are empty rather than guessed; that is stated where the query is assembled.
 
     .venv/bin/python -m skynet.recall_scorecard
     .venv/bin/python -m skynet.recall_scorecard --db /path/to/ledger.sqlite3
@@ -178,6 +191,13 @@ REFERENCE_ACTIVE_MEMORIES = 380
 REFERENCE_SOURCE = "9590d67dffbf5f9d9795bea8930e4627"
 LESSON_SOURCE = "d8f164cc0336d7d3a923aeee2aec3342"
 
+# The two readers a ranking figure can be measured on. ``_query`` assembles the planner
+# layout by hand out of the fixture fields, mirroring ``Reactor._planner_memory_query``;
+# the injected layout is assembled by the shipped ``Reactor._memory_query`` itself, so
+# run 4 cannot report a reader it did not run.
+PLANNER_LAYOUT = "planner layout (Reactor._planner_memory_query parts, Reactor._join_query_parts)"
+INJECTED_LAYOUT = "injected-run layout (Reactor._memory_query, the query whose hits reach the run prompt)"
+
 # -- the verdict rule --------------------------------------------------------
 # An exact-integer match calls a figure that moved by one scenario "DRIFTED", a
 # claim the fixture counts cannot support: five situations cannot separate a real
@@ -234,6 +254,21 @@ VERDICT_MIN_SCENARIOS = 4
 # that would decide each one belongs in the report instead of staying implicit.
 REQUIRED_N_SEARCH_LIMIT = 5000  # every live figure decides far below this; the bound keeps the search finite
 HARNESS_SUPPLY_DESCRIPTION = "distinct run_started envelopes carrying previous_outcome (the labelled planner-recall cases)"
+# The same count, bounded by a replay instant: under ``--as-of`` the figures beside
+# it are replayed on a reconstructed cohort, so the supply they are decided against has
+# to be the corpus that existed then.
+HARNESS_SUPPLY_BOUNDED_DESCRIPTION = (
+    "distinct run_started envelopes carrying previous_outcome and written by the replay instant "
+    "(the labelled planner-recall cases that existed then)"
+)
+# ``required_n`` returns ``None`` for two different reasons, and conflating them
+# published the opposite of the truth: a gap LARGER than the band is decided at a
+# finite n (the difference interval shrinks around the true gap), so a ``None`` that
+# comes from the search bound must not be reported as "can never drift". The reason
+# is decided from the projected rates themselves, not from the failed search.
+BUDGET_REASON_INSIDE_BAND = "inside_band"
+BUDGET_REASON_BEYOND_BOUND = "beyond_search_bound"
+BUDGET_REASON_NO_DENOMINATOR = "no_denominator"
 
 
 def wilson_interval(successes: int, total: int, level: float = VERDICT_LEVEL) -> tuple[float, float]:
@@ -324,10 +359,11 @@ def required_n(
     see". The search starts at ``VERDICT_MIN_SCENARIOS``, so the table can never
     report a budget that the verdict rule would itself refuse, and ends at ``limit``.
 
-    ``None`` is returned when no n below ``limit`` decides it. A gap smaller than the
-    ROPE band is the common case and is decidable at NO n -- both rates round to the
-    same value once n is large -- so ``None`` is a finding about the effect size, not
-    a search failure.
+    ``None`` is returned when no n below ``limit`` decides it, which happens for two
+    different reasons that ``required_n_detail`` tells apart: a gap smaller than the
+    ROPE band is decidable at NO n (both rates round to the same value once n is
+    large), while a gap wider than the band is decided at some n the bound cut off.
+    Only the first is a finding about the effect size; the second is a search failure.
     """
     recorded_hits, recorded_total = recorded
     observed_hits, observed_total = observed
@@ -352,13 +388,27 @@ def required_n_detail(
         "search_limit": REQUIRED_N_SEARCH_LIMIT,
         "supply": supply,
         "reachable": None,
+        "reason": None,
+        "projected_gap": None,
     }
-    if required is not None and supply is not None:
-        detail["reachable"] = int(supply.get("labelled_cases") or 0) >= required
+    if required is not None:
+        if supply is not None:
+            detail["reachable"] = int(supply.get("labelled_cases") or 0) >= required
+        return detail
+    recorded_hits, recorded_total = recorded
+    observed_hits, observed_total = observed
+    if recorded_total <= 0 or observed_total <= 0:
+        detail["reason"] = BUDGET_REASON_NO_DENOMINATOR
+        return detail
+    gap = abs(observed_hits / observed_total - recorded_hits / recorded_total)
+    detail["projected_gap"] = gap
+    # At large n the difference interval collapses around this gap, so a gap wider
+    # than the band is decided at SOME finite n -- just one the search bound cut off.
+    detail["reason"] = BUDGET_REASON_BEYOND_BOUND if gap > VERDICT_ROPE else BUDGET_REASON_INSIDE_BAND
     return detail
 
 
-def harness_supply(connection: sqlite3.Connection) -> dict[str, Any]:
+def harness_supply(connection: sqlite3.Connection, as_of: str | None = None) -> dict[str, Any]:
     """The labelled cases the planner harness could supply at the table's n.
 
     The label the held-out planner-recall comparisons use is "memories whose
@@ -366,14 +416,30 @@ def harness_supply(connection: sqlite3.Connection) -> dict[str, Any]:
     ``run_started`` envelopes that carry a ``previous_outcome`` -- the corpus
     generations 170-191 measured on. Counting DISTINCT run ids rather than rows keeps
     a re-emitted envelope from inflating the figure.
+
+    ``as_of`` bounds the supply to the envelopes that already existed at the replay
+    instant, because the reachability flag is an input of the same verdict: without
+    the bound a report that replayed its rankings on a reconstructed cohort still
+    decided "the harness can supply that n" on cases written after the corpus, and
+    called a budget reachable that the cohort could not have paid for. Measured on
+    the live ledger over nine historical instants, the flag disagrees with the
+    cohort-bound supply in 6 of the 32 (figure, instant) cells that carry a budget:
+    at 2026-09-19T20:00Z the supply reads 198 where only 4 labelled cases existed.
     """
-    rows = connection.execute(
+    query = (
         "SELECT DISTINCT json_extract(payload, '$.run_id') FROM event_log "
         "WHERE kind='run_started' AND payload LIKE '%previous_outcome%'"
-    ).fetchall()
+    )
+    params: tuple[Any, ...] = ()
+    description = HARNESS_SUPPLY_DESCRIPTION
+    if as_of is not None:
+        query += " AND created_at <= ?"
+        params = (as_of,)
+        description = HARNESS_SUPPLY_BOUNDED_DESCRIPTION
+    rows = connection.execute(query, params).fetchall()
     return {
         "labelled_cases": sum(1 for row in rows if row[0]),
-        "description": HARNESS_SUPPLY_DESCRIPTION,
+        "description": description,
     }
 
 
@@ -381,6 +447,15 @@ def budget_text(detail: dict[str, Any]) -> str:
     """One line stating what would settle an UNDERDETERMINED comparison."""
     required = detail.get("required_n")
     if required is None:
+        if detail.get("reason") == BUDGET_REASON_NO_DENOMINATOR:
+            return "budget: no n decides it -- a comparison has no denominator"
+        if detail.get("reason") == BUDGET_REASON_BEYOND_BOUND:
+            gap = detail.get("projected_gap")
+            gap_text = "" if gap is None else f" (gap {gap:.4f})"
+            return (
+                f"budget: the deciding n is above the {detail.get('search_limit')} search bound -- the gap{gap_text} "
+                f"exceeds the +/-{VERDICT_ROPE:.2f} band, so a large enough fixture set would settle it"
+            )
         return (
             f"budget: no n below {detail.get('search_limit')} decides it -- the two rates are closer together than the "
             f"+/-{VERDICT_ROPE:.2f} band, so the comparison can never drift"
@@ -427,6 +502,26 @@ def _query(situation: Situation, phrase: str | None) -> str:
     return Reactor._join_query_parts([part for part in parts if part])
 
 
+def _injected_query(situation: Situation) -> str:
+    """The fixture read through the injected-run reader, by calling it.
+
+    ``_query`` above is the planner prompt's layout. The query whose hits enter an
+    agent run's prompt is ``Reactor._memory_query(selected_work, inbox_events,
+    next_plan)`` at the point the StartEnvelope is built, and this calls that function
+    rather than re-deriving its part list, so the scorecard cannot disagree with the
+    reader it claims to replay.
+
+    A frozen fixture carries no owner inbox message and no acceptance criterion, so
+    those slots are empty (``[]`` and a task dict without the key), not invented; the
+    fixture's label supplies the task title and its goal the goal title. The reader split
+    survives that: the injected layout has no constant phrase and no summary, which is
+    exactly what moves the ranking.
+    """
+    selected_work = {"task": {"title": situation.label, "goal_title": situation.goal}}
+    next_plan = {"initial_prompt": situation.initial_prompt, "next": situation.next_step}
+    return Reactor._memory_query(selected_work, [], next_plan)
+
+
 def _pooled_fused_order(
     connection: sqlite3.Connection, terms: list[str], limit: int, allowed: set[str] | None = None
 ) -> list[str]:
@@ -437,9 +532,15 @@ def _pooled_fused_order(
     rank beside the shipped page rank lets a moved figure be attributed to the
     reader instead of guessed.
 
-    ``allowed``, when given, restricts every fusion axis to a reconstructed past
-    cohort, so a reference figure can be replayed against the corpus it was read
-    on rather than today's.
+    ``allowed``, when given, IS the membership predicate: it replaces today's
+    ``status='active'`` clause instead of intersecting it. The cohort was built from
+    the validity window of the replay instant, which already decides membership
+    there, so adding today's status re-introduces the later events the reconstruction
+    removed and silently rewrites the past figure. Measured on the live ledger at
+    2026-09-22T23:40:45Z, three cohort members were superseded later; keeping the
+    status clause reported hub top-1 as 2/5 (UNDERDETERMINED) where the same instant
+    without it reads 3/5 -- while the module's own docstring claims 3/5 for that
+    cohort, so the shipped reader and its documented figure disagreed by one cell.
     """
     match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
     candidate_limit = limit * 5
@@ -449,20 +550,23 @@ def _pooled_fused_order(
         placeholders = ",".join("?" for _ in sorted(allowed))
         cohort_sql = f" AND m.memory_id IN ({placeholders})"
         cohort_params = tuple(sorted(allowed))
+    # The cohort replaces the status clause; without a cohort the shipped status clause
+    # stays, so a live reading is byte-for-byte the shipped reader.
+    status_sql = "" if allowed is not None else " AND m.status='active'"
     axes: tuple[tuple[str, tuple[Any, ...]], ...] = (
         (
             "SELECT m.memory_id FROM memories_fts JOIN memories m ON m.memory_id = memories_fts.memory_id "
-            "WHERE memories_fts MATCH ? AND m.status='active'" + cohort_sql + " "
+            "WHERE memories_fts MATCH ?" + status_sql + cohort_sql + " "
             "ORDER BY bm25(memories_fts), m.memory_id LIMIT ?",
             (match, *cohort_params, candidate_limit),
         ),
         (
-            "SELECT m.memory_id FROM memories m WHERE m.status='active'" + cohort_sql + " "
+            "SELECT m.memory_id FROM memories m WHERE 1=1" + status_sql + cohort_sql + " "
             "ORDER BY updated_at DESC, memory_id LIMIT ?",
             (*cohort_params, candidate_limit),
         ),
         (
-            "SELECT m.memory_id FROM memories m WHERE m.status='active'" + cohort_sql + " "
+            "SELECT m.memory_id FROM memories m WHERE 1=1" + status_sql + cohort_sql + " "
             "ORDER BY confidence DESC, updated_at DESC, memory_id LIMIT ?",
             (*cohort_params, candidate_limit),
         ),
@@ -531,8 +635,11 @@ def _read(
     pooled_allowed: set[str] | None = None,
 ) -> Reading:
     terms = MemoryStore._normalize_terms(query)
-    page3 = [m["memory_id"] for m in store.search(query, limit=3)]
-    page20 = [m["memory_id"] for m in store.search(query, limit=20)]
+    # The shipped page takes ``pooled_allowed`` as well: ``shipped_top3``/``shipped_top20``
+    # are printed beside the pooled ranks, so a page read against today's ledger while its
+    # siblings replay a cohort would report corpus movement as a reader difference.
+    page3 = [m["memory_id"] for m in store.search(query, limit=3, allowed=pooled_allowed)]
+    page20 = [m["memory_id"] for m in store.search(query, limit=20, allowed=pooled_allowed)]
     pooled3 = _pooled_fused_order(connection, terms, 3, allowed=pooled_allowed)
     pooled20 = _pooled_fused_order(connection, terms, 20, allowed=pooled_allowed)
     return Reading(
@@ -567,6 +674,11 @@ def build_report(db_path: Path, as_of: str | None = None) -> dict[str, Any]:
         pairs: dict[str, dict[str, Any]] = {}
         for situation in SITUATIONS:
             recorded_q, shipped_q, free_q = _query(situation, RECORDED_PHRASE), _query(situation, SHIPPED_PHRASE), _query(situation, None)
+            # Both readers of the layout block are measured on the same corpus: the
+            # injected reading takes ``pooled_allowed`` too, or an ``--as-of`` replay
+            # would score the planner layout against the published cohort and the
+            # injected layout against today's much larger one, and report the corpus
+            # difference as a difference between readers.
             shipped_terms = set(MemoryStore._normalize_terms(shipped_q))
             free_terms = set(MemoryStore._normalize_terms(free_q))
             pairs[situation.key] = {
@@ -579,7 +691,10 @@ def build_report(db_path: Path, as_of: str | None = None) -> dict[str, Any]:
                 "shipped": _read(
                     connection, store, situation, shipped_q, _terms_of(SHIPPED_PHRASE) | _goal_terms(situation.goal), pooled_allowed
                 ).__dict__,
-                "phrase_free": _read(connection, store, situation, free_q, set()).__dict__,
+                "injected": _read(
+                    connection, store, situation, _injected_query(situation), _goal_terms(situation.goal), pooled_allowed
+                ).__dict__,
+                "phrase_free": _read(connection, store, situation, free_q, set(), pooled_allowed).__dict__,
                 "displaced_terms": [t for t in MemoryStore._normalize_terms(shipped_q) if t not in free_terms],
                 "gained_terms": [t for t in MemoryStore._normalize_terms(free_q) if t not in shipped_terms],
             }
@@ -624,7 +739,10 @@ def build_report(db_path: Path, as_of: str | None = None) -> dict[str, Any]:
         }
         # Every comparison that can be undecided states its own budget, so a reader
         # can tell one that a bigger fixture set would settle from one that no n can.
-        supply = harness_supply(connection)
+        # The supply is bounded by the same instant as the figures it is attached to:
+        # ``reachable`` answers "could the harness pay for this n", and the harness it
+        # is asked about is the one the replay instant describes.
+        supply = harness_supply(connection, as_of)
         for name in ("hub_top1", "hub_top2", "governing_top3", "governing_top20"):
             entry = verdicts[name]
             entry.update(
@@ -654,6 +772,10 @@ def build_report(db_path: Path, as_of: str | None = None) -> dict[str, Any]:
             "pairs": pairs,
             "recorded_tail_share": tail_share,
             "verdicts": verdicts,
+            # The same figures under the other reader, with the assembler named, so no
+            # ranking verdict has to be read without knowing which reader produced it.
+            "injected_totals": figure_observations(pairs, "injected"),
+            "layout": layout_comparison(pairs),
         }
     finally:
         connection.close()
@@ -675,6 +797,117 @@ def totals_for(pairs: dict[str, dict[str, Any]], reading: str) -> dict[str, int]
     return totals
 
 
+def membership_changed(before: dict[str, int | None], after: dict[str, int | None]) -> bool:
+    """Whether a governed memory's top-3/top-20 membership moved between two readings."""
+    return bool(before["top3"]) != bool(after["top3"]) or bool(before["top20"]) != bool(after["top20"])
+
+
+def membership_text(before: dict[str, int | None], after: dict[str, int | None]) -> str:
+    """The print marker for a governed memory whose membership moved."""
+    return " (moved)" if membership_changed(before, after) else ""
+
+
+def figure_observations(pairs: dict[str, dict[str, Any]], reading: str) -> dict[str, tuple[int, int]]:
+    """The four published figures as observed under one reader's reading."""
+    totals = totals_for(pairs, reading)
+    situations = len(SITUATIONS)
+    return {
+        "hub_top1": (totals["hub1"], situations),
+        "hub_top2": (totals["hub2"], situations),
+        "governing_top3": (totals["gov3"], totals["verdicts"]),
+        "governing_top20": (totals["gov20"], totals["verdicts"]),
+    }
+
+
+def layout_comparison(pairs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Score every recorded figure against both readers, side by side.
+
+    A rate observed under the planner layout and the same rate under the injected-run
+    layout are different measurements of the same claim, so this block is what lets a
+    verdict name its reader. Per fixture it also carries the hub's and every governing
+    memory's rank under both layouts, so a moved figure can be read as a rank movement
+    instead of an unexplained count.
+
+    ``planner`` reads the run-1 ``recorded`` pair and ``injected`` the run-4 pair; the
+    layout names are used on both sides of that mapping so a reader cannot be dropped
+    silently.
+    """
+    situations = len(SITUATIONS)
+    recorded: dict[str, tuple[int, int]] = {
+        "hub_top1": (REFERENCE_HUB_TOP1, situations),
+        "hub_top2": (REFERENCE_HUB_TOP2, situations),
+        "governing_top3": (REFERENCE_GOVERNING_TOP3, REFERENCE_GOVERNING_VERDICTS),
+        "governing_top20": (REFERENCE_GOVERNING_TOP20, REFERENCE_GOVERNING_VERDICTS),
+    }
+    layouts: tuple[tuple[str, str], ...] = (("planner", "recorded"), ("injected", "injected"))
+    observed = {layout: figure_observations(pairs, reading) for layout, reading in layouts}
+    readers = {"planner": PLANNER_LAYOUT, "injected": INJECTED_LAYOUT}
+    figures: dict[str, Any] = {}
+    changed: list[str] = []
+    for name, reference in recorded.items():
+        entry: dict[str, Any] = {
+            "recorded": {"hits": reference[0], "total": reference[1]},
+            "source": REFERENCE_SOURCE,
+            "readers": {},
+        }
+        for layout, _reading in layouts:
+            hits, total = observed[layout][name]
+            detail = verdict_detail(reference, (hits, total))
+            detail["reader"] = readers[layout]
+            detail["layout"] = layout
+            # The observed margin: how far this reader sits from the recorded rate, in
+            # rate units, so a REPRODUCED and a DRIFTED reading of the same figure can be
+            # told apart by how much they moved or did not.
+            detail["gap"] = hits / total - reference[0] / reference[1] if total else None
+            detail["required_n"] = required_n(reference, (hits, total))
+            entry["readers"][layout] = detail
+        if entry["readers"]["planner"]["verdict"] != entry["readers"]["injected"]["verdict"]:
+            changed.append(name)
+        figures[name] = entry
+    per_pair: dict[str, Any] = {}
+    rank_changes = 0
+    verdicts = 0
+    for key, pair in pairs.items():
+        ranks: dict[str, Any] = {}
+        for layout, reading in layouts:
+            data = pair[reading]
+            ranks[layout] = {
+                "hub_top1": data["fused_top1"] == HUB_MEMORY_ID,
+                "hub_top2": HUB_MEMORY_ID in data["fused_top3"],
+                "governing": {
+                    entry["memory_id"]: {"top3": data["pooled_top3"][entry["memory_id"]], "top20": data["pooled_top20"][entry["memory_id"]]}
+                    for entry in pair["governing"]
+                },
+            }
+        moved: list[dict[str, Any]] = []
+        for entry in pair["governing"]:
+            mid = entry["memory_id"]
+            verdicts += 1
+            before = ranks["planner"]["governing"][mid]
+            after = ranks["injected"]["governing"][mid]
+            if membership_changed(before, after):
+                rank_changes += 1
+                moved.append({"memory_id": mid, "label": entry["label"], "planner": before, "injected": after})
+        per_pair[key] = {
+            "label": pair["label"],
+            "goal": pair["goal"],
+            "planner": ranks["planner"],
+            "injected": ranks["injected"],
+            "membership_moved": moved,
+        }
+    return {
+        "fixtures": situations,
+        "recorded_source": REFERENCE_SOURCE,
+        "readers": readers,
+        "figures": figures,
+        "verdict_changes": changed,
+        "verdict_change_count": len(changed),
+        "governing_verdicts": verdicts,
+        "governing_rank_change_count": rank_changes,
+        "per_pair": per_pair,
+    }
+
+
 def _print_run(report: dict[str, Any], reading: str, title: str) -> dict[str, int]:
     print(f"\n{title}")
     for key, pair in report["pairs"].items():
@@ -682,6 +915,12 @@ def _print_run(report: dict[str, Any], reading: str, title: str) -> dict[str, in
         print(f"  {key} {pair['label']}")
         print(f"    goal-title intactness: {'yes' if data['goal_intact'] else 'NO'}")
         print(f"    constant-tail term share: {data['tail_share']}/{_MAX_QUERY_TERMS}")
+        if reading == "injected":
+            # The injected layout carries no constant phrase, so the only fixed part it
+            # can retain is the goal title; the label says what the count is.
+            print(f"    goal-title terms inside the window: {data['tail_share']}/{_MAX_QUERY_TERMS}")
+        else:
+            print(f"    constant-tail term share: {data['tail_share']}/{_MAX_QUERY_TERMS}")
         print(f"    fused top-1: {data['fused_top1']}   shipped top-3: {[m[:8] for m in data['shipped_top3']]}")
         for entry in pair["governing"]:
             mid = entry["memory_id"]
@@ -707,6 +946,52 @@ def _print_verdict(name: str, detail: dict[str, Any], source: str) -> None:
     )
     if detail["verdict"] == "UNDERDETERMINED" and "required_n" in detail:
         print(f"    {budget_text(detail)}")
+
+
+def _print_layout_check(report: dict[str, Any]) -> None:
+    """Every recorded figure scored against both readers, side by side."""
+    layout = report["layout"]
+    readers = layout["readers"]
+    print("\n[reader layout] the same recorded figures, scored per reader")
+    print(f"  planner  reader: {readers['planner']}")
+    print(f"  injected reader: {readers['injected']}")
+    print(
+        f"  recorded figures come from memory {layout['recorded_source'][:8]}; "
+        f"{layout['fixtures']} fixture pairs; the planner reading is run 1 above"
+    )
+    for name, entry in layout["figures"].items():
+        recorded = entry["recorded"]
+        cells = []
+        for reader in ("planner", "injected"):
+            detail = entry["readers"][reader]
+            gap = detail["gap"]
+            cells.append(
+                f"{reader} {detail['observed']['hits']}/{detail['observed']['total']} {detail['verdict']} "
+                f"(gap {gap:+.4f}, n*={detail['required_n']})"
+            )
+        print(f"  {name}: recorded {recorded['hits']}/{recorded['total']} -> " + " | ".join(cells))
+    changed = layout["verdict_changes"]
+    print(
+        f"  figures whose verdict changes between readers: {layout['verdict_change_count']}/{len(layout['figures'])}"
+        + (f" ({', '.join(changed)})" if changed else " (none)")
+    )
+    print(
+        f"  governing verdicts whose top-3/top-20 membership changes between readers: "
+        f"{layout['governing_rank_change_count']}/{layout['governing_verdicts']}"
+    )
+    for key, pair in layout["per_pair"].items():
+        print(f"  {key} {pair['label']}")
+        print(
+            f"    hub {HUB_MEMORY_ID[:8]} fused top-1: planner {'yes' if pair['planner']['hub_top1'] else 'no'}"
+            f" / injected {'yes' if pair['injected']['hub_top1'] else 'no'}"
+        )
+        for memory_id, before in pair["planner"]["governing"].items():
+            after = pair["injected"]["governing"][memory_id]
+            print(
+                f"    governing {memory_id[:8]}: planner top-3 {before['top3'] or 'absent'} "
+                f"top-20 {before['top20'] or 'absent'} -> injected top-3 {after['top3'] or 'absent'} "
+                f"top-20 {after['top20'] or 'absent'}{membership_text(before, after)}"
+            )
 
 
 def _print_reference_check(report: dict[str, Any]) -> None:
@@ -776,7 +1061,9 @@ def main(argv: list[str] | None = None) -> int:
     _print_run(report, "recorded", f"[run 1] recorded configuration (phrase {RECORDED_PHRASE!r}, pooled fusion, {cohort_note})")
     _print_run(report, "shipped", f"[run 3] shipped query (constant phrase {SHIPPED_PHRASE!r})")
     _print_run(report, "phrase_free", f"[run 2] shipped query with {SHIPPED_PHRASE!r} removed")
+    _print_run(report, "injected", "[run 4] injected-run layout (Reactor._memory_query on the fixture envelope)")
     _print_reference_check(report)
+    _print_layout_check(report)
     return 0
 
 

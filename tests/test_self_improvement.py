@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,7 @@ from skynet.outbox import render_alert
 from skynet.recovery import RebootGuard, RecoveryError
 from skynet.self_improvement import (
     DEFAULT_TEST_COMMAND,
+    ORPHAN_SWEEP_EXEMPT_ENV,
     ImprovementProposal,
     SelfImprovementError,
     SelfImprovementManager,
@@ -240,14 +243,122 @@ class CoreTests(unittest.TestCase):
             subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
             manager = SelfImprovementManager(root, root / "worktrees")
             proposal = manager.propose()
+            # A stale checkout is what the sweep reclaims, and a checkout carries a
+            # .git entry; a bare directory the organism created is durable evidence
+            # and is spared (see
+            # test_orphan_sweep_spares_a_directory_that_is_not_a_checkout).
             orphan = manager.worktree_root / "orphan"
             orphan.mkdir(parents=True)
+            (orphan / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
             (orphan / "junk.txt").write_text("stale", encoding="utf-8")
+            durable = manager.worktree_root / "unregistered-evidence"
+            durable.mkdir()
+            (durable / "keep.txt").write_text("keep", encoding="utf-8")
             removed = manager.prune_orphan_worktrees()
             self.assertEqual(removed, [str(orphan)])
             self.assertFalse(orphan.exists())
+            self.assertTrue(durable.exists())
             self.assertTrue(proposal.worktree.exists())
             manager.discard(proposal)
+
+    def test_orphan_sweep_spares_a_directory_that_is_not_a_checkout(self) -> None:
+        """The sweep deletes stale *checkouts*; a self-made directory is durable evidence.
+
+        Measured at commit 6772867: a plain directory ``planted-sentinel`` under the
+        worktree root was removed by the executed probe and its bytes were unrecoverable,
+        because the only filters were ``is_dir()`` and membership in ``git worktree
+        list``. The pinned reference ledger has that shape -- it sits beside a derived
+        worktree root, not inside a checkout -- so the sweep must spare a child without a
+        ``.git`` entry.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "module.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+            manager = SelfImprovementManager(root, root / "worktrees")
+
+            durable = manager.worktree_root / "skynet-scratch"
+            durable.mkdir(parents=True)
+            sentinel = durable / "reference.sqlite3"
+            sentinel.write_bytes(b"pinned reference bytes")
+            digest = hashlib.sha256(sentinel.read_bytes()).hexdigest()
+            crypt = manager.worktree_root / "skynet-scratch.crypt"
+            crypt.mkdir()
+            (crypt / "keep").write_bytes(b"randomly named durable directory")
+
+            stale = manager.worktree_root / "stale-checkout"
+            stale.mkdir()
+            (stale / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
+            (stale / "junk.txt").write_text("stale", encoding="utf-8")
+
+            removed = manager.prune_orphan_worktrees()
+
+            self.assertEqual(removed, [str(stale)])
+            self.assertFalse(stale.exists())
+            self.assertTrue(sentinel.exists())
+            self.assertEqual(hashlib.sha256(sentinel.read_bytes()).hexdigest(), digest)
+            self.assertTrue(crypt.exists())
+
+    def test_orphan_sweep_never_follows_a_symlinked_child(self) -> None:
+        """A symlinked child is skipped: the sweep must not delete through a link."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "module.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+            manager = SelfImprovementManager(root, root / "worktrees")
+            manager.worktree_root.mkdir(parents=True, exist_ok=True)
+            victim = root / "outside" / "victim"
+            victim.mkdir(parents=True)
+            (victim / "keep.txt").write_text("must survive", encoding="utf-8")
+            link = manager.worktree_root / "linked"
+            link.symlink_to(victim, target_is_directory=True)
+
+            removed = manager.prune_orphan_worktrees()
+
+            self.assertEqual(removed, [])
+            self.assertTrue(link.is_symlink())
+            self.assertTrue((victim / "keep.txt").exists())
+
+    def test_orphan_sweep_honours_the_named_keep_patterns(self) -> None:
+        """``SKYNET_KEEP_WORKTREES`` exempts a checkout-shaped child by name."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "module.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+            manager = SelfImprovementManager(root, root / "worktrees")
+            manager.worktree_root.mkdir(parents=True, exist_ok=True)
+            pinned = manager.worktree_root / "frozen-evidence"
+            pinned.mkdir()
+            (pinned / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
+            sweepable = manager.worktree_root / "other-orphan"
+            sweepable.mkdir()
+            (sweepable / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
+
+            previous = os.environ.get(ORPHAN_SWEEP_EXEMPT_ENV)
+            os.environ[ORPHAN_SWEEP_EXEMPT_ENV] = "frozen-*"
+            try:
+                removed = manager.prune_orphan_worktrees()
+            finally:
+                if previous is None:
+                    os.environ.pop(ORPHAN_SWEEP_EXEMPT_ENV, None)
+                else:
+                    os.environ[ORPHAN_SWEEP_EXEMPT_ENV] = previous
+
+            self.assertEqual(removed, [str(sweepable)])
+            self.assertTrue(pinned.exists())
+            self.assertFalse(sweepable.exists())
 
     def test_self_improvement_rejects_identical_failed_proposal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -819,6 +930,120 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(record["test_command_fallback"])
             self.assertEqual(cast(list, record["test_command"]), list(DEFAULT_TEST_COMMAND))
             manager.discard(ImprovementProposal(str(record["proposal_id"]), Path(str(record["worktree"])), str(record["base_commit"])))
+
+    def test_every_test_command_encoding_normalizes_to_the_same_argv(self) -> None:
+        """One command, many spellings, one argv -- and the first token decides.
+
+        The live ledger holds 17 submissions (2026-09-20 .. 2026-09-25, runs
+        8edb356d, a4237767, 65401da2, eefb4fa1 and 13 more) whose complete change
+        set was discarded as "proposal validation executable is unavailable"
+        purely because the command was spelled as a LIST OF COMMAND LINES: only
+        a one-element shell-shaped list was split, so argv[0] stayed the whole
+        line ".../python -m pytest -q" and no such file exists. Run 8edb356d
+        burned five submissions for one accepted change.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "module.py").write_text("value = 1", encoding="utf-8")
+            commit_all(root, "base")
+            manager = _manager(root)
+            python = sys.executable
+            expected = (python, "-m", "pytest", "-q")
+            spellings = {
+                "shell string": python + " -m pytest -q",
+                "one-element shell list": [python + " -m pytest -q"],
+                "argv tokens": [python, "-m", "pytest", "-q"],
+                "two command lines": [python + " -m pytest -q", python + " -m ruff check skynet/react.py"],
+                "three command lines": [python + " -m pytest -q", python + " -m pytest -q tests/test_self_improvement.py", python + " -m ruff check skynet tests"],
+                "nested argv stage": [[python, "-m", "pytest", "-q"]],
+                "nested argv stages": [[python, "-m", "pytest", "-q"], [python, "-m", "ruff", "check", "skynet/react.py"]],
+                "venv python spelling": [".venv/bin/python", "-m", "pytest", "-q"],
+            }
+            for label, spelling in spellings.items():
+                command, fallback = manager._coerce_test_command(spelling)
+                self.assertEqual(command, expected, label)
+                self.assertFalse(fallback, label)
+                # The executable check reads the FIRST token, so a resolvable
+                # spelling must name a path that exists.
+                self.assertTrue(Path(command[0]).is_file() or shutil.which(command[0]), label)
+            # The refusal is preserved: an unresolvable first token stays as it
+            # was written, for both the argv and the command-line spelling.
+            for spelling in (["definitely-not-a-real-binary", "-m", "pytest", "-q"], "definitely-not-a-real-binary -m pytest -q"):
+                command, _ = manager._coerce_test_command(spelling)
+                self.assertEqual(command[0], "definitely-not-a-real-binary")
+                self.assertFalse(Path(command[0]).is_file())
+            # A flat argv list is never re-split, so a pytest expression that
+            # arrives as ONE token stays one token (pre-existing contract).
+            command, _ = manager._coerce_test_command([python, "-m", "pytest", "-q", "tests/", "-k", "planner or memory"])
+            self.assertEqual(command[-1], "planner or memory")
+            # A quoted argument inside a command line survives as one token.
+            program = "import pathlib; print('probe')"
+            command, _ = manager._coerce_test_command(python + ' -c "' + program + '"')
+            self.assertEqual(command[1], "-c")
+            self.assertEqual(command[2], program)
+            # The head heuristic must not mistake an existing argv[0] for a
+            # command line just because the checkout path contains a space.
+            spaced = root / "space dir"
+            spaced.mkdir()
+            interpreter = spaced / "checker"
+            interpreter.write_text("#!/bin/sh", encoding="utf-8")
+            interpreter.chmod(0o755)
+            command, _ = manager._coerce_test_command([str(interpreter), "-m", "pytest", "-q"])
+            self.assertEqual(command, (str(interpreter), "-m", "pytest", "-q"))
+
+    def test_extra_declared_stages_are_recorded_not_silently_dropped(self) -> None:
+        """A second declared stage must leave a trace instead of vanishing.
+
+        Only the first stage is executed by validate_and_commit; the rest must
+        be recorded so a reader can tell "the proposal checked this too" from
+        "the proposal checked nothing else".
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            written: list[tuple[str, object]] = []
+            manager = _manager(Path(directory))
+
+            class _Log:
+                def write(self, kind: str, payload: object, **_: object) -> None:
+                    written.append((kind, payload))
+
+            manager.runtime_log = _Log()
+            command, _ = manager._coerce_test_command([sys.executable + " -m pytest -q", sys.executable + " -m ruff check skynet tests"])
+            self.assertEqual(command, (sys.executable, "-m", "pytest", "-q"))
+            self.assertEqual([kind for kind, _ in written], ["test_command_stages_skipped"])
+            self.assertEqual(cast(dict, written[0][1])["stages"], [[sys.executable, "-m", "ruff", "check", "skynet", "tests"]])
+            written.clear()
+            manager._coerce_test_command([sys.executable, "-m", "pytest", "-q"])
+            self.assertEqual(written, [])
+
+    def test_tool_intake_keeps_nested_argv_stages(self) -> None:
+        """The argv form the runbook recommends must reach the manager intact.
+
+        ``SelfImprovementTool.execute`` accepted only a list of strings, so a
+        nested stage list fell through to ``self.test_command`` (the default
+        suite) and the stages the proposal declared were dropped before the
+        manager ever saw them.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("one", encoding="utf-8")
+            manager = _manager(root)
+            tool = SelfImprovementTool(manager, test_command=(sys.executable, "-c", "pass"))
+            stages = [[sys.executable, "-m", "pytest", "-q"], [sys.executable, "-m", "ruff", "check", "skynet/react.py"]]
+            with patch.object(manager, "propose_files", return_value={"ok": True, "proposal_id": "p"}) as propose:
+                tool.execute(
+                    {
+                        "changes": [{"path": "README.md", "operation": "replace", "old": "one", "new": "two"}],
+                        "test_command": stages,
+                        "hypothesis": {"problem": "test", "expected_behavior": "two", "evidence": "fixture", "validation": "pass", "rollback_condition": "fail"},
+                    },
+                    idempotency_key="command-normalize-stages",
+                )
+            forwarded = cast(tuple, propose.call_args.args[1])
+            self.assertEqual([list(stage) for stage in forwarded], stages)
+            # And the manager turns them into the same argv the flat form gives.
+            command, _ = manager._coerce_test_command(forwarded)
+            self.assertEqual(command, tuple(stages[0]))
 
     def test_control_characters_in_test_command_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

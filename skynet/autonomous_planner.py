@@ -11,13 +11,31 @@ from typing import Any
 from .idea_archive import CELLS_TOTAL, CHANGE_TYPES, EVIDENCE_SOURCES, SUBSYSTEMS, learnability_defect
 from .model_contracts import PLANNER_RESPONSE_SCHEMA, validate_shape
 from .models import ModelTurn
-from .planner import hypothesis_fingerprint, normalize_hypothesis_text, structural_fingerprint
+from .planner import (
+    hypothesis_fingerprint,
+    normalize_hypothesis_text,
+    structural_fingerprint,
+    title_prefix,
+    title_similarity,
+)
 from .planner_contract import PLANNER_INSTRUCTION, PLANNER_RETRY_INSTRUCTION, parse_planner_reply, planner_system_prompt
 from .provider import LLMProvider, Message
 
 
 class AutonomousPlanner:
-    def __init__(self, provider: LLMProvider, store: Any, *, output_tokens: int = 16_384, max_input_chars: int = 700_000, timeout_seconds: float = 120.0, max_active_goals: int = 8, hypothesis_ttl_days: float = 30.0) -> None:
+    # A proposal whose title similarity to an already-RESOLVED proposal crosses
+    # this ratio is the same question asked again. Neither number is a guess. On
+    # the 80-proposal live ledger 0.55 is the highest threshold that still fires,
+    # and it fires exactly once: the true positive "measure the BM25-vs-dense
+    # top-k crossover N", asked 2026-09-24 and asked again 2026-09-25 minutes
+    # after the first one answered it. 0.60 fires zero times, and whole-population
+    # 0.55 adds one false positive -- the recurring "Pay the owner channel"
+    # recovery habit at 0.64, whose re-issue is legitimate -- which is why
+    # recovery is excluded by kind rather than the threshold raised.
+    TITLE_PARAPHRASE_RATIO = 0.55
+    TITLE_PARAPHRASE_KINDS = frozenset({"research", "validation"})
+
+    def __init__(self, provider: LLMProvider, store: Any, *, output_tokens: int = 16_384, max_input_chars: int = 700_000, timeout_seconds: float = 120.0, max_active_goals: int = 8, hypothesis_ttl_days: float = 30.0, paraphrase_history_limit: int = 200) -> None:
         self.provider = provider
         self.store = store
         self.output_tokens = output_tokens
@@ -25,6 +43,10 @@ class AutonomousPlanner:
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.max_active_goals = max(1, int(max_active_goals))
         self.hypothesis_ttl_days = max(0.0, float(hypothesis_ttl_days))
+        # How many resolved proposals the paraphrase gate scans. Deliberately
+        # larger than the bounded prompt's own view, because the model can only
+        # avoid asking what it was shown, and its prompt is capped.
+        self.paraphrase_history_limit = max(1, int(paraphrase_history_limit))
         # The outcome of the most recent generate() call. The reactor reads it
         # to distinguish "the planner crashed" from "the planner found nothing",
         # which the empty list return value cannot express on its own.
@@ -122,6 +144,11 @@ class AutonomousPlanner:
                 deduplicated += 1
                 self.store.record_planner_proposal(proposal, attempt, "deduplicated", reason="duplicate fingerprint")
                 continue
+            paraphrase = self._paraphrase_of_resolved_work(proposal)
+            if paraphrase is not None:
+                deduplicated += 1
+                self._record_paraphrase(proposal, attempt, paraphrase)
+                continue
             # Learnability is checked only for genuinely new work: a duplicate is
             # reported as a duplicate, not as unlearnable, so the rejection reason
             # stays diagnostic instead of masking what actually happened.
@@ -217,19 +244,76 @@ class AutonomousPlanner:
             (hypothesis_fingerprint_value, structural_fingerprint_value),
         ).fetchone() is not None
 
+    def _paraphrase_of_resolved_work(self, proposal: dict[str, Any]) -> dict[str, Any] | None:
+        """A proposal that re-asks a question whose task already reached a terminal state.
+
+        The fingerprint gate is exact, and by design the TTL frees a resolved
+        area so a solved-then-regressed problem can be revisited. A paraphrase
+        defeats both, because it hashes differently and nothing else notices that
+        its question was already answered.
+
+        Scope is deliberate on both edges. Only ``TITLE_PARAPHRASE_KINDS`` are
+        compared, because among ``recovery`` proposals a near-identical title is
+        a legitimate recurrence ("drain the inbox again"); and only a prior
+        proposal that received a task already in a terminal state counts, so work
+        that is still live is neither duplicated nor blocked.
+        """
+        kind = str(proposal.get("kind", ""))
+        if kind not in self.TITLE_PARAPHRASE_KINDS:
+            return None
+        if not normalize_hypothesis_text(proposal.get("title", "")).strip():
+            return None
+        rows = self.store.connection.execute(
+            "SELECT p.title, p.kind, p.created_at, t.status AS task_status FROM planner_proposals p "
+            "JOIN tasks t ON t.task_id = p.created_task_id "
+            "WHERE p.created_task_id IS NOT NULL AND p.kind IN ('research','validation') "
+            "AND t.status IN ('completed','cancelled','failed') ORDER BY p.created_at DESC LIMIT ?",
+            (self.paraphrase_history_limit,),
+        ).fetchall()
+        for row in rows:
+            ratio = title_similarity(proposal.get("title", ""), row["title"])
+            if ratio >= self.TITLE_PARAPHRASE_RATIO:
+                return {"ratio": round(ratio, 3), "title": title_prefix(row["title"]), "kind": row["kind"], "created_at": row["created_at"], "task_status": row["task_status"]}
+        return None
+
+    def _record_paraphrase(self, proposal: dict[str, Any], attempt: str, match: dict[str, Any]) -> None:
+        """Visible under its own name: a paraphrase is not byte-identical work."""
+        self.store.record_planner_proposal(
+            proposal, attempt, "deduplicated",
+            reason=f"paraphrase of resolved work (similarity {match['ratio']}): {match['title']}",
+        )
+        self.store.append_event("planner_paraphrase_deduplicated", {"attempt_id": attempt, "title": title_prefix(proposal.get("title", "")), "kind": str(proposal.get("kind", "")), "match": match})
+
+    # How many of the reactor's own rows the prompt carries. Both callers hand
+    # this function their collection best-first -- `_run_autonomous_planning`
+    # reads tasks with ORDER BY updated_at DESC and search_memories ranks by
+    # score -- so the window is taken from the head and the trimmer below drops
+    # from the tail. Keeping the far end instead showed the model the *oldest*
+    # rows the reactor held: at the generation-220 planner call the 40 tasks in
+    # the prompt ended at 2026-09-24T11:06Z and held none of that day's 36 tasks,
+    # while the completed task that already answered the question sat at rank 6
+    # of 100 newest-first, so a re-issue was indistinguishable from new work.
+    PAYLOAD_TASK_WINDOW = 40
+    PAYLOAD_MEMORY_WINDOW = 20
+
     def _bounded_payload(self, goals: list[dict[str, Any]], tasks: list[dict[str, Any]], memories: list[dict[str, Any]], previous: dict[str, Any]) -> dict[str, Any]:
-        """Trim complete JSON records, never cut a serialized document mid-value."""
+        """Trim complete JSON records, never cut a serialized document mid-value.
+
+        Every collection arrives best-first, so both the window and the
+        over-budget trim work from the head: the newest task and the
+        highest-scoring memory are the rows that must survive the cap.
+        """
         payload: dict[str, Any] = {
             "goals": list(goals),
-            "tasks": list(tasks[-40:]),
-            "memories": list(memories[-20:]),
+            "tasks": list(tasks[: self.PAYLOAD_TASK_WINDOW]),
+            "memories": list(memories[: self.PAYLOAD_MEMORY_WINDOW]),
             "previous_outcome": previous,
             "cell_coverage": self._cell_coverage(),
             "instruction": PLANNER_INSTRUCTION,
         }
         while len(json.dumps(payload, ensure_ascii=False)) > self.max_input_chars and (payload["memories"] or payload["tasks"] or payload["goals"]):
             collection = payload["memories"] or payload["tasks"] or payload["goals"]
-            collection.pop(0)
+            collection.pop()
         if len(json.dumps(payload, ensure_ascii=False)) > self.max_input_chars:
             payload["previous_outcome"] = {"truncated": True}
         if len(json.dumps(payload, ensure_ascii=False)) > self.max_input_chars:

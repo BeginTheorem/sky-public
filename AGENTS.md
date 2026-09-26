@@ -95,8 +95,9 @@ tool result (`verified_progress`), прохождение gate-набора и �
   `SKYNET_STALL_ALERT_SECONDS` — это единственный наблюдатель класса «процесс
   жив, но прогоны не стартуют», который `StaleRunWatchdog` структурно не видит
   (он смотрит только активный прогон).
-- **Схема версионируется и мигрируется.** `store.SCHEMA_VERSION` (сейчас 12) и
-  `store.MIGRATION_NAMES`; миграция 12 — `run-progress` (`runs.heartbeat_at` /
+- **Схема версионируется и мигрируется.** `store.SCHEMA_VERSION` (сейчас 13) и
+  `store.MIGRATION_NAMES`; миграция 13 — `affect-valence` (таблица
+  `affect_state`), предыдущая 12 — `run-progress` (`runs.heartbeat_at` /
   `runs.last_progress_at`). Бамп версии без имени миграции — баг (см. инцидент
   2026-09-19 ниже).
 - `SOUL.md` — единственный авторитетный документ про identity; не переписывать

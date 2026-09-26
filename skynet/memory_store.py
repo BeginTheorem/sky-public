@@ -101,6 +101,19 @@ _RRF_WEIGHTS = (("bm25", 1.0), ("recency", 0.5), ("confidence", 0.35))
 # an UNBOUNDED lift costs 3.4x recall (held-out hit@5 0.102 -> 0.343 at 1),
 # while the intentional fixture lift still fires. A memory with no lexical rank
 # is placed after every memory that has one.
+#
+# Generation 227 re-measured that claim against the FUSION FUNCTION itself, on
+# 184 frozen envelopes (139 labelled) replayed from a read-only ledger copy:
+# replicated fusion plus THIS placement reproduces MemoryStore.search on 184/184
+# envelopes on both query arms, 0 of 417 top-3 slots come from outside the bm25
+# pool, and the page SET is unchanged under 20 score-preserving tie shuffles
+# (0/139) -- so on this reader a fused order can only REORDER the lexical pool.
+# Replacing the rank fusion by a relative-score convex combination (per-axis
+# min-max, same weights) moved h@5 by +.0072, 95% interval [-.0216,+.0432], on
+# the planner arm and by exactly 0 on the injected arm, while its h@1 and MRR
+# intervals lay wholly BELOW zero on the planner arm: the alternative function
+# is not adopted, and no fusion-function change should be proposed for this
+# reader without a mechanism that changes pool MEMBERSHIP rather than order.
 _RRF_MAX_LIFT = 1
 
 
@@ -218,54 +231,82 @@ class MemoryStore:
     def _document_terms(value: str) -> list[str]:
         return [token for token in MemoryStore._terms(value) if len(token) >= 2 and token not in _STOPWORDS]
 
-    def search(self, query: str, limit: int = 20, *, include_inactive: bool = False) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 20,
+        *,
+        include_inactive: bool = False,
+        allowed: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rank memories for ``query``; ``allowed`` restricts every axis to a cohort.
+
+        ``allowed`` is the counterpart of the scorecard's ``--as-of``: every fusion axis
+        is filtered to the given memory ids, so a page can be read against the corpus a
+        published figure was measured on instead of today's ledger. An EMPTY set is a
+        real cohort (no memory existed) and must not degrade to "no restriction", which
+        is why the test is ``is not None`` and not truthiness.
+
+        A supplied cohort is the WHOLE membership predicate: it replaces today's
+        ``status='active'`` clause instead of intersecting it. The caller built the set
+        from the validity window of an instant, which already decides membership there, so
+        intersecting it with today's status re-introduces exactly the later events the
+        reconstruction removed -- a memory alive at the instant and superseded afterwards
+        vanished from the replay, and the past figure became a function of the present.
+        Measured on the live ledger at 2026-09-22T23:40:45Z: three cohort members were
+        superseded later, two of them sat in S3's replayed order, and hub top-1 read 2/5
+        through the re-filter where the same instant without it reads 3/5.
+        """
         terms = self._normalize_terms(query)
         if not terms:
             return []
         limit = max(1, min(int(limit), 50))
         if self.fts_available:
-            return self._fts_search(terms, limit, include_inactive=include_inactive)
-        return self._fallback_search(terms, limit, include_inactive=include_inactive)
+            return self._fts_search(terms, limit, include_inactive=include_inactive, allowed=allowed)
+        return self._fallback_search(terms, limit, include_inactive=include_inactive, allowed=allowed)
 
-    def _fts_search(self, terms: list[str], limit: int, *, include_inactive: bool = False) -> list[dict[str, Any]]:
-        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
-        candidate_limit = limit * 5
-        active_join = "" if include_inactive else " AND m.status='active'"
-        active_where = "" if include_inactive else " WHERE status='active'"
-        bm25_rows = self.connection.execute(
-            """SELECT m.memory_id FROM memories_fts
-               JOIN memories m ON m.memory_id = memories_fts.memory_id
-               WHERE memories_fts MATCH ?""" + active_join + """
-               ORDER BY bm25(memories_fts), m.memory_id
-               LIMIT ?""",
-            (match, candidate_limit),
-        ).fetchall()
-        recency_rows = self.connection.execute(
-            "SELECT memory_id FROM memories" + active_where + " ORDER BY updated_at DESC, memory_id LIMIT ?",
-            (candidate_limit,),
-        ).fetchall()
-        confidence_rows = self.connection.execute(
-            "SELECT memory_id FROM memories" + active_where + " ORDER BY confidence DESC, updated_at DESC, memory_id LIMIT ?",
-            (candidate_limit,),
-        ).fetchall()
-        scores: dict[str, float] = {}
-        for rows, (_axis, weight) in zip((bm25_rows, recency_rows, confidence_rows), _RRF_WEIGHTS, strict=False):
-            for rank, row in enumerate(rows, start=1):
-                scores[row["memory_id"]] = scores.get(row["memory_id"], 0.0) + weight / (_RRF_K + rank)
-        if not scores:
-            return []
-        lexical_rank = {row["memory_id"]: rank for rank, row in enumerate(bm25_rows, start=1)}
+    def _cohort_clause(self, alias: str, allowed: set[str] | None) -> tuple[str, tuple[Any, ...]]:
+        """The ``AND <alias>.memory_id IN (...)`` fragment restricting an axis to a cohort."""
+        if allowed is None:
+            return "", ()
+        return (
+            f" AND {alias}.memory_id IN ({','.join('?' for _ in sorted(allowed))})",
+            tuple(sorted(allowed)),
+        )
+
+    @staticmethod
+    def _place_bounded(
+        scores: dict[str, float],
+        lexical_order: list[str],
+        limit: int,
+        *,
+        max_lift: int = _RRF_MAX_LIFT,
+    ) -> list[tuple[str, float]]:
+        """The shipped bounded placement: fused scores -> ``(id, score)`` page slots.
+
+        Extracted verbatim from ``_fts_search`` so a replay harness can reproduce a
+        published page instead of re-implementing the three passes. The shipped page is
+        NOT the fused order -- measured on the 165 frozen envelopes of the generation-206
+        ledger, the shipped page equals the pooled fused order on 0/165 envelopes on
+        either query arm -- so a rig that only re-ranks cannot check itself against
+        ``MemoryStore.search`` at all, and every scratch harness that priced an
+        alternative reader (generations 206, 227) re-implemented these passes by hand.
+
+        ``lexical_order`` is the bm25 axis in rank order: only a memory inside it has a
+        bounded lift budget of ``max_lift`` slots above its own lexical rank. Pass 2 fills
+        only what pass 1 left, so a memory no BM25 match returned can never displace a
+        lexically retrieved one; pass 3 rescues a lexical memory whose bounded slot fell
+        past the page, so the page stays as full as the unbounded fusion kept it. Equal
+        scores are broken by the stable external memory id, not by the pool's row order.
+        """
+        lexical_rank = {memory_id: rank for rank, memory_id in enumerate(lexical_order, start=1)}
         ranked = sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
         slots: list[str | None] = [None] * limit
-        # Pass 1: memories with lexical evidence, each lifted at most
-        # `_RRF_MAX_LIFT` slots above its own BM25 rank. Pass 2: memories that no
-        # BM25 match returned at all fill only what is left, so an unbounded
-        # non-relevance prior can never displace a lexically retrieved memory.
         for memory_id, _score in ranked:
             rank = lexical_rank.get(memory_id)
             if rank is None:
                 continue
-            for index in range(max(0, rank - 1 - _RRF_MAX_LIFT), limit):
+            for index in range(max(0, rank - 1 - max_lift), limit):
                 if slots[index] is None:
                     slots[index] = memory_id
                     break
@@ -276,9 +317,6 @@ class MemoryStore:
                 if slots[index] is None:
                     slots[index] = memory_id
                     break
-        # Pass 3: a lexical memory whose bounded slot lies past the page would
-        # otherwise be dropped; it fills whatever the first two passes left, so
-        # the page stays as full as the unbounded fusion kept it.
         placed = {memory_id for memory_id in slots if memory_id is not None}
         for memory_id, _score in ranked:
             if memory_id in placed:
@@ -287,14 +325,57 @@ class MemoryStore:
                 if slots[index] is None:
                     slots[index] = memory_id
                     break
-        ordered = [(memory_id, scores[memory_id]) for memory_id in slots if memory_id is not None]
+        return [(memory_id, scores[memory_id]) for memory_id in slots if memory_id is not None]
+
+    def _fts_search(
+        self,
+        terms: list[str],
+        limit: int,
+        *,
+        include_inactive: bool = False,
+        allowed: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
+        candidate_limit = limit * 5
+        cohort_only = allowed is not None
+        active_join = "" if (include_inactive or cohort_only) else " AND m.status='active'"
+        # Anchored with ``WHERE 1=1`` so the cohort fragment (which starts with AND) is
+        # always a valid continuation, with or without the status clause: composing
+        # "FROM memories" + "" + " AND ..." was a syntax error, so the one call that
+        # asked for a cohort without the status filter could not run at all.
+        active_where = "" if (include_inactive or cohort_only) else " AND status='active'"
+        bm25_cohort, bm25_params = self._cohort_clause("m", allowed)
+        axis_cohort, axis_params = self._cohort_clause("memories", allowed)
+        bm25_rows = self.connection.execute(
+            """SELECT m.memory_id FROM memories_fts
+               JOIN memories m ON m.memory_id = memories_fts.memory_id
+               WHERE memories_fts MATCH ?""" + active_join + bm25_cohort + """
+               ORDER BY bm25(memories_fts), m.memory_id
+               LIMIT ?""",
+            (match, *bm25_params, candidate_limit),
+        ).fetchall()
+        recency_rows = self.connection.execute(
+            "SELECT memory_id FROM memories WHERE 1=1" + active_where + axis_cohort + " ORDER BY updated_at DESC, memory_id LIMIT ?",
+            (*axis_params, candidate_limit),
+        ).fetchall()
+        confidence_rows = self.connection.execute(
+            "SELECT memory_id FROM memories WHERE 1=1" + active_where + axis_cohort + " ORDER BY confidence DESC, updated_at DESC, memory_id LIMIT ?",
+            (*axis_params, candidate_limit),
+        ).fetchall()
+        scores: dict[str, float] = {}
+        for rows, (_axis, weight) in zip((bm25_rows, recency_rows, confidence_rows), _RRF_WEIGHTS, strict=False):
+            for rank, row in enumerate(rows, start=1):
+                scores[row["memory_id"]] = scores.get(row["memory_id"], 0.0) + weight / (_RRF_K + rank)
+        if not scores:
+            return []
+        ordered = self._place_bounded(scores, [row["memory_id"] for row in bm25_rows], limit)
         if not ordered:
             return []
         ids = [memory_id for memory_id, _ in ordered]
         placeholders = ",".join("?" for _ in ids)
         rows = self.connection.execute(
             f"SELECT memory_id, kind, content, confidence, source_run, updated_at FROM memories WHERE memory_id IN ({placeholders})"
-            + ("" if include_inactive else " AND status='active'"),
+            + ("" if (include_inactive or cohort_only) else " AND status='active'"),
             ids,
         ).fetchall()
         by_id = {row["memory_id"]: dict(row) for row in rows}
@@ -307,12 +388,46 @@ class MemoryStore:
             results.append(item)
         return results
 
-    def _fallback_search(self, terms: list[str], limit: int, *, include_inactive: bool = False) -> list[dict[str, Any]]:
-        active_where = "" if include_inactive else " WHERE status='active'"
+    def _fallback_search(
+        self,
+        terms: list[str],
+        limit: int,
+        *,
+        include_inactive: bool = False,
+        allowed: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Replay the corpus by hand, ordered by a key that cannot tie.
+
+        This branch runs when the durable FTS projection is missing or unreadable,
+        so it is the reader a re-measurement falls back to; a page that depends on
+        the physical row order cannot be re-measured against the figure it
+        published. Measured 2026-09-26 (738 active memories, 182 frozen planner
+        envelopes): the hand-built score lands on two decimals or coarser, so the
+        key this branch used to carry, ``(score, confidence)``, tied on 171/182
+        queries -- and two ledgers holding the same logical corpus in different
+        insertion orders returned DIFFERENT 20-slot pages, because ``sorted``
+        leaves equal keys in the pool's row order and ``ORDER BY updated_at DESC``
+        alone leaves that order to the query plan. This is the failure mode Lin and
+        Yang describe for Lucene (arXiv:1807.05798v2): a tie broken by an indexer-
+        assigned id is not repeatable across index instances, and the remedy is to
+        break it by the stable external document id. Two edits, one per line: the
+        pool is ordered ``updated_at DESC, memory_id`` so the membership of the
+        500-row window stops depending on the scan, and the final key ends in
+        ``memory_id``. The key negates instead of using ``reverse=True``, because
+        reverse inverts the identifier too and would order equal-score memories by
+        descending id -- arbitrary in exactly the way this change exists to remove.
+        Wherever the old key was already unique the order is unchanged (measured: 0
+        of 182 live pages move), so the edit decides only the pages that were
+        arbitrary before it.
+        """
+        active_where = "" if (include_inactive or allowed is not None) else " AND status='active'"
+        cohort_where, cohort_params = self._cohort_clause("memories", allowed)
         rows = self.connection.execute(
-            "SELECT memory_id, kind, content, confidence, source_run, updated_at FROM memories"
+            "SELECT memory_id, kind, content, confidence, source_run, updated_at FROM memories WHERE 1=1"
             + active_where
-            + " ORDER BY updated_at DESC LIMIT 500"
+            + cohort_where
+            + " ORDER BY updated_at DESC, memory_id LIMIT 500",
+            cohort_params,
         ).fetchall()
         documents = [self._document_terms(row["content"]) for row in rows]
         document_frequency = {term: sum(term in document for document in documents) for term in set(terms)}
@@ -332,4 +447,4 @@ class MemoryStore:
                 item = dict(row)
                 item["score"] = score
                 scored.append(item)
-        return sorted(scored, key=lambda item: (item["score"], item["confidence"]), reverse=True)[:limit]
+        return sorted(scored, key=lambda item: (-item["score"], -item["confidence"], item["memory_id"]))[:limit]

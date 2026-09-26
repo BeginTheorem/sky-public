@@ -609,6 +609,8 @@ def main() -> int:
         memory_inject_limit=int(os.getenv("SKYNET_MEMORY_INJECT_LIMIT", "3")),
         metrics_snapshot_enabled=os.getenv("SKYNET_METRICS_SNAPSHOT", "true").strip().casefold() not in {"0", "false", "no", "off"},
         planner_epsilon=float(os.getenv("SKYNET_PLANNER_EPSILON", "0.1")),
+        affect_valence_window=int(os.getenv("SKYNET_AFFECT_VALENCE_WINDOW", "20")),
+        affect_valence_tilt_weight=float(os.getenv("SKYNET_AFFECT_VALENCE_TILT_WEIGHT", "0.5")),
         hypothesis_ttl_days=float(os.getenv("SKYNET_HYPOTHESIS_TTL_DAYS", "30")),
         cell_scarcity_weight=float(os.getenv("SKYNET_CELL_SCARCITY_WEIGHT", "0.20")),
         external_seek_enabled=os.getenv("SKYNET_EXTERNAL_SEEK", "true").strip().casefold() not in {"0", "false", "no", "off"},

@@ -18,6 +18,38 @@ log = logging.getLogger("skynet.providers.fallback")
 
 MIN_PROVIDER_COOLDOWN_SECONDS = 30.0
 
+# The two terminal texts the chain can raise, as recorded in
+# ``run_results.failure``. They name DIFFERENT failure classes and are disjoint
+# on the live ledger (measured 2026-09-25, 174 committed runs): 5 runs died with
+# the cooldown text below -- the terminal model call was refused before it
+# reached any provider -- and 12 died with a ladder that had struck at least one
+# provider first. A reader that only matches the shared "all providers failed"
+# substring cannot separate them, which is why the exact pair is named here.
+CHAIN_WIDE_COOLDOWN_MARKER = "every provider is in cooldown"
+ZERO_STRIKE_MARKER = "all providers failed after 0 attempts"
+
+
+def is_chain_wide_cooldown_abort(failure: str) -> bool:
+    """Whether a run's terminal failure text is a zero-strike chain cooldown.
+
+    "Every provider is in cooldown" is not a dead provider: it is the chain
+    declaring WHEN it can answer again (``blocked_until``), and the abort is
+    reached without a single strike having been spent. Both markers are required
+    together, so the 12 recorded runs whose ladder struck a provider and then
+    gave up stay outside this class -- they are provider failures, not an
+    unreachable chain.
+
+    This is a classification of RECORDED text, and it is deliberately narrow:
+    it answers "did this episode die because no provider could be reached at
+    all", nothing more. Measured effect on the counters the reactor moves: each
+    such run charged its task +1 ``attempts`` (the run was started) and 0
+    ``consecutive_model_failures`` (the reactor's own "all providers failed"
+    exemption already covered it), so a reader must not treat this class as the
+    cause of the task give-up budget.
+    """
+    text = str(failure or "")
+    return ZERO_STRIKE_MARKER in text and CHAIN_WIDE_COOLDOWN_MARKER in text
+
 
 @dataclass(slots=True)
 class FallbackProvider:
@@ -266,7 +298,7 @@ class FallbackProvider:
                 message = (
                     f"all providers failed after {strikes_done} attempts: "
                     f"every provider is in cooldown ({cooling})"
-                )
+                )  # the exact pair is_chain_wide_cooldown_abort matches; keep them in step
                 self._log("fallback_all_cooling", {"attempts": strikes_done, "blocked_remaining": blocked})
                 raise ProviderError(
                     message,

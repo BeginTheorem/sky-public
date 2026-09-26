@@ -125,6 +125,13 @@ CREATE TABLE IF NOT EXISTS memories (
     decayed_at TEXT,
     UNIQUE(kind, content)
 );
+CREATE TABLE IF NOT EXISTS affect_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    valence REAL NOT NULL DEFAULT 0.5,
+    draws INTEGER NOT NULL DEFAULT 0,
+    source_run TEXT,
+    updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS rng_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     seed INTEGER NOT NULL,
@@ -300,8 +307,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_area ON tasks(area, status);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned, updated_at DESC);
 """
 
-SCHEMA_VERSION = 12
-MIGRATION_NAMES = {3: "durable-boundaries", 4: "measured-liveness", 5: "planning-rng", 6: "owner-dialogue", 7: "dead-persistence", 8: "drop-dead-checkpoints", 9: "memory-validity", 10: "idea-archive", 11: "memory-decay-clock", 12: "run-progress"}
+SCHEMA_VERSION = 13
+# v13 adds `affect_state`: the one persisted valence channel, stored as
+# `(value, draws)`. Like v10 it is a brand-new table, so `executescript(SCHEMA)`
+# creates it with every column on an upgraded database and there is no ALTER to
+# catch up on.
+MIGRATION_NAMES = {3: "durable-boundaries", 4: "measured-liveness", 5: "planning-rng", 6: "owner-dialogue", 7: "dead-persistence", 8: "drop-dead-checkpoints", 9: "memory-validity", 10: "idea-archive", 11: "memory-decay-clock", 12: "run-progress", 13: "affect-valence"}
 
 # `evaluations.run_id` is NOT NULL; metrics snapshots belong to no run, so they
 # share one sentinel instead of inventing a fake run identity.
@@ -348,6 +359,11 @@ PROTECTED_EVENT_KINDS = frozenset({
     "report_claim_unverified",
     "restart_requested", "restart_escalated", "restart_skipped", "cycle_error", "provider_lockout",
     "provider_failure", "provider_error_classified", "worktree_dirty_after_bash",
+    # The post-mortem of an episode discarded before it could try anything. It is
+    # run-scoped where `fallback_all_cooling` is not (that event is written by the
+    # chain with run_id NULL), so it is the only durable row naming which run and
+    # which task paid for the chain-wide cooldown.
+    "provider_unreachable",
     "livelock_suspected", "memory_loop_failed", "memory_degraded", "policy_denied", "policy_soft_denied",
     # The episode the memory loop could not capture. Retention must not erase
     # the only pointer back to it: pruning this row deletes the work it names.
@@ -373,6 +389,13 @@ PROTECTED_EVENT_KINDS = frozenset({
     # separates an empty reply from one whose tokens went to the reasoning
     # channel, so retention must not erase the planner post-mortem.
     "planner_turn",
+    # The query the PLANNER searched, with the ablation that says whether its
+    # previous-outcome part reaches the recall window at all. It is an instrument
+    # of the planner contour like `planner_turn`: generations 191-223 could not
+    # answer a part-order question about this query without rebuilding it from
+    # the StartEnvelope, and the rebuild's own front cap and ledger copy change
+    # the verdict, so retention must not erase what was actually searched.
+    "planner_memory_recall",
     # The watchdog's only durable trace that the gate-protected planner contour
     # degraded; the alert row is deduped, so this event is the post-mortem.
     "judge_health_degraded",
@@ -417,7 +440,7 @@ PROTECTED_EVENT_KINDS = frozenset({
     # The idea archive is the organism's lineage: losing it would erase which
     # stepping stones were tried and why, so it survives every retention window.
     "idea_archived", "idea_superseded", "idea_archive_rejected", "idea_materialized",
-    "external_seek_created", "external_senses_unavailable", "idea_learnability_rejected",
+    "external_seek_created", "external_seek_suppressed", "external_senses_unavailable", "idea_learnability_rejected",
 })
 
 # Provider-chain diagnostics that are low-volume and diagnostically load-bearing:
@@ -1120,6 +1143,59 @@ class StateStore:
             return {"steps": 0, "usage_tokens": 0}
         return {"steps": int(row["steps"] or 0), "usage_tokens": int(row["usage_tokens"] or 0)}
 
+    def run_executed_tool_names(self, run_id: str) -> list[str]:
+        """The tools this run actually executed, read from its own durable rows.
+
+        The ReAct Loop cannot answer this for a killed episode: its message
+        history dies with the process, and ``ReActRunner._succeeded_tool_names``
+        reads exactly that history. The event log is the durable equivalent, so
+        the same predicate is applied here to the stored events -- a
+        ``tool_result`` whose ``result.ok`` is not False, named by the
+        ``tool_call`` that preceded it. The name is resolved through the
+        request's ``call_id`` rather than the result's own copy, so a result
+        cannot rename the tool that produced it. A refused call (unknown tool
+        name, policy denial) reports ``ok`` False and is therefore not evidence.
+
+        Measured on the live ledger (generation 238): of 13,996 ``tool_result``
+        events, 13,009 carry ``result.ok`` true and 0 lack the key, so the
+        ``is not False`` and ``is True`` readings coincide here. A stronger
+        check is available because the same work is written twice by two
+        different code paths -- this reader from ``event_log``, and
+        ``run_effect_capabilities`` from ``capability_effects``. Over all 221
+        runs they agree exactly (221 agree, 0 differ), and on the five
+        ``interrupted`` runs both count the same 142 calls. A reader that will
+        size a run's stored evidence is therefore cross-checked against a ledger
+        it does not read.
+        """
+        rows = self.connection.execute(
+            "SELECT kind, payload FROM event_log WHERE run_id=? AND kind IN ('tool_call','tool_result') ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        requested: dict[str, str] = {}
+        names: list[str] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if row["kind"] == "tool_call":
+                call_id = str(payload.get("call_id") or "")
+                name = str(payload.get("tool_name") or "")
+                if call_id and name:
+                    requested[call_id] = name
+                continue
+            result = payload.get("result")
+            if not isinstance(result, dict) or result.get("ok") is False:
+                continue
+            raw_call = payload.get("call")
+            call: dict[str, Any] = raw_call if isinstance(raw_call, dict) else {}
+            name = requested.get(str(call.get("call_id") or "")) or str(call.get("tool_name") or "")
+            if name:
+                names.append(name)
+        return names
+
     def stale_active_run(self, before: str) -> str | None:
         """Return the active run id when its heartbeat is older than `before`.
 
@@ -1759,17 +1835,44 @@ class StateStore:
         yet by practice.
         """
         if keep_runs <= 0:
-            return {"transcript": 0, "episodes": 0}
+            return {"transcript": 0, "episodes": 0, "owed": 0}
         keep = "SELECT run_id FROM runs ORDER BY rowid DESC LIMIT ?"
+        # A run whose report is still owed keeps its history while the event
+        # window still holds its audit rows. The 30-day event window is what
+        # governs exactly those rows, so the hold releases itself: once every
+        # unprotected event row of the run is gone the subquery drops it and the
+        # next sweep reclaims the history. Bounding the hold by a second clock
+        # rather than by a new constant is what keeps it from becoming the
+        # unbounded pin generation 173 removed. Measured (generation 208,
+        # read-only on the live ledger, 192 runs / 31 owed): 26 of the 31 are
+        # offside the first-fire window and would lose 1,187 transcript rows and
+        # 21 snapshots there; the transcript is the only copy of 690,880 B of
+        # the owed runs' 766,392 B of provider_response text, and 0 of the 23
+        # owed runs hold all their tool results in event_log. Saturation is ~32
+        # runs / 10.9 MB at the measured 32.9 runs/day and 16.1% owed rate, and
+        # simulating the event window released all 26.
+        protected = ", ".join("?" for _ in sorted(PROTECTED_EVENT_KINDS))
+        owed = (
+            f"SELECT run_id FROM runs WHERE status != '{RunStatus.COMPLETED.value}' AND run_id IN ("
+            f"SELECT DISTINCT run_id FROM event_log WHERE run_id IS NOT NULL AND kind NOT IN ({protected}))"
+        )
+        params = (keep_runs, *sorted(PROTECTED_EVENT_KINDS))
         transcript = self.connection.execute(
-            f"DELETE FROM transcript WHERE run_id IS NOT NULL AND run_id NOT IN ({keep})",
-            (keep_runs,),
+            f"DELETE FROM transcript WHERE run_id IS NOT NULL AND run_id NOT IN ({keep}) AND run_id NOT IN ({owed})",
+            params,
         ).rowcount
         episodes = self.connection.execute(
-            f"DELETE FROM episode_snapshots WHERE run_id NOT IN ({keep})",
-            (keep_runs,),
+            f"DELETE FROM episode_snapshots WHERE run_id NOT IN ({keep}) AND run_id NOT IN ({owed})",
+            params,
         ).rowcount
-        return {"transcript": max(0, transcript), "episodes": max(0, episodes)}
+        # Counted after the delete, so the number names the evidence that is
+        # actually still there rather than what the guard intended to hold.
+        skipped = self.connection.execute(
+            f"SELECT COUNT(DISTINCT run_id) FROM transcript "
+            f"WHERE run_id IS NOT NULL AND run_id NOT IN ({keep}) AND run_id IN ({owed})",
+            params,
+        ).fetchone()[0]
+        return {"transcript": max(0, transcript), "episodes": max(0, episodes), "owed": max(0, int(skipped))}
 
     def set_transcript(self, kind: str, payload: dict[str, Any], run_id: str) -> int:
         """Replace the previous row of this kind for the run.
@@ -1913,6 +2016,84 @@ class StateStore:
         row = self.connection.execute("SELECT seed FROM rng_state WHERE id=1").fetchone()
         return int(row["seed"]) if row else None
 
+    def affect_valence(self) -> tuple[float, int]:
+        """The single persisted valence channel, as ``(value, draws)``.
+
+        One channel, not seven: a taxonomy of moods is worth building only after
+        one channel has been shown to change a decision. With no row the channel
+        is inert (``VALENCE_PRIOR``, zero draws), so selection is unchanged.
+        """
+        from .planner import VALENCE_PRIOR
+
+        row = self.connection.execute("SELECT valence, draws FROM affect_state WHERE id=1").fetchone()
+        if row is None:
+            return (VALENCE_PRIOR, 0)
+        return (max(0.0, min(float(row["valence"]), 1.0)), max(0, int(row["draws"])))
+
+    def charge_affect_valence(self, *, window: int) -> dict[str, Any]:
+        """Charge the channel with the progress rate of the newest ``window`` runs.
+
+        The value IS the window's measured rate -- it is computed here from the
+        same rows the draw count comes from, so the reading, the confidence and
+        the reported counts cannot be supplied independently and then disagree.
+        Stored as ``(value, draws)`` and never as a bare value: the count is both
+        the confidence the tilt uses and the selection bias, so a channel with one
+        observation cannot swing a decision.
+
+        Idempotent by construction: the charge is a function of the current
+        window, not a running total, so charging an unchanged window twice leaves
+        ``affect_state`` identical. With no finished runs the channel is set to
+        the inert prior rather than inventing a reading from nothing.
+        """
+        from .planner import VALENCE_PRIOR
+
+        window_rows = self.valence_window(window=window)
+        stats = window_rows["stats"]
+        rows = window_rows["rows"]
+        draws = len(rows)
+        value = VALENCE_PRIOR if not rows else max(0.0, min(float(stats["progress"]), 1.0))
+        source_run = str(rows[0]["run_id"]) if rows else None
+        self.connection.execute(
+            "INSERT INTO affect_state(id, valence, draws, source_run, updated_at) VALUES (1, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET valence=excluded.valence, draws=excluded.draws, "
+            "source_run=excluded.source_run, updated_at=excluded.updated_at",
+            (value, draws, source_run, utc_now()),
+        )
+        return {
+            "valence": value,
+            "draws": draws,
+            "window": int(window_rows["window"]),
+            "source_run": source_run,
+            **stats,
+        }
+
+    def valence_window(self, *, window: int) -> dict[str, Any]:
+        """The one definition of the valence window: the newest terminal runs.
+
+        Both the charging write and the observational reader go through here. A
+        duplicated window predicate would let the charge and the reported rate
+        disagree about which runs they were looking at, which is exactly the
+        class of defect this channel exists to be measured against.
+        """
+        bounded_window = max(1, int(window))
+        rows = self.connection.execute(
+            "SELECT status, run_id, finished_at FROM runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT ?",
+            (bounded_window,),
+        ).fetchall()
+        statuses = [str(row["status"]) for row in rows]
+        completed = sum(1 for status in statuses if status == "completed")
+        return {
+            "window": bounded_window,
+            "rows": rows,
+            "stats": {
+                "labelled_cases": len(statuses),
+                "completed": completed,
+                "progress": (completed / len(statuses)) if statuses else 0.0,
+                "statuses": statuses,
+                "latest_finished_at": rows[0]["finished_at"] if rows else None,
+            },
+        }
+
     def add_goal(self, title: str, priority: float = 0.0, goal_id: str | None = None, *, constraints: dict[str, Any] | None = None) -> str:
         from uuid import uuid4
         goal_id = goal_id or str(uuid4())
@@ -1962,7 +2143,7 @@ class StateStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def record_planner_decision(self, candidates: list[Any], selected: Any | None, *, reason: str | None = None, draw: float | None = None) -> None:
+    def record_planner_decision(self, candidates: list[Any], selected: Any | None, *, reason: str | None = None, draw: float | None = None, threshold: float | None = None, base_threshold: float | None = None) -> None:
         from uuid import uuid4
         state = self.state()
         payload = [
@@ -1989,6 +2170,23 @@ class StateStore:
                 "draw": round(draw, 6),
                 "chosen_rank": candidates.index(selected) if selected in candidates else None,
             }
+            # The threshold the draw was decided against is part of the record:
+            # without it a later replay has to re-derive why the draw flared,
+            # and a channel that influenced selection would be invisible.
+            if threshold is not None:
+                details["exploration"]["threshold"] = round(float(threshold), 6)
+                if base_threshold is not None:
+                    # The untilted arm, so the counterfactual is decidable from the
+                    # record alone: a replay can compare the rank the draw produced
+                    # against the rank the same draw would have produced with the
+                    # channel absent, without knowing the config of that day. Legacy
+                    # rows written before the valence channel existed carry neither
+                    # key and keep their shape: the writer never invents it.
+                    details["exploration"]["base_threshold"] = round(float(base_threshold), 6)
+                if hasattr(self, "affect_valence"):
+                    value, draws = self.affect_valence()
+                    if draws:
+                        details["exploration"]["valence"] = {"value": round(value, 6), "draws": draws}
         self.connection.execute("INSERT INTO planner_decisions(decision_id, generation, selected_workstream_id, selected_task_id, candidates, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), state.generation, details["selected_workstream_id"], details["selected_task_id"], json.dumps(payload), chosen_reason, utc_now()))
         self.append_event("planner_decision", details)
 
@@ -2275,6 +2473,16 @@ class StateStore:
         and are selected directly. The caller supplies them so this module does
         not have to import reactor constants (circular import).
 
+        That exclusion is scoped to the NEWEST live instance of each family.
+        Excluding the fingerprint outright exempted every stacked copy forever:
+        measured on the live ledger (2026-09-25, read-only copy, 6 pending
+        instances of the external-seek template, oldest 2026-09-21), all six read
+        ``fingerprint_state='terminal'`` by ``planner_candidates`` and none was
+        selectable by ``PortfolioPlanner.rank()``, so the repair kept rows the
+        planner is already paying to skip. The safety net needs one live
+        instance to stay reachable; the older copies are stale work. A
+        ``running`` instance is never retired by this path.
+
         Idempotent: a second call repairs nothing.
         """
         now = utc_now()
@@ -2287,7 +2495,13 @@ class StateStore:
         cancel_params: tuple[Any, ...] = (now,)
         if exclusions:
             placeholders = ",".join("?" for _ in exclusions)
-            cancel_sql += f" AND hypothesis_fingerprint NOT IN ({placeholders})"
+            cancel_sql += (
+                f" AND (hypothesis_fingerprint NOT IN ({placeholders})"
+                "        OR (status <> 'running' AND created_at < ("
+                "              SELECT MAX(t2.created_at) FROM tasks t2"
+                "               WHERE t2.hypothesis_fingerprint = tasks.hypothesis_fingerprint"
+                "                 AND t2.status IN ('pending', 'running'))))"
+            )
             cancel_params = (now, *exclusions)
         with self.transaction():
             aligned_hypotheses = self.connection.execute(

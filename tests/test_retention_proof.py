@@ -104,6 +104,9 @@ class RetentionProofTests(unittest.TestCase):
             )
 
             pruned = json.loads(connection.execute("SELECT payload FROM event_log WHERE kind='history_pruned' ORDER BY sequence DESC LIMIT 1").fetchone()[0])
+            # Every seeded run is COMPLETED, so the owed guard holds nothing and
+            # the payload keeps its exact shape: the skip key is written only
+            # when a skip happened.
             self.assertEqual(pruned, {"transcript": len(aged), "episodes": len(aged), "keep_runs": KEEP_RUNS})
 
             # The exact deletion set: every aged run's history is gone ...

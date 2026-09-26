@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 from helpers import FakeProvider, FixtureTool, commit_all, git_repo
 
 from skynet import react
-from skynet.models import Budget, ModelTurn, RunStatus, StartEnvelope, ToolCall
+from skynet.models import AgentRunResult, Budget, ModelTurn, RunStatus, StartEnvelope, ToolCall
 from skynet.provider import Tool
 from skynet.providers.errors import ProviderError
 from skynet.react import ReActConfig, ReActRunner
@@ -908,6 +908,133 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_invalid'").fetchone()[0], 0)
             store.close()
 
+
+_DEFERRED_RESTART_SENTENCE = "Self-improvement promoted; restart deferred until memory and checkpoint complete."
+
+
+class _DeferredRestartTool:
+    """The promotion tool, reporting the control action the branch reacts to."""
+
+    name = "propose_self_improvement"
+    schema = {"type": "function", "function": {"name": name, "description": "propose", "parameters": {"type": "object", "additionalProperties": False}}}  # noqa: RUF012 - Tool protocol reads schema as an instance property
+
+    def execute(self, arguments, *, idempotency_key):
+        return {"ok": True, "control_action": {"type": "restart_after_checkpoint", "proposal_id": "p", "commit": "abc1234"}}
+
+
+def _deferred_restart_result(closing, *, tools=None, dispatch=None):
+    """Drive one episode to the deferred-restart branch with a chosen closing turn."""
+
+    chosen_tools = tools or {"propose_self_improvement": _DeferredRestartTool()}
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, messages, *, max_tokens, tools=()):
+            self.calls += 1
+            if self.calls == 1:
+                first = ToolCall("fixture_tool", {}) if tools else ToolCall("propose_self_improvement", {})
+                return ModelTurn(tool_calls=[first], usage_tokens=1)
+            if self.calls == 2 and tools:
+                return ModelTurn(tool_calls=[ToolCall("propose_self_improvement", {})], usage_tokens=1)
+            return ModelTurn(text=closing, usage_tokens=0)
+
+    class Session:
+        def __enter__(self):
+            self.directory = tempfile.TemporaryDirectory()
+            self.store = StateStore(Path(self.directory.name) / "state.sqlite3")
+            runner = ReActRunner(Provider(), self.store, chosen_tools, ReActConfig(provider_retries=0))
+            if dispatch is None:
+                self.result = runner.run(StartEnvelope("test"), "system")
+            else:
+                with dispatch():
+                    self.result = runner.run(StartEnvelope("test"), "system")
+            return self.result, self.store
+
+        def __exit__(self, *_exc):
+            self.store.close()
+            self.directory.cleanup()
+            return False
+
+    return Session()
+
+
+class FinishCitationClampTests(unittest.TestCase):
+    """A citation overrun must clamp, not cost the episode its verified work.
+
+    The live cost of the opposite behaviour is still on the ledger: runs
+    b01c5fdb (33 steps) and 9b944e12 (60 steps) closed needs_recovery with
+    reports that were the bare strings "Finish Report invalid:
+    response.citations[0] is too long" and "response.summary is too long", and
+    no evidence list. Both predate the clamp (skynet/react.py:655 calls
+    clamp_to_schema before validate_shape); since it landed, 28 finish_clamped
+    rows have been recorded and no length rejection. The only runner-level
+    test of that boundary pinned the summary path, so the citation half and
+    the clamp-versus-structure boundary were unpinned -- which is how the
+    defect closed without a regression test.
+    """
+
+    class _CitationProvider:
+        def __init__(self, payload: str) -> None:
+            self.payload = payload
+            self.calls = 0
+
+        def complete(self, messages, *, max_tokens, tools=()):
+            self.calls += 1
+            if self.calls == 1:
+                return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+            return ModelTurn(text=self.payload, usage_tokens=1)
+
+    @staticmethod
+    def _report_with_citations(citations: list[object]) -> str:
+        return json.dumps({
+            "status": "COMPLETED",
+            "summary": "work verified",
+            "evidence": ["fixture tool result"],
+            "actions": [],
+            "changes": [],
+            "tests": [],
+            "blocker": "",
+            "next_hypothesis": "",
+            "citations": citations,
+        })
+
+    def _run(self, payload: str) -> tuple[AgentRunResult, list[dict[str, object]], list[dict[str, object]]]:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(self._CitationProvider(payload), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            clamped = [json.loads(row[0]) for row in store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_clamped'").fetchall()]
+            invalid = [json.loads(row[0]) for row in store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_invalid'").fetchall()]
+            store.close()
+            return result, clamped, invalid
+
+    def test_citation_over_the_length_limit_is_clamped_not_discarded(self) -> None:
+        # 1526 characters: the live shape that closed run b01c5fdb as
+        # needs_recovery when the length check still ran before the clamp.
+        citation = "https://example.org/faq - " + "x" * 1500
+        result, clamped, invalid = self._run(self._report_with_citations([citation]))
+        self.assertEqual(result.status, RunStatus.COMPLETED)
+        self.assertEqual([row["paths"] for row in clamped], [["response.citations[0]"]], "the over-long citation is reported as repaired")
+        self.assertEqual(invalid, [], "a wording overrun must not make the report invalid")
+        self.assertEqual(len(json.loads(result.report)["citations"][0]), 400, "the persisted citation honours the contract's limit")
+
+    def test_citation_count_over_the_ceiling_is_trimmed_not_discarded(self) -> None:
+        result, clamped, invalid = self._run(self._report_with_citations([f"https://example.org/{n}" for n in range(12)]))
+        self.assertEqual(result.status, RunStatus.COMPLETED)
+        self.assertEqual([row["paths"] for row in clamped], [["response.citations"]], "the count overrun is reported as repaired")
+        self.assertEqual(invalid, [])
+        kept = json.loads(result.report)["citations"]
+        self.assertEqual(kept, [f"https://example.org/{n}" for n in range(8)], "only the declared number of leading items survives")
+
+    def test_clamping_a_length_does_not_accept_a_malformed_citation(self) -> None:
+        # The boundary: the clamp repairs wording and must never license a
+        # structurally broken report, which would close a task on nothing.
+        result, clamped, invalid = self._run(self._report_with_citations([["not-a-string"]]))
+        self.assertEqual(result.status, RunStatus.NEEDS_RECOVERY)
+        self.assertEqual(clamped, [])
+        self.assertEqual([row["error"] for row in invalid], ["response.citations[0] must be string"])
+
     def test_prose_finish_report_is_repaired_by_one_bounded_turn(self) -> None:
         class RepairingProvider:
             def __init__(self) -> None:
@@ -1025,6 +1152,116 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(result.status, RunStatus.COMPLETED)
             self.assertEqual(json.loads(result.report)["summary"], "done")
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+            store.close()
+
+    def test_a_deferred_restart_keeps_the_evidence_this_branch_used_to_drop(self) -> None:
+        """The fourth erasure site: the deferred-restart report override.
+
+        Live ledger, read-only, generation 235: 12 of 217 ``run_results`` rows are
+        the fixed 81-character sentence while their own events hold 11-137
+        successful tool results each (845 in total) and none of the 12 names any of
+        them. The override to COMPLETED is the control decision and stays.
+        """
+        tools = {"fixture_tool": FixtureTool(), "propose_self_improvement": _DeferredRestartTool()}
+        with _deferred_restart_result("", tools=tools) as (result, store):
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            self.assertEqual(result.failure, "deferred restart")
+            self.assertEqual(result.control_action["type"], "restart_after_checkpoint")
+            carried = json.loads(result.report)
+            self.assertEqual(carried["status"], "COMPLETED")
+            self.assertIn("executed tool: fixture_tool", carried["evidence"])
+            self.assertTrue(carried["summary"].startswith(_DEFERRED_RESTART_SENTENCE))
+            self.assertEqual(carried["blocker"], "")
+            events = store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_evidence_carried'").fetchall()
+            self.assertEqual([json.loads(row[0])["reason"] for row in events], ["finish_unreadable"])
+
+    def test_the_deferred_restart_branch_carries_evidence_if_finish_returns_prose(self) -> None:
+        """The guard this branch keeps: prose out of ``_finish`` while tools ran.
+
+        With the current ``_finish`` every report it returns for an episode that ran
+        a tool is already JSON, so this path is a guard rather than the route; a
+        guard whose behaviour is unmeasured is not a guard.
+        """
+        tools = {"fixture_tool": FixtureTool(), "propose_self_improvement": _DeferredRestartTool()}
+
+        def dispatch():
+            return patch.object(ReActRunner, "_finish", autospec=True, return_value=(RunStatus.NEEDS_RECOVERY, "Finish Report invalid: prose", 0))
+
+        with _deferred_restart_result(FINISH_OK, tools=tools, dispatch=dispatch) as (result, store):
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            self.assertTrue(json.loads(result.report)["summary"].startswith(_DEFERRED_RESTART_SENTENCE))
+            reasons = [json.loads(row[0])["reason"] for row in store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_evidence_carried'").fetchall()]
+            self.assertEqual(reasons, ["deferred_restart"])
+
+    def test_a_deferred_restart_never_relabels_a_readable_report_as_an_error(self) -> None:
+        """A readable BLOCKED closing turn is kept, not replaced by the sentence."""
+        closing = json.dumps({
+            "status": "BLOCKED", "summary": "promoted but unsure about the next step",
+            "evidence": ["executed tool: fixture_tool"], "actions": ["pytest"],
+            "changes": ["skynet/react.py"], "tests": ["84 passed"],
+            "blocker": "uncertain about the next bounded task", "next_hypothesis": "retry the gate",
+        })
+        tools = {"fixture_tool": FixtureTool(), "propose_self_improvement": _DeferredRestartTool()}
+        with _deferred_restart_result(closing, tools=tools) as (result, store):
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            kept = json.loads(result.report)
+            self.assertEqual(kept["status"], "COMPLETED")
+            self.assertIn("promoted but unsure about the next step", kept["summary"])
+            self.assertEqual(kept["evidence"], ["executed tool: fixture_tool"])
+            self.assertEqual(kept["changes"], ["skynet/react.py"])
+            self.assertEqual(kept["tests"], ["84 passed"])
+            self.assertEqual(kept["blocker"], "")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+
+    def test_a_deferred_restart_without_executed_work_keeps_the_bare_sentence(self) -> None:
+        """The control: the promotion call itself failed, so nothing executed."""
+
+        class FailedPromotionTool:
+            name = "propose_self_improvement"
+            schema = {"type": "function", "function": {"name": name, "description": "propose", "parameters": {"type": "object", "additionalProperties": False}}}  # noqa: RUF012 - Tool protocol reads schema as an instance property
+
+            def execute(self, arguments, *, idempotency_key):
+                return {"ok": False, "error": "gate rejected", "control_action": {"type": "restart_after_checkpoint", "commit": "abc1234"}}
+
+        with _deferred_restart_result("", tools={"propose_self_improvement": FailedPromotionTool()}) as (result, store):
+            self.assertEqual(result.report.strip(), _DEFERRED_RESTART_SENTENCE)
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+
+    def test_the_time_budget_exit_no_longer_drops_an_executed_tool_result(self) -> None:
+        """Pin for the time-budget-before-a-queued-tool exit."""
+
+        class OneToolThenSlow:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                time.sleep(0.05)
+                return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(OneToolThenSlow(), store, {"fixture_tool": FixtureTool()}, ReActConfig(timeout_seconds=0.02, provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.failure, "time budget")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 1)
+            self.assertIn("executed tool: fixture_tool", json.loads(result.report)["evidence"])
+            store.close()
+
+    def test_the_step_budget_exit_no_longer_drops_executed_tool_results(self) -> None:
+        """Pin for the step-budget exit."""
+
+        class LoopingProvider:
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], completion_tokens=1, usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            result = ReActRunner(LoopingProvider(), store, {"fixture_tool": FixtureTool()}, ReActConfig()).run(StartEnvelope("test", budget=Budget(steps=2)), "system")
+            self.assertEqual(result.failure, "step budget")
+            self.assertEqual(json.loads(result.report)["evidence"], ["executed tool: fixture_tool"] * 2)
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 1)
             store.close()
 
     def test_inbox_is_read_once_per_step_boundary(self) -> None:

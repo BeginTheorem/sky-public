@@ -333,6 +333,142 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(calls, [])
             reactor.close()
 
+    def test_interrupt_keeps_the_executed_evidence_of_the_episode(self) -> None:
+        """The fifth and sixth erasure sites: the two interrupt write paths.
+
+        Live ledger, read-only, generation 238: 5 of 221 runs are ``interrupted``
+        and every one stored the bare 50- or 63-character sentence while its own
+        events held 9, 15, 20, 42 and 56 successful tool results (142 in total,
+        matching the 142 ``capability_effects`` rows with ``status='applied'``
+        under the same run prefixes). The interrupt itself is correct and stays;
+        only the report stops discarding the work.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3", watchdog_timeout_seconds=5))
+            store = reactor.store
+            from skynet.models import Budget, RunRecord
+            from skynet.time import utc_now
+            with store.transaction():
+                store.create_run(RunRecord("interrupted-run", 1, RunStatus.RUNNING, utc_now(), Budget()))
+                state = store.state()
+                state.active_run_id = "interrupted-run"
+                store.transition(state, LifecycleState.REACT, run_id="interrupted-run", reason="test")
+                store.set_state(state)
+                store.append_event("tool_call", {"call_id": "call-1", "tool_name": "bash", "arguments": {}}, "interrupted-run")
+                store.append_event("tool_result", {"call": {"call_id": "call-1", "tool_name": "bash"}, "result": {"ok": True, "stdout": "x"}}, "interrupted-run")
+                store.append_event("tool_call", {"call_id": "call-2", "tool_name": "no_such_tool", "arguments": {}}, "interrupted-run")
+                store.append_event("tool_result", {"call": {"call_id": "call-2", "tool_name": "no_such_tool"}, "result": {"ok": False, "error": "unknown tool"}}, "interrupted-run")
+            reactor.interrupt_stale_run(reason="owner_stop", force=True)
+            ledger = store.connection.execute("SELECT status, report, failure FROM run_results WHERE run_id=?", ("interrupted-run",)).fetchone()
+            # The status and the failure label are the control decision and are unchanged.
+            self.assertEqual(ledger["status"], "interrupted")
+            self.assertEqual(ledger["failure"], "owner_stop")
+            carried = json.loads(ledger["report"])
+            self.assertEqual(carried["status"], "INTERRUPTED")
+            self.assertTrue(carried["summary"].startswith("Run interrupted by the harness before a Finish Report."))
+            # Only the successful call is evidence; the refused one is the control.
+            self.assertEqual(carried["evidence"], ["executed tool: bash"])
+            self.assertTrue(carried["blocker"])
+            event = store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_evidence_carried'").fetchone()
+            self.assertEqual(json.loads(event[0])["reason"], "owner_stop")
+            self.assertEqual(json.loads(event[0])["tools"], ["bash"])
+            store.close()
+
+    def test_interrupt_without_executed_work_keeps_the_bare_sentence(self) -> None:
+        """The control: an episode that executed nothing keeps its old report."""
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3", watchdog_timeout_seconds=5))
+            store = reactor.store
+            from skynet.models import Budget, RunRecord
+            from skynet.time import utc_now
+            with store.transaction():
+                store.create_run(RunRecord("interrupted-run", 1, RunStatus.RUNNING, utc_now(), Budget()))
+                state = store.state()
+                state.active_run_id = "interrupted-run"
+                store.set_state(state)
+                store.append_event("tool_call", {"call_id": "call-1", "tool_name": "no_such_tool"}, "interrupted-run")
+                store.append_event("tool_result", {"call": {"call_id": "call-1", "tool_name": "no_such_tool"}, "result": {"ok": False}}, "interrupted-run")
+            reactor.interrupt_stale_run(reason="watchdog_timeout", force=True)
+            report = store.connection.execute("SELECT report FROM run_results WHERE run_id=?", ("interrupted-run",)).fetchone()[0]
+            self.assertEqual(report, "Run interrupted by the harness before a Finish Report.")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+            store.close()
+
+    def test_process_restart_recovery_keeps_the_executed_evidence(self) -> None:
+        """The same carrier on the startup path, which has no messages either."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = StateStore(path)
+            from skynet.models import Budget, RunRecord
+            from skynet.time import utc_now
+            with store.transaction():
+                store.create_run(RunRecord("run-restart", 1, RunStatus.RUNNING, utc_now(), Budget()))
+                state = store.state()
+                state.active_run_id = "run-restart"
+                store.set_state(state)
+                store.append_event("tool_call", {"call_id": "call-1", "tool_name": "read", "arguments": {"path": "x"}}, "run-restart")
+                store.append_event("tool_result", {"call": {"call_id": "call-1", "tool_name": "read"}, "result": {"ok": True, "content": "x"}}, "run-restart")
+            store.close()
+            reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=path))
+            reactor.recover()
+            ledger = reactor.store.connection.execute("SELECT status, report, failure FROM run_results WHERE run_id=?", ("run-restart",)).fetchone()
+            self.assertEqual(ledger["failure"], "process_restart")
+            carried = json.loads(ledger["report"])
+            self.assertTrue(carried["summary"].startswith("Run interrupted by a process restart before a Finish Report."))
+            self.assertEqual(carried["evidence"], ["executed tool: read"])
+            reactor.close()
+
+    def test_run_executed_tool_names_reads_the_durable_events(self) -> None:
+        """The reader the carrier is built on, and its two boundaries."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            with store.transaction():
+                store.append_event("tool_call", {"call_id": "a", "tool_name": "bash"}, "run-1")
+                store.append_event("tool_result", {"call": {"call_id": "a", "tool_name": "bash"}, "result": {"ok": True}}, "run-1")
+                # A result that renames its own tool is named by the request, not by itself.
+                store.append_event("tool_call", {"call_id": "b", "tool_name": "grep"}, "run-1")
+                store.append_event("tool_result", {"call": {"call_id": "b", "tool_name": "bash"}, "result": {"ok": True}}, "run-1")
+                # A refused call is not work.
+                store.append_event("tool_call", {"call_id": "c", "tool_name": "bash"}, "run-1")
+                store.append_event("tool_result", {"call": {"call_id": "c", "tool_name": "bash"}, "result": {"ok": False, "policy_warning": True}}, "run-1")
+                # A result with no `ok` key is not a refusal: the guard is `is False`.
+                store.append_event("tool_call", {"call_id": "d", "tool_name": "db"}, "run-1")
+                store.append_event("tool_result", {"call": {"call_id": "d", "tool_name": "db"}, "result": {"rows": []}}, "run-1")
+                # A result whose request is missing cannot be attributed.
+                store.append_event("tool_result", {"call": {"call_id": "e"}, "result": {"ok": True}}, "run-1")
+            self.assertEqual(store.run_executed_tool_names("run-1"), ["bash", "grep", "db"])
+            self.assertEqual(store.run_executed_tool_names("no-such-run"), [])
+            store.close()
+
+    def test_executed_tool_names_agree_with_the_effect_ledger(self) -> None:
+        """The invariant the report carrier relies on: two ledgers, one count.
+
+        The executed evidence is written twice by independent code paths -- this
+        reader walks ``event_log``, ``run_effect_capabilities`` walks
+        ``capability_effects`` -- so a disagreement is a real defect in one of
+        them rather than a matter of interpretation. Measured on the live ledger
+        (generation 238, all 221 runs): 221 agree, 0 differ, and the five
+        ``interrupted`` runs agree at 142.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            from skynet.models import Budget, RunRecord
+            from skynet.time import utc_now
+            with store.transaction():
+                store.create_run(RunRecord("run-1", 1, RunStatus.RUNNING, utc_now(), Budget()))
+                for index in range(3):
+                    call_id = f"call-{index}"
+                    store.append_event("tool_call", {"call_id": call_id, "tool_name": "bash"}, "run-1")
+                    store.append_event("tool_result", {"call": {"call_id": call_id, "tool_name": "bash"}, "result": {"ok": True}}, "run-1")
+                    store.record_effect(f"run-1:{index}:{call_id}", "bash", "hash", {"ok": True}, "applied")
+                # A refusal is written to both ledgers as a non-application.
+                store.append_event("tool_call", {"call_id": "call-refused", "tool_name": "bash"}, "run-1")
+                store.append_event("tool_result", {"call": {"call_id": "call-refused", "tool_name": "bash"}, "result": {"ok": False, "policy_warning": True}}, "run-1")
+                store.record_effect("run-1:3:call-refused", "bash", "hash", {"ok": False, "policy_warning": True}, "refused")
+            self.assertEqual(len(store.run_executed_tool_names("run-1")), sum(store.run_effect_capabilities("run-1").values()))
+            self.assertEqual(store.run_effect_capabilities("run-1"), {"bash": 3})
+            store.close()
+
     def test_backfill_missing_run_results(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")

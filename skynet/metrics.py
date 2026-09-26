@@ -39,6 +39,12 @@ DEVIATION_KINDS = (
     # operational events, not deviations.
     "fallback_failure",
     "fallback_all_cooling",
+    # The subset of chain failures that died before striking ANY provider: the
+    # chain itself said when it could answer and the episode was discarded
+    # anyway. It is its own kind so the deviations digest reports the class the
+    # shared "all providers failed" substring cannot separate from a ladder that
+    # actually tried (measured 2026-09-25: 5 zero-strike runs vs 12 that struck).
+    "provider_unreachable",
     "worktree_dirty_after_bash",
     "livelock_suspected",
     "memory_loop_failed",

@@ -576,9 +576,11 @@ class ReActRunner:
                     if status in {RunStatus.NEEDS_RECOVERY, RunStatus.BLOCKED}:
                         # The promotion already succeeded and is tool-verified; a
                         # harness stop or a cautious model verdict must not
-                        # record the successful promotion as a failed task.
+                        # record it as a failed task. Only the status is the
+                        # control decision; the report override used to erase the
+                        # episode's executed evidence as well.
                         status = RunStatus.COMPLETED
-                        report = "Self-improvement promoted; restart deferred until memory and checkpoint complete."
+                        report = self._deferred_restart_report(report, start.run_id, messages)
                     return AgentRunResult(
                         status,
                         report,
@@ -732,10 +734,8 @@ class ReActRunner:
 
     # Every non-COMPLETED AgentRunResult that can be reached after a successful
     # tool call must route its report through this carrier (or through ``_finish``
-    # and ``_provider_failure_report``, which call it). The census of the sites is
-    # asserted by ``test_every_agent_run_result_exit_carries_executed_evidence``;
-    # this table is what makes a new situation a two-line addition instead of a
-    # fourth copy of the same reasoning.
+    # and ``_provider_failure_report``, which call it). The sites are pinned by
+    # FinishCitationClampTests in tests/test_react.py, one case per path.
     EVIDENCE_CARRY_SITUATIONS: ClassVar[dict[str, tuple[str, str]]] = {
         "finish_unreadable": (
             "The closing turn was not a readable Finish Report and the repair turn failed",
@@ -757,7 +757,12 @@ class ReActRunner:
             "The harness stopped the cycle safely",
             "the harness stopped the cycle before the model returned a readable report",
         ),
+        "deferred_restart": (
+            "The promotion was committed and the restart deferred, but the closing turn was not a verified completion",
+            "the promoted episode's closing turn was not a verified completion; the promotion itself is committed",
+        ),
     }
+    DEFERRED_RESTART_SENTENCE: ClassVar[str] = "Self-improvement promoted; restart deferred until memory and checkpoint complete."
 
     def _carry_evidence_forward(
         self, report: str, run_id: str, messages: list[Message], *, situation: str = "finish_unreadable"
@@ -814,6 +819,43 @@ class ReActRunner:
         )
         return RunStatus.NEEDS_RECOVERY, carried
 
+    def _deferred_restart_report(self, report: str, run_id: str, messages: list[Message]) -> str:
+        """Announce a deferred restart without discarding the episode's tool work.
+
+        The control decision is unchanged: a promotion the promotion tool itself
+        verified is recorded COMPLETED even when the closing turn is unreadable or
+        cautious. What changed is that the replacement text is no longer the whole
+        report -- the branch used to assign the fixed sentence over the report
+        ``_finish`` had just returned, and ``_finish`` now carries the executed
+        evidence into exactly those reports.
+
+        Measured on the live ledger (read-only, generation 235): 12 of 217
+        ``run_results`` rows are that 81-character sentence verbatim while their own
+        events hold 11-137 successful tool results each (845 in total), and none of
+        the 12 names any of them. This branch is the fourth erasure site of the same
+        class as the time-budget, step-budget and harness-stop exits. A readable
+        closing report is kept as authored; only ``status`` and ``blocker`` are
+        applied, because a blocker under ``status: COMPLETED`` is the rendering
+        defect skynet/reporting.py:284 removed. An episode with no successful call
+        keeps the bare sentence, exactly like every other carrier site.
+        """
+        try:
+            candidate = json.loads(report)
+        except ValueError:
+            candidate = None
+        if not (isinstance(candidate, dict) and "status" in candidate):
+            _status, carried = self._carry_evidence_forward(report, run_id, messages, situation="deferred_restart")
+            try:
+                candidate = json.loads(carried)
+            except ValueError:
+                return self.DEFERRED_RESTART_SENTENCE
+        data = dict(candidate) if isinstance(candidate, dict) else None
+        if data is None:
+            return self.DEFERRED_RESTART_SENTENCE
+        data["status"] = "COMPLETED"
+        data["blocker"] = ""
+        data["summary"] = f"{self.DEFERRED_RESTART_SENTENCE} {str(data.get('summary') or '').strip()}".strip()
+        return json.dumps(data, ensure_ascii=False)
     def _provider_failure_report(self, report: str, run_id: str, messages: list[Message]) -> str:
         """Keep the ``Provider unavailable: ...`` text and stop erasing the work.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ from skynet import metrics
 from skynet.idea_archive import effective_modes, learnability_defect
 from skynet.models import Budget, RunRecord, RunStatus
 from skynet.planner import PortfolioPlanner
-from skynet.reactor import Reactor, ReactorConfig
+from skynet.reactor import _EXTERNAL_SEEK_FINGERPRINTS, SAFETY_NET_FINGERPRINTS, Reactor, ReactorConfig, _live_external_seek_tasks
 from skynet.self_improvement import SelfImprovementManager
 from skynet.store import StateStore
 from skynet.time import utc_now
@@ -405,6 +406,149 @@ class ExternalSeekTests(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
+            reactor.close()
+
+
+    def test_valve_does_not_stack_a_second_instance_of_itself(self) -> None:
+        """An outward look already waiting must not be created again.
+
+        Measured on the live ledger before this check existed (2026-09-25,
+        read-only): the valve fired 56 times in six days and at the moment of
+        every one of those firings a prior external-seek task was still live
+        under the same stable template fingerprints, so asking for one
+        outstanding instance would have suppressed 56 of 56 creations and
+        starved nothing. Seven were simultaneously pending, the oldest four days
+        old, against a mean 0.9 h from creation to a terminal state.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"webfetch": Mock()},
+                ReactorConfig(
+                    state_path=Path(directory) / "state.sqlite3",
+                    external_seek_every_generations=1,
+                    external_seek_cooldown_seconds=0.0,
+                ),
+            )
+            reactor.store.add_goal("g", priority=1.0)
+            goals = reactor.store.active_work()[0]
+            state = reactor.store.state()
+            first = reactor._seek_external_evidence(state, goals)
+            self.assertIsNotNone(first)
+            first_id = cast(dict, first)["task"]["task_id"]
+            self.assertIsNone(reactor._seek_external_evidence(state, goals))
+            self.assertEqual(
+                reactor.store.connection.execute(
+                    "SELECT COUNT(*) FROM event_log WHERE kind='external_seek_created'"
+                ).fetchone()[0],
+                1,
+            )
+            suppressed = reactor.store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='external_seek_suppressed' "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(suppressed)
+            self.assertEqual(json.loads(suppressed["payload"])["live_task_id"], first_id)
+            reactor.close()
+
+    def test_valve_reopens_once_the_outstanding_look_is_settled(self) -> None:
+        """The check gates duplication, not the valve: a settled task frees it.
+
+        Every terminal status frees the valve, because none of them is
+        selectable again; a suppressed duplicate must not seal the boundary.
+        """
+        for settled in ("completed", "cancelled", "failed", "blocked"):
+            with self.subTest(settled=settled), tempfile.TemporaryDirectory() as directory:
+                reactor = Reactor(
+                    FakeProvider(),
+                    {"webfetch": Mock()},
+                    ReactorConfig(
+                        state_path=Path(directory) / "state.sqlite3",
+                        external_seek_every_generations=1,
+                        external_seek_cooldown_seconds=0.0,
+                    ),
+                )
+                reactor.store.add_goal("g", priority=1.0)
+                goals = reactor.store.active_work()[0]
+                state = reactor.store.state()
+                first = reactor._seek_external_evidence(state, goals)
+                self.assertIsNotNone(first)
+                task_id = cast(dict, first)["task"]["task_id"]
+                reactor.store.connection.execute(
+                    "UPDATE tasks SET status=?, updated_at=? WHERE task_id=?",
+                    (settled, utc_now(), task_id),
+                )
+                self.assertIsNotNone(reactor._seek_external_evidence(state, goals))
+                reactor.close()
+
+    def test_a_stale_stack_is_repaired_down_to_the_newest_live_instance(self) -> None:
+        """The exemption keeps one reachable instance, not every stacked copy.
+
+        Measured on a replica of the live ledger at generation 202 (read-only):
+        6 pending copies of the external-seek template shared one terminal
+        hypothesis, planner_candidates scored all 6 'terminal' and
+        PortfolioPlanner.rank() returned none of them, while the valve's own
+        duplicate check counted them. The repair must reduce the family to the
+        newest live instance instead of exempting the whole family forever.
+
+        Note what this does NOT claim: the valve stays shut while that survivor
+        is pending with a terminal hypothesis, because nothing selects such a row
+        except the firing that created it. That residual sealing is recorded for
+        the next cycle rather than asserted as fixed here.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"webfetch": Mock()},
+                ReactorConfig(
+                    state_path=Path(directory) / "state.sqlite3",
+                    external_seek_every_generations=1,
+                    external_seek_cooldown_seconds=0.0,
+                ),
+            )
+            reactor.store.add_goal("g", priority=1.0)
+            goals = reactor.store.active_work()[0]
+            state = reactor.store.state()
+            first = reactor._seek_external_evidence(state, goals)
+            first_id = cast(dict, first)["task"]["task_id"]
+            # Two older copies of the same template survive as pending rows and
+            # the hypothesis behind them is terminal, exactly as on the ledger.
+            stale_ids = []
+            for offset, when in enumerate(("2026-09-21T11:58:57Z", "2026-09-23T02:19:53Z")):
+                stale = reactor.store.add_task(
+                    f"stale copy {offset}",
+                    goals[0]["goal_id"],
+                    expected_new_fact="stale",
+                    hypothesis_fingerprint=_EXTERNAL_SEEK_FINGERPRINTS[0],
+                    structural_fingerprint=_EXTERNAL_SEEK_FINGERPRINTS[1],
+                    area="research",
+                )
+                reactor.store.connection.execute("UPDATE tasks SET created_at=? WHERE task_id=?", (when, stale))
+                stale_ids.append(stale)
+            reactor.store.connection.execute(
+                "UPDATE tasks SET created_at='2026-09-25T11:48:11Z' WHERE task_id=?", (first_id,)
+            )
+            reactor.store.connection.execute(
+                "UPDATE hypotheses SET status='completed' WHERE fingerprint=?", (_EXTERNAL_SEEK_FINGERPRINTS[0],)
+            )
+            reactor.store.connection.commit()
+            self.assertEqual(
+                len(_live_external_seek_tasks(reactor.store.connection)), 3, "the stack is live before the repair"
+            )
+            repaired = reactor.store.repair_status_consistency(exclude_fingerprints=SAFETY_NET_FINGERPRINTS)
+            self.assertEqual(repaired["tasks"], 2, "both stale copies are retired")
+            statuses = dict(reactor.store.connection.execute(
+                "SELECT task_id, status FROM tasks WHERE hypothesis_fingerprint=?", (_EXTERNAL_SEEK_FINGERPRINTS[0],)
+            ).fetchall())
+            self.assertEqual(statuses[first_id], "pending", "the newest instance keeps the safety net")
+            for stale_id in stale_ids:
+                self.assertEqual(statuses[stale_id], "cancelled")
+            surviving = _live_external_seek_tasks(reactor.store.connection)
+            self.assertEqual([row["task_id"] for row in surviving], [first_id], "one instance of the family stays live")
+            # Pinned residual behaviour: the survivor is pending with a terminal
+            # hypothesis, so it still holds the valve shut. Retiring it is a
+            # separate change with its own evidence.
+            self.assertIsNone(reactor._seek_external_evidence(state, goals))
             reactor.close()
 
 

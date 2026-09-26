@@ -539,6 +539,67 @@ class MemoryRetrievalTests(unittest.TestCase):
             store.close()
 
 
+class FallbackOrderTests(unittest.TestCase):
+    """The fallback reader must return one page per logical corpus.
+
+    ``_fallback_search`` is the route that runs when the durable FTS projection
+    is missing or unreadable, and its score is built by hand: measured on the
+    live ledger it lands on two decimals or coarser, so the ``(score,
+    confidence)`` key it used to carry tied on 171 of 182 frozen planner
+    queries.  ``sorted`` leaves equal keys in the row order of the 500-row pool,
+    and that pool was ordered by ``updated_at DESC`` alone, so the same logical
+    corpus returned different pages from two ledgers whose rows were inserted in
+    different orders.  Both tests below fail on that reader and pass once the
+    order is decided by the stable external memory id.
+    """
+
+    BODY = "frozen envelope recall validation procedure " * 8
+    QUERY = "frozen envelope recall validation procedure frozen recall"
+
+    def _store(self, directory: str, rows: list[tuple[str, str, str, float, str]]) -> StateStore:
+        store = StateStore(Path(directory) / "state.sqlite3")
+        for memory_id, kind, content, confidence, updated_at in rows:
+            store.connection.execute(
+                "INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES(?,?,?,?,NULL,?)",
+                (memory_id, kind, content, confidence, updated_at),
+            )
+        store.connection.commit()
+        assert store.memory_store is not None
+        store.memory_store.fts_available = False  # exercise the fallback route
+        return store
+
+    def _page(self, store: StateStore, limit: int) -> list[str]:
+        return [item["memory_id"] for item in store.search_memories(self.QUERY, limit=limit)]
+
+    def test_fallback_page_does_not_depend_on_physical_row_order(self) -> None:
+        # Four memories with the SAME score and the SAME confidence: the old key
+        # is entirely tied and the page was whatever order the rows happened to
+        # be scanned in.
+        rows = [
+            ("mem-a", "procedure", self.BODY, 0.80, "2026-09-25T00:00:00Z"),
+            ("mem-b", "lesson", self.BODY + " ", 0.80, "2026-09-25T00:00:00Z"),
+            ("mem-c", "risk", self.BODY + "  ", 0.80, "2026-09-25T00:00:00Z"),
+            ("mem-d", "fact", self.BODY + "   ", 0.80, "2026-09-25T00:00:00Z"),
+        ]
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            forward, backward = self._store(first, rows), self._store(second, list(reversed(rows)))
+            self.assertEqual(self._page(forward, 4), self._page(backward, 4))
+            forward.close()
+            backward.close()
+
+    def test_fallback_pool_cut_does_not_depend_on_physical_row_order(self) -> None:
+        # 502 matching memories share one ``updated_at``: the 500-row window that
+        # buys the score ties at the pool's own cut, so its membership is decided
+        # by the id as well.
+        tied = "2026-09-25T00:00:00Z"
+        rows = [(f"mem-{index:03d}", "fact", f"{self.QUERY} window {index}", 0.5, tied) for index in range(502)]
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            forward, backward = self._store(first, rows), self._store(second, list(reversed(rows)))
+            self.assertEqual(self._page(forward, 50), self._page(backward, 50))
+            forward.close()
+            backward.close()
+
+
 class MemoryPromptTests(unittest.TestCase):
     def test_the_memory_prompt_drops_the_react_system_message(self) -> None:
         # The ReAct transcript starts with its own system prompt and the Memory

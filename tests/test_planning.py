@@ -206,12 +206,16 @@ class CoreTests(unittest.TestCase):
 class FingerprintPlannerProvider:
     """Returns one deterministic proposal so dedup liveness is observable."""
 
-    def __init__(self, goal_id: str, *, problem: str, expected_new_fact: str, scope: list[str], kind: str = "engineering") -> None:
+    def __init__(self, goal_id: str, *, problem: str, expected_new_fact: str, scope: list[str], kind: str = "engineering", title: str = "bounded dedup probe", inspiration_ref: str = "arXiv:0000.00000 fixture citation") -> None:
         self.goal_id = goal_id
         self.problem = problem
         self.expected_new_fact = expected_new_fact
         self.scope = scope
         self.kind = kind
+        self.title = title
+        # A research proposal is rejected before dedup unless it cites an external
+        # source, so the fixture carries one.
+        self.inspiration_ref = inspiration_ref
 
     @property
     def fingerprints(self) -> tuple[str, str]:
@@ -223,13 +227,14 @@ class FingerprintPlannerProvider:
     def complete(self, messages, *, max_tokens, tools=()):
         return ModelTurn(text=json.dumps({"proposals": [{
             "goal_id": self.goal_id,
-            "title": "bounded dedup probe",
+            "title": self.title,
             "problem": self.problem,
             "hypothesis": "the dedup gate only blocks live or terminal work",
             "expected_new_fact": self.expected_new_fact,
             "validation": "assert the planner accepts the proposal",
             "scope": list(self.scope),
             "kind": self.kind,
+            "inspiration_ref": self.inspiration_ref,
         }]}), usage_tokens=1)
 
 
@@ -258,6 +263,86 @@ class DedupLivenessTests(unittest.TestCase):
             self.assertNotEqual(third[0]["task_id"], first[0]["task_id"])
             recorded = {row[0]: row[1] for row in store.connection.execute("SELECT status, COUNT(*) FROM planner_proposals WHERE hypothesis_fingerprint=? GROUP BY status", (hypothesis_fp,))}
             self.assertEqual(recorded, {"accepted": 2, "deduplicated": 1})
+            store.close()
+
+    def test_paraphrased_research_question_is_deduplicated(self) -> None:
+        """The measured true positive: a resolved question re-asked in new wording.
+
+        The two titles below are the real ones from the live ledger (2026-09-24 and
+        2026-09-25); their title-token Jaccard is 0.56, so they never collide on an
+        exact fingerprint even though the second cannot produce a new fact once the
+        first shipped its answer.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("dedup", priority=1.0)
+            first_provider = FingerprintPlannerProvider(
+                goal_id,
+                problem="price the owner's RAG deferral from the dense-retrieval scaling curve",
+                expected_new_fact="the empty-vs-dense crossover size in corpus tokens",
+                scope=["skynet/memory_store.py"],
+                kind="research",
+                title="Measure the BM25-vs-dense top-k crossover N on the live memory corpus to price the owner's RAG deferral",
+            )
+            goals, _ = store.active_work()
+            first = AutonomousPlanner(first_provider, store, timeout_seconds=1000.0).generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="first")
+            self.assertEqual(len(first), 1)
+            store.apply_task_updates([{"task_id": first[0]["task_id"], "status": "completed"}], run_id="run-1")
+            second_provider = FingerprintPlannerProvider(
+                goal_id,
+                problem="state the corpus size at which a dense route becomes worth acquiring",
+                expected_new_fact="the crossover size restated against the frozen labelled envelopes",
+                scope=["skynet/recall_scorecard.py"],
+                kind="research",
+                title="Give the owner's RAG deferral a number: measure the BM25-vs-dense top-k crossover N on the frozen labelled envelopes",
+            )
+            # The exact gates provably could not fire: the paraphrased re-issue
+            # differs in problem, expected_new_fact and scope, so both of its
+            # fingerprints differ from the first proposal's.
+            self.assertNotEqual(second_provider.fingerprints[0], first_provider.fingerprints[0])
+            self.assertNotEqual(second_provider.fingerprints[1], first_provider.fingerprints[1])
+            second = AutonomousPlanner(second_provider, store, timeout_seconds=1000.0).generate(generation=1, goals=goals, tasks=[], memories=[], previous={}, trigger="second")
+            self.assertEqual(second, [])
+            row = store.connection.execute(
+                "SELECT status, rejection_reason FROM planner_proposals WHERE title LIKE 'Give the owner%'"
+            ).fetchone()
+            self.assertEqual(row[0], "deduplicated")
+            self.assertIn("paraphrase of resolved work", row[1])
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+            store.close()
+
+    def test_recurring_recovery_habit_is_not_deduplicated(self) -> None:
+        """The measured false positive that kinds exist to avoid.
+
+        "Pay the owner channel" is re-issued whenever the inbox fills again, with
+        title similarity 0.64 to its own predecessor -- higher than the true
+        positive above. It is legitimate recurrence, so it must stay proposable.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("dedup", priority=1.0)
+            first_provider = FingerprintPlannerProvider(
+                goal_id,
+                problem="the pending owner messages need answers",
+                expected_new_fact="each pending inbox event is answered and acknowledged",
+                scope=["skynet/reactor.py"],
+                kind="recovery",
+                title="Pay the owner channel: answer the pending messages and acknowledge the inbox",
+            )
+            goals, _ = store.active_work()
+            first = AutonomousPlanner(first_provider, store, timeout_seconds=1000.0).generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="first")
+            self.assertEqual(len(first), 1)
+            store.apply_task_updates([{"task_id": first[0]["task_id"], "status": "completed"}], run_id="run-1")
+            second_provider = FingerprintPlannerProvider(
+                goal_id,
+                problem="new pending owner messages need answers",
+                expected_new_fact="the newly pending inbox events are answered and acknowledged",
+                scope=["skynet/reactor.py"],
+                kind="recovery",
+                title="Pay the owner channel: answer the currently pending inbox events and acknowledge exactly those",
+            )
+            second = AutonomousPlanner(second_provider, store, timeout_seconds=1000.0).generate(generation=1, goals=goals, tasks=[], memories=[], previous={}, trigger="second")
+            self.assertEqual(len(second), 1)
             store.close()
 
     def test_pending_task_fingerprint_is_still_deduplicated(self) -> None:
@@ -755,3 +840,108 @@ class PlannerFailureVisibilityTests(unittest.TestCase):
             reasons = [row["reason"] for row in reactor.store.connection.execute("SELECT reason FROM planner_decisions").fetchall()]
             self.assertEqual(reasons, ["no novel work"])
             reactor.close()
+
+
+class PlannerPromptWindowTests(unittest.TestCase):
+    """The planner prompt must carry the newest tasks and the best memories.
+
+    Both callers hand `_bounded_payload` a best-first collection:
+    `Reactor._run_autonomous_planning` reads tasks with ``ORDER BY updated_at
+    DESC`` and reads memories through ``search_memories``, which ranks by score.
+    A window sliced from the far end of that list therefore shows the model the
+    *oldest* tasks and the *worst-ranked* memories it holds, and the over-budget
+    trim removes rows from the newest end as well.
+
+    The measured consequence (generation 220, live ledger): the 40 tasks in the
+    prompt ended at 2026-09-24T11:06Z and contained none of that day's 36 tasks,
+    so the completed task that had already answered the question -- rank 6 of
+    100 newest-first -- was invisible, and the planner re-proposed it as a new
+    task one minute later. That duplicate's kind is ``engineering``, which the
+    title-paraphrase gate does not compare, so the prompt window was the only
+    surface that could have shown it.
+    """
+
+    @staticmethod
+    def _planner(store: StateStore, *, max_input_chars: int = 700_000) -> AutonomousPlanner:
+        return AutonomousPlanner(FakeProvider(), store, max_input_chars=max_input_chars, timeout_seconds=1000.0)
+
+    @staticmethod
+    def _tasks(count: int) -> list[dict[str, Any]]:
+        """`count` tasks in the reactor's order: index 0 is the newest row.
+
+        The timestamps descend with the index, so the fixture's order is the
+        order ``ORDER BY updated_at DESC`` produces, and index 6 is completed
+        because that is where the already-answered task sat in the live ledger.
+        """
+        return [
+            {
+                "task_id": f"t-{index}",
+                "title": f"task {index}",
+                "status": "completed" if index == 6 else "pending",
+                "updated_at": f"2026-09-25T{11 - index // 60:02d}:{59 - index % 60:02d}:00Z",
+            }
+            for index in range(count)
+        ]
+
+    def test_the_prompt_carries_the_newest_tasks_not_the_oldest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            tasks = self._tasks(100)
+            payload = self._planner(store)._bounded_payload(goals=[], tasks=tasks, memories=[], previous={})
+            self.assertEqual([task["task_id"] for task in payload["tasks"]], [f"t-{index}" for index in range(40)])
+            # The completed row the live prompt lost must stay visible, and the
+            # 60 oldest rows must not displace it.
+            self.assertEqual(payload["tasks"][6]["status"], "completed")
+            self.assertNotIn("t-60", [task["task_id"] for task in payload["tasks"]])
+            store.close()
+
+    def test_the_prompt_carries_the_highest_scoring_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            memories = [{"memory_id": f"m-{index}", "content": f"memory {index}"} for index in range(60)]
+            payload = self._planner(store)._bounded_payload(goals=[], tasks=[], memories=memories, previous={})
+            self.assertEqual(
+                [memory["memory_id"] for memory in payload["memories"]],
+                [f"m-{index}" for index in range(20)],
+            )
+            store.close()
+
+    def test_an_over_budget_prompt_drops_the_oldest_rows_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            tasks = self._tasks(100)
+            payload = self._planner(store, max_input_chars=4000)._bounded_payload(goals=[], tasks=tasks, memories=[], previous={})
+            self.assertLessEqual(len(json.dumps(payload, ensure_ascii=False)), 4000)
+            self.assertIsInstance(json.loads(json.dumps(payload, ensure_ascii=False)), dict)
+            kept = [task["task_id"] for task in payload["tasks"]]
+            self.assertLess(len(kept), 40)
+            # A head window, not a suffix: whatever the cap removed, the rows
+            # that stayed are the newest ones.
+            self.assertEqual(kept, [f"t-{index}" for index in range(len(kept))])
+            store.close()
+
+    def test_the_newest_row_survives_when_the_store_itself_supplies_the_order(self) -> None:
+        """The live shape: the row that answers the question is the newest one."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("prompt window goal", priority=1.0)
+            for index in range(60):
+                store.add_task(f"older task {index}", goal_id, area="engineering")
+            answered = store.add_task(
+                "Land the reader-layout and reader-cohort regression tests",
+                goal_id,
+                expected_new_fact="the two classes are pinned",
+                area="engineering",
+            )
+            store.connection.execute("UPDATE tasks SET status='completed' WHERE task_id=?", (answered,))
+            # Second-resolution timestamps tie, so the order the reactor gets is
+            # made explicit rather than left to SQLite's tie-breaking.
+            store.connection.execute(
+                "UPDATE tasks SET updated_at='2026-09-25T00:00:00Z' WHERE task_id!=?", (answered,)
+            )
+            store.connection.execute("UPDATE tasks SET updated_at='2026-09-25T23:59:59Z' WHERE task_id=?", (answered,))
+            store.connection.commit()
+            rows = [dict(row) for row in store.connection.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 100")]
+            payload = self._planner(store)._bounded_payload(goals=[], tasks=rows, memories=[], previous={})
+            self.assertIn(answered, [task["task_id"] for task in payload["tasks"]])
+            store.close()

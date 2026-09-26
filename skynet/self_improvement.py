@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import hashlib
 import json
 import logging
@@ -125,6 +126,10 @@ DEFAULT_PROPOSAL_TTL_HOURS = 24.0
 # warned worktree from lingering for a day purely because the model moved on.
 DEFAULT_WARNED_TTL_HOURS = 6.0
 DEFAULT_MAX_WORKTREES = 8
+# The orphan sweep is destructive and its root is derived, so a pattern the
+# organism owns by name is exempt: a proposal id is ``uuid4().hex``, while a
+# durable artifact directory is named and its absence is discoverable.
+ORPHAN_SWEEP_EXEMPT_ENV = "SKYNET_KEEP_WORKTREES"
 # A proposal that rewrites the suite, its configuration, or this module could
 # neuter the gate and validate itself. Those paths are warned on first
 # submission and only an identical resubmission reaches a stage.
@@ -455,9 +460,17 @@ class SelfImprovementManager:
     def _coerce_test_command(self, test_command: str | Sequence[str] | None) -> tuple[tuple[str, ...], bool]:
         """Turn the model's command spelling into an argv list, or fall back.
 
-        Shell strings and one-element shell-shaped lists are split once more so
-        a formatting mistake does not discard an otherwise valid proposal. An
-        unusable command falls back to the default suite because the intent
+        The same command must normalize to the same tokens however it is
+        spelled: a shell string, one argv list, a list of command lines, or a
+        list of stages. Only a ONE-element shell-shaped list used to be
+        split, so a two- or three-stage command kept its whole first line as
+        argv[0] and every such submission died later as "proposal validation
+        executable is unavailable" -- 17 rows in the live ledger between
+        2026-09-20 and 2026-09-25, each one a complete change set discarded
+        over spelling. The first declared stage is the bounded check; further
+        stages are recorded instead of silently dropped, and a nested argv
+        stage used to be replaced by the default suite the same way. An
+        unusable command still falls back to the default because the intent
         ("run the tests") is unambiguous.
         """
         if test_command is None:
@@ -465,20 +478,70 @@ class SelfImprovementManager:
         if isinstance(test_command, str):
             if self._contains_control(test_command):
                 raise SelfImprovementError("proposal test command contains control characters")
-            parts = self._split_shell_command(test_command)
+            stages: list[tuple[str, ...]] = [tuple(self._split_shell_command(test_command))]
         else:
-            parts = [str(item) for item in test_command]
-            if any(self._contains_control(item) for item in parts):
+            items = list(test_command)
+            if any(self._contains_control(str(item)) for item in items):
                 raise SelfImprovementError("proposal test command contains control characters")
-        if len(parts) == 1 and any(token in parts[0] for token in (" ", "&&", ";", "|")):
-            if self._contains_control(parts[0]):
-                raise SelfImprovementError("proposal test command contains control characters")
-            parts = self._split_shell_command(parts[0])
-        if any(self._contains_control(item) for item in parts):
+            # The first element decides the shape, and only the first: a flat
+            # argv list whose TAIL carries a quoted pytest expression
+            # (`-k "planner or memory"`, ledger row 20916) must keep that
+            # element as ONE token, while a command-line list always leads with
+            # the separator-carrying command.
+            if items and (isinstance(items[0], (list, tuple)) or self._is_command_line_head(str(items[0]))):
+                stages = [self._stage_test_command(item) for item in items]
+            else:
+                # A flat argv list: its elements are tokens, never re-split, so
+                # a quoted pytest expression such as `-k "planner or memory"`
+                # stays ONE token exactly as before.
+                stages = [tuple(str(item) for item in items)]
+        if any(self._contains_control(part) for stage in stages for part in stage):
             raise SelfImprovementError("proposal test command contains control characters")
-        if not parts or not parts[0].strip():
+        stages = [stage for stage in stages if stage and stage[0].strip()]
+        if not stages:
             return DEFAULT_TEST_COMMAND, True
-        return self._normalize_test_command(parts), False
+        if len(stages) > 1 and self.runtime_log is not None:
+            # Recorded, not dropped: the harness suite runs regardless, so an
+            # extra stage is a declaration the proposal made about itself and
+            # a silent substitution would hide it.
+            self.runtime_log.write("test_command_stages_skipped", {"stages": [list(stage) for stage in stages[1:]]})
+        return self._normalize_test_command(stages[0]), False
+
+    @classmethod
+    def _is_command_line_head(cls, value: str) -> bool:
+        """True when the FIRST element of a list is a whole command, not argv[0].
+
+        A command line carries shell separators; a genuine argv[0] does not. A
+        checkout whose path contains a space is the one false positive, so an
+        element that already names an existing file or a PATH executable is
+        treated as argv[0] even when it contains a space.
+        """
+        if not cls._is_command_line(value):
+            return False
+        candidate = value.strip()
+        if Path(candidate).is_file() or Path(candidate).is_dir():
+            return False
+        return shutil.which(candidate) is None
+
+    @staticmethod
+    def _is_command_line(value: str) -> bool:
+        """True when a single string carries shell separators, i.e. is a command."""
+        return any(marker in value for marker in (" ", "&&", ";", "|"))
+
+    @classmethod
+    def _stage_test_command(cls, stage: object) -> tuple[str, ...]:
+        """Tokens of one declared stage: an argv list, or one command line.
+
+        A list is already tokenized and is passed through. A string carrying a
+        shell separator is split, so a quoted argument (``-c "import x; y"``)
+        survives as one token; a bare word is a one-token argv.
+        """
+        if isinstance(stage, (list, tuple)):
+            return tuple(str(item) for item in stage)
+        text = str(stage)
+        if cls._is_command_line(text):
+            return tuple(cls._split_shell_command(text))
+        return (text,)
 
     @staticmethod
     def _contains_control(value: str) -> bool:
@@ -775,6 +838,27 @@ class SelfImprovementManager:
         (each one carries a full copy of the tree), so startup sweeps them.
         The same startup pass expires validated proposals that were never
         promoted, since their worktrees are otherwise never reclaimed.
+
+        ``root`` is derived, not chosen: ``__init__`` walks up from the
+        organism's own root to the nearest ``.skynet-improvements`` directory
+        and otherwise takes ``root.parent / ".skynet-improvements"``. When the
+        organism runs from inside that collection (every gate worktree does, and
+        the collection then holds ``skynet/`` itself), the derived root is the
+        collection, so a durable artifact parked beside it is inside the swept
+        tree. A plain directory the organism created has no ``.git`` entry while
+        a real checkout does, and ``Path.is_dir`` follows symbolic links, so the
+        two rules below keep that boundary honest and both err towards
+        preserving bytes:
+
+        * a child is skipped when it is a symlink, or when it has no ``.git``
+          file or directory: a directory the organism itself created is not a
+          stale checkout, and deleting one silently destroys evidence;
+        * a child whose name matches a pattern named in
+          ``SKYNET_KEEP_WORKTREES`` (comma-separated ``fnmatch`` patterns, e.g.
+          ``skynet-scratch*``) is never deleted, so a named durable directory
+          can be pinned without editing and redeploying this module.
+
+        A skipped child is logged at INFO with the rule that spared it.
         """
         self.sweep_stale_proposals()
         root = self.worktree_root
@@ -788,9 +872,25 @@ class SelfImprovementManager:
         known = {line.split(" ", 1)[1].strip() for line in listed.splitlines() if line.startswith("worktree ")}
         if not known:
             return []
+        exempt = tuple(
+            pattern.strip() for pattern in os.getenv(ORPHAN_SWEEP_EXEMPT_ENV, "").split(",") if pattern.strip()
+        )
         removed: list[str] = []
         for child in sorted(root.iterdir()):
-            if not child.is_dir() or str(child) in known or child == self.root:
+            if child == self.root:
+                continue
+            if child.is_symlink():
+                log.info("orphan sweep spared %s: symbolic link", child)
+                continue
+            if not child.is_dir():
+                continue
+            if str(child) in known:
+                continue
+            if not (child / ".git").exists():
+                log.info("orphan sweep spared %s: no .git entry, so not a checkout", child)
+                continue
+            if any(fnmatch.fnmatch(child.name, pattern) for pattern in exempt):
+                log.info("orphan sweep spared %s: matched %s", child, ORPHAN_SWEEP_EXEMPT_ENV)
                 continue
             shutil.rmtree(child, ignore_errors=True)
             if not child.exists():
@@ -2000,7 +2100,15 @@ class SelfImprovementTool:
                     requested_test_command = shlex.split(requested_test_command)
                 except ValueError:
                     requested_test_command = None
-            test_command = tuple(requested_test_command) if isinstance(requested_test_command, list) and all(isinstance(item, str) for item in requested_test_command) else self.test_command
+            # A nested stage list (the argv form the runbook recommends) used
+            # to fail this string-only test and be replaced by the default
+            # suite, so the stages the proposal declared were silently dropped.
+            test_command = (
+                tuple(requested_test_command)
+                if isinstance(requested_test_command, list)
+                and all(isinstance(item, (str, list, tuple)) for item in requested_test_command)
+                else self.test_command
+            )
             on_dirty_arg = arguments.get("on_dirty", "quarantine")
             on_dirty = on_dirty_arg if on_dirty_arg in ("quarantine", "refuse") else "quarantine"
             result = self.manager.propose_files(files, test_command, changes=changes, patch=patch, metadata={"hypothesis": arguments.get("hypothesis", {})}, on_dirty=on_dirty)

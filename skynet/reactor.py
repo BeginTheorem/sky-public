@@ -31,6 +31,7 @@ from .models import AgentRunResult, AgentState, Budget, LifecycleState, ModelTur
 from .plan_tool import PLAN_OBSERVATION_EVENT_KIND, RecordPlanTool, latest_recorded_plan, plan_preceded_first_mutation
 from .planner import PortfolioPlanner, hypothesis_fingerprint, structural_fingerprint
 from .provider import LLMProvider, Message, Tool, ToolSchema
+from .providers.fallback import is_chain_wide_cooldown_abort
 from .react import ReActConfig, ReActRunner
 from .rollback import RollbackRequestTool
 from .self_improvement import SelfImprovementManager, SelfImprovementTool
@@ -101,8 +102,51 @@ UNVERIFIED_CLAIM_PATTERNS = {
 _REPO_PATH_PATTERN = re.compile(r"(?:^|[\s(])(/?(?:[\w.-]+/)+[\w.-]+\.[A-Za-z0-9]+)(?::\d+)?")
 
 
+# Measured 2026-09-26 (generation 242): the scratch directory is the
+# organism's own ledger-copy bench and its usual artifact is a 241-289 MB copy
+# of state/skynet.sqlite3. On this host /tmp is a 3.9 GB tmpfs, so ~13 stale
+# per-generation copies filled it to 100% and the next cp/sqlite3 a run staged
+# failed with ENOSPC -- one line after the prompt had pointed at that directory
+# as the place to work. A full scratch is not a missing tool: it raises an
+# environment error the run can only misreport as its own failure. Two measured
+# ledger copies of headroom is the point at which the next probe cannot be
+# staged, so that is the floor.
+SCRATCH_LOW_HEADROOM_BYTES = 512 * 1024 * 1024
+
+
+def _scratch_root() -> Path:
+    """The one scratch root, from the same variable the policy boundary reads.
+
+    This fact used to be built from a hardcoded ``/tmp/skynet-scratch`` while
+    ``policy.ExecutionPolicy`` authorised ``SKYNET_SCRATCH_DIR``, so the
+    envelope could advertise a directory bash was not allowed to touch.
+    """
+    return Path(os.getenv("SKYNET_SCRATCH_DIR", "/tmp/skynet-scratch").strip() or "/tmp/skynet-scratch")
+
+
+def _scratch_headroom_facts(scratch: Path) -> dict[str, Any]:
+    """Free and total bytes of the filesystem holding ``scratch``.
+
+    The envelope told the model *where* scratch was but never whether it could
+    hold anything, so exhaustion surfaced only as a refused write. The flag is
+    present only in the low case, so a healthy run's facts keep the same keys
+    the pinned liveness test asserts.
+    """
+    try:
+        usage = shutil.disk_usage(scratch)
+    except OSError:
+        return {}
+    facts: dict[str, Any] = {
+        "scratch_headroom_bytes": usage.free,
+        "scratch_budget_bytes": usage.total,
+    }
+    if usage.free <= SCRATCH_LOW_HEADROOM_BYTES:
+        facts["scratch_low_headroom"] = True
+    return facts
+
+
 def _is_scratch_path(path: str) -> bool:
-    scratch = (os.getenv("SKYNET_SCRATCH_DIR", "/tmp/skynet-scratch").strip() or "/tmp/skynet-scratch").rstrip("/")
+    scratch = str(_scratch_root()).rstrip("/")
     return path == scratch or path.startswith((scratch + "/", "/tmp/"))
 
 PLAN_INSTRUCTION = (
@@ -218,6 +262,50 @@ SAFETY_NET_FINGERPRINTS = _FALLBACK_FINGERPRINTS + _EXTERNAL_SEEK_FINGERPRINTS
 
 
 
+# How many instances of the same safety-net template may be live at once. The
+# valve is cadence-driven and its cooldown bounds the interval between firings,
+# not how many copies stay outstanding, so it used to stack them: measured on the
+# live ledger (2026-09-25, read-only copy), the valve fired 56 times in six days
+# and at the moment of EVERY firing a prior external-seek task was still live
+# under these same stable fingerprints, so "one outstanding instance" would have
+# suppressed 56 of 56 creations and starved nothing. Seven were simultaneously
+# pending, the oldest four days old, against a mean 0.9 h from creation to a
+# terminal state. The rule is the one the SRE overload literature states for a
+# client whose requests are not being served: stop issuing the ones the backend
+# cannot serve (Google SRE Book, ch. 21 "Handling Overload" -- client-side
+# adaptive throttling, requests above the cap "fail locally without even
+# reaching the network"), rather than retrying them blind. Scope is by stable
+# template fingerprints, not by title: the display title carries a generation
+# suffix and 11 distinct fingerprints sit on this one title because the template
+# text itself was edited, so a title match would miss exactly the copies that
+# share the template identity.
+EXTERNAL_SEEK_LIVE_LIMIT = 1
+
+# Terminal for the task selector: a row in one of these never becomes work again.
+_TERMINAL_TASK_STATUSES = ("completed", "cancelled", "failed", "blocked")
+
+
+def _live_external_seek_tasks(connection: Any, goal_id: str | None = None) -> list[dict[str, Any]]:
+    """Outward looks that are still selectable, newest first.
+
+    A bounded read: the family is small by construction (its own limit is what
+    this exists to enforce), and every caller needs either the count or the
+    single instance that is holding the valve shut.
+    """
+    hypothesis, structural = _EXTERNAL_SEEK_FINGERPRINTS
+    sql = (
+        "SELECT task_id, status, created_at, area, goal_id FROM tasks "
+        "WHERE (hypothesis_fingerprint=? OR structural_fingerprint=?) "
+        "AND status NOT IN (?, ?, ?, ?)"
+    )
+    params: list[Any] = [hypothesis, structural, *_TERMINAL_TASK_STATUSES]
+    if goal_id is not None:
+        sql += " AND goal_id=?"
+        params.append(goal_id)
+    sql += " ORDER BY created_at DESC"
+    return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+
 # An owner message is a notification the organism may act on, never an order and
 # never an auto-created task: see `_inbox_notifications` and `acknowledge_inbox`.
 
@@ -262,6 +350,21 @@ class ReactorConfig:
     # planner always takes the top candidate and a bad score function is
     # indistinguishable from a good one.
     planner_epsilon: float = 0.1
+    # The valence channel is charged from the newest terminal runs and tilted
+    # into the exploration threshold. The window is both the lookback and the
+    # draw count, so it is one number rather than two that can disagree.
+    affect_valence_window: int = 20
+    # How far the channel may move the exploration threshold. This is the one
+    # number that sets the channel's whole reach: the reachable interval is
+    # `valence_decidable_band` = [base * (1 - weight), base * (1 + weight)], so
+    # at the shipped 0.5 and planner_epsilon 0.1 only draws inside [0.05, 0.15]
+    # can ever decide differently -- 1 of the 66 decisions the live journal has
+    # recorded. The default is unchanged (it is the shipped constant, so the
+    # deployment's own decisions are unaffected); it is exposed because the
+    # falsifier's sample size is a joint function of this amplitude and the
+    # base, and a verdict about the channel has to be run at a reach that can
+    # actually produce one.
+    affect_valence_tilt_weight: float = 0.5
     hypothesis_ttl_days: float = 30.0
     # Quality-diversity: an empty descriptor cell outranks a crowded one. Small
     # on purpose, so it can never dominate a genuinely more critical task.
@@ -734,6 +837,34 @@ class Reactor:
                     )
                     retryable_blocker = effective_status == RunStatus.BLOCKED and self._is_retryable_environment_blocker(result.report)
                     provider_failed = self._run_had_provider_failure(start.run_id)
+                    if is_chain_wide_cooldown_abort(result.failure):
+                        # The class the shipped exemption cannot name: the chain
+                        # answered "every provider is in cooldown" WITHOUT a
+                        # single strike, so the episode died before it could try
+                        # anything. The chain's own `fallback_all_cooling` event
+                        # records that this happened but is written with run_id
+                        # NULL, so until now the only way to count these episodes
+                        # was to re-derive them by hand from run_results.failure
+                        # strings. Measured 2026-09-25 on the live ledger: 5 of
+                        # 174 committed runs, disjoint from the 12 that struck a
+                        # provider first. Recorded here per run and per task with
+                        # the counter deltas this class actually caused -- 1
+                        # attempt charged (the run did start) and no model-side
+                        # failure charged (the "all providers failed" exemption
+                        # already covers it) -- so a later reader cannot confuse
+                        # the attempt budget with the give-up budget.
+                        selected_for_event = selected_work.get("task") if selected_work and selected_work.get("kind") == "task" else {}
+                        self.store.append_event(
+                            "provider_unreachable",
+                            {
+                                "failure": result.failure[:500],
+                                "steps": result.steps,
+                                "task_id": (selected_for_event or {}).get("task_id"),
+                                "attempt_charged": bool(selected_for_event),
+                                "model_failure_charged": False,
+                            },
+                            start.run_id,
+                        )
                     if effective_status == RunStatus.COMPLETED:
                         # Instrumentation ONLY: a COMPLETED report whose `actions`
                         # name a ledger-backed tool that left no row is recorded,
@@ -1041,8 +1172,15 @@ class Reactor:
                         {"generation": state.generation, "memory_count": memory_count},
                         start.run_id,
                     )
-                    if pruned["transcript"] or pruned["episodes"]:
-                        self.store.append_event("history_pruned", {**pruned, "keep_runs": self.config.transcript_retention_runs}, start.run_id)
+                    history = {key: pruned[key] for key in ("transcript", "episodes")}
+                    if pruned.get("owed"):
+                        # A deliberate skip is not a no-op: without it a firing
+                        # whose every eviction was still owed would report zeros
+                        # and read as a clean pass. Written only when a skip
+                        # happened, so a clean firing keeps the exact payload.
+                        history["owed"] = pruned["owed"]
+                    if any(history.values()):
+                        self.store.append_event("history_pruned", {**history, "keep_runs": self.config.transcript_retention_runs}, start.run_id)
                     self.store.transition(state, LifecycleState.SLEEP, run_id=start.run_id, reason="checkpoint complete")
             self._run_per_cycle_housekeeping()
             # The memory audit is metadata-only and append-only: it records the
@@ -1144,6 +1282,20 @@ class Reactor:
             senses.add("webfetch")
         return sorted(senses)
 
+    def _live_external_seek_task(self) -> dict[str, Any] | None:
+        """The outstanding outward look, if one is already waiting.
+
+        Read-only and goal-independent on purpose. The task previously created
+        for one goal is the same question for every goal -- "consult one external
+        source about a concrete bottleneck" -- so scoping this by goal would
+        still allow one copy per active goal, which is how the backlog reached
+        seven identical pending rows. It is not a selection change: the valve
+        stays cadence-driven and still fires while work is ready, it just stops
+        creating an instance the organism cannot get to.
+        """
+        live = _live_external_seek_tasks(self.store.connection)
+        return live[0] if len(live) >= EXTERNAL_SEEK_LIVE_LIMIT else None
+
     def _external_seek_due(self, state: AgentState) -> bool:
         """Cadence plus a durable cooldown: no in-memory counter to lose on restart.
 
@@ -1185,6 +1337,20 @@ class Reactor:
             })
             return None
         if not self._external_seek_due(state):
+            return None
+        live = self._live_external_seek_task()
+        if live is not None:
+            # Suppression is recorded under its own kind, not as a silent return:
+            # "the valve was due and did nothing" and "the valve was not due" are
+            # different facts, and only one of them is a duplicate refused.
+            self.store.append_event("external_seek_suppressed", {
+                "generation": state.generation,
+                "live_task_id": live["task_id"],
+                "live_status": live["status"],
+                "live_created_at": live["created_at"],
+                "live_area": live["area"],
+                "reason": reason,
+            })
             return None
         goal = goals[0] if goals else None
         if goal is None:
@@ -1591,7 +1757,7 @@ class Reactor:
         """
         root = Path(self.config.self_improvement_root or Path.cwd())
         venv_python = root / ".venv" / "bin" / "python"
-        scratch = Path("/tmp/skynet-scratch")
+        scratch = _scratch_root()
         facts: dict[str, Any] = {
             "workspace": str(root),
             "test_command": f"{venv_python} -m pytest -q" if venv_python.exists() else f"{sys.executable} -m pytest -q",
@@ -1605,6 +1771,7 @@ class Reactor:
             scratch.mkdir(parents=True, exist_ok=True)
         except OSError:
             facts.pop("scratch_directory", None)
+        facts.update(_scratch_headroom_facts(scratch))
         # The model repeatedly queried tables that do not exist (`events` instead
         # of `event_log`, `planner_proposals` instead of `planner_attempts`), so
         # the schema is injected instead of being rediscovered by failure.
@@ -2142,8 +2309,33 @@ class Reactor:
         with self.store.transaction():
             current = self.store.state()
             self.store.transition(current, LifecycleState.PLAN, reason="no ready work; autonomous planning")
-        tasks = [dict(row) for row in self.store.connection.execute("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 100")]
-        memories = self.store.search_memories(self._planner_memory_query(state, goals), limit=20)
+        # `updated_at` is not unique (the live ledger holds a five-row group
+        # sharing one stamp), and the physical row order decided ranks 18, 19,
+        # 21 and 22 of this window: two ledgers holding the same 184 tasks in
+        # opposite insertion orders handed the planner four different rows, and
+        # when such a group straddles the 40-row PAYLOAD_TASK_WINDOW cut the two
+        # builds carried different rows entirely. The stable id terminates the
+        # key, so the window is a function of the corpus and not of its layout.
+        tasks = [dict(row) for row in self.store.connection.execute("SELECT * FROM tasks ORDER BY updated_at DESC, task_id LIMIT 100")]
+        planner_query = self._planner_memory_query(state, goals)
+        memories = self.store.search_memories(planner_query, limit=20)
+        # The planner's recall query is the input the planning decision is made
+        # from, and until now no durable row carried it: measured on the live
+        # ledger, 206 `memory_retrieval` rows describe the OTHER assembler
+        # (`Reactor._memory_query`) and 0 rows of any kind carried this one. The
+        # consequence is not cosmetic -- a part-order question about THIS query
+        # could not be audited after the fact, so every later run rebuilt the
+        # query from the StartEnvelope's `next_plan`, and the rebuild's own
+        # choices change the answer. Measured this generation: at the code's own
+        # per-part cap the moved order [ip,next,const,report,goal] reads h@5 0.248
+        # against the shipped 0.211 on the 133-case g222 ledger, while at a
+        # 200-char front cap the same order reads 0.173 -- the figure a recorded
+        # verdict was published on -- and the shipped order itself reads 0.211 or
+        # 0.200 depending only on which ledger copy is used. The row is written
+        # here, on the calling thread, because the planner runs its provider on a
+        # worker thread and the store connection is not thread-shared (the same
+        # reason the `planner_turn` row is emitted here).
+        self._record_planner_recall(planner_query, memories, state, goals)
         previous = state.next_plan if isinstance(state.next_plan, dict) else {}
         self._planner_provider.reset()
         proposals = self.autonomous_planner.generate(
@@ -2174,6 +2366,79 @@ class Reactor:
             "output_truncated": "planner_output_truncated",
         }.get(status, "no novel work")
         return [str(item["task_id"]) for item in proposals if item.get("task_id")], reason
+    def _record_planner_recall(
+        self,
+        query: str,
+        memories: list[dict[str, Any]],
+        state: AgentState,
+        goals: list[dict[str, Any]],
+    ) -> None:
+        """Write the planner's searched query durably, with the previous-outcome part measured.
+
+        The query string is recorded verbatim because a later run must be able to
+        read what was searched instead of re-deriving it: the assembler is
+        sensitive to choices (the per-part front cap, the ledger copy) that change
+        a part-order verdict without changing the code. ``previous_outcome_terms``
+        is the count of terms the previous-outcome part actually puts INSIDE the
+        recall window, measured by differencing the real query against the same
+        query with that part blanked -- the same ablation the planner-recall
+        analyses of generations 191-223 did by hand. On the live shapes this is
+        the number that says whether the part is alive at all: it sits first in
+        the list and ``MemoryStore._normalize_terms`` keeps only the LAST 24
+        terms, so replaying this writer over the 181 live envelopes reports a mean
+        of 0.12 added terms for it, non-zero on only 3 of them, while the parts
+        after it supply the whole window.
+        """
+        indexable = " ".join(term.replace('"', '""') for term in MemoryStore._normalize_terms(query))
+        previous_terms = 0
+        for candidate in self._planner_query_without_previous_outcome(state, goals):
+            previous_terms = len(
+                set(MemoryStore._normalize_terms(query)) - set(MemoryStore._normalize_terms(candidate))
+            )
+        self.store.append_event(
+            "planner_memory_recall",
+            {
+                "query": query,
+                "query_chars": len(query),
+                "query_terms_effective": len(MemoryStore._normalize_terms(query)),
+                # Counted rather than assumed from the assembly: a whitespace
+                # count would overstate the query the index actually ran.
+                "terms": len(indexable.split()),
+                "hits": len(memories),
+                "previous_outcome_terms": previous_terms,
+                "goal_title_terms": len(MemoryStore._document_terms(
+                    str((goals[0] if goals else {}).get("title", ""))
+                )),
+            },
+            None,
+        )
+
+    @staticmethod
+    def _planner_query_without_previous_outcome(state: AgentState, goals: list[dict[str, Any]]) -> list[str]:
+        """The planner query with the previous-outcome part blanked, as a one-element list.
+
+        Returned as a list so an unavailable previous outcome yields no candidate
+        at all instead of a candidate identical to the real query, which would
+        report every term as contributed by the part. The blanked candidate is
+        assembled from the same parts the real query uses, in the same order, so
+        the difference between the two windows is attributable to that part.
+        """
+        next_plan = state.next_plan if isinstance(state.next_plan, dict) else {}
+        previous = next_plan.get("previous_outcome")
+        if not isinstance(previous, dict):
+            return []
+        if not str(previous.get("report") or previous.get("summary") or ""):
+            return []
+        return [
+            Reactor._join_query_parts(
+                [
+                    str(next_plan.get("initial_prompt", "")),
+                    str(next_plan.get("next", "")),
+                    "autonomous planning",
+                    *([str(goals[0].get("title", ""))] if goals else []),
+                ]
+            )
+        ]
 
     @staticmethod
     def _inbox_notifications(inbox_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2305,12 +2570,23 @@ class Reactor:
 
         The reactor records it once the autonomous planner outcome is known, so
         one cycle produces one decision whose reason is accurate.
+
+        The valence channel is charged once per selection, from the same window
+        the charge and the reader share (``StateStore.charge_affect_valence``),
+        and the reading tilts the exploration threshold through
+        ``valence_tilt``. The channel influences the ONE actuator that already
+        existed and is inert by construction: a window with no finished runs
+        leaves the threshold at ``planner_epsilon`` exactly, so a fresh or
+        disabled channel cannot change a single decision.
         """
+        charge = self.store.charge_affect_valence(window=self.config.affect_valence_window)
         planner = PortfolioPlanner(
             self.store,
             epsilon=self.config.planner_epsilon,
             hypothesis_ttl_days=self.config.hypothesis_ttl_days,
             cell_scarcity_weight=self.config.cell_scarcity_weight,
+            valence=(float(charge["valence"]), int(charge["draws"])),
+            tilt_weight=self.config.affect_valence_tilt_weight,
         )
         return planner, planner.select(record=False)
 
@@ -2401,6 +2677,57 @@ class Reactor:
         finally:
             self._run_lock.release()
 
+    def _interrupted_report(self, run_id: str, sentence: str, reason: str) -> str:
+        """Name the work an interrupted episode had already executed.
+
+        An interrupt happens while the ReAct loop is running, so its in-memory
+        message history dies with the process: ``ReActRunner._succeeded_tool_names``
+        -- the carrier every early exit inside the loop uses -- cannot be reached
+        from here. The episode's own durable rows can be, and they are the same
+        evidence under the same predicate, so the carrier is rebuilt on
+        ``StateStore.run_executed_tool_names``.
+
+        Measured on the live ledger (read-only, generation 238): 5 of 221 runs
+        are ``interrupted`` (4 ``owner_stop``, 1 ``watchdog_timeout``) and each
+        stored the bare 50- or 63-character sentence as its ``run_results.report``
+        while its events held 9, 15, 20, 42 and 56 successful tool results -- 142
+        in total, the count the run's own ``capability_effects`` rows with
+        ``status='applied'`` independently confirm, and not one of them named in
+        any report. This is the fifth and sixth site of the erasure class closed
+        inside ``skynet/react.py`` (time budget, step budget, harness stop,
+        unreadable finish, provider death, deferred restart).
+
+        Only the report changes. The run's status, its ``failure`` label and the
+        ``owner_stop``/``watchdog_timeout``/``process_restart`` distinction are
+        untouched, and an episode that executed nothing keeps the bare sentence
+        verbatim -- the same control every other carrier site uses.
+        """
+        executed = self.store.run_executed_tool_names(run_id)
+        if not executed:
+            return sentence
+        report = json.dumps(
+            {
+                "status": "INTERRUPTED",
+                "summary": (
+                    f"{sentence} {len(executed)} tool call(s) had already executed, so their "
+                    "evidence is kept in this report instead of being discarded."
+                ),
+                "evidence": [f"executed tool: {name}" for name in executed],
+                "actions": [f"tool call: {name}" for name in executed],
+                "changes": [],
+                "tests": [],
+                "blocker": f"the {reason} interrupt ended the episode before it returned a Finish Report",
+                "next_hypothesis": "retry the interrupted episode; the work it already ran is listed above",
+            },
+            ensure_ascii=False,
+        )
+        self.store.append_event(
+            "finish_evidence_carried",
+            {"tool_calls": len(executed), "tools": executed[:20], "reason": reason, "site": "reactor.interrupt"},
+            run_id,
+        )
+        return report
+
     def _interrupt_run(self, run_id: str, reason: str) -> None:
         with self.store.transaction():
             state = self.store.state()
@@ -2408,7 +2735,8 @@ class Reactor:
                 return
             self.store.finish_run(run_id, RunStatus.INTERRUPTED)
             usage = self.store.run_usage(run_id)
-            self.store.commit_run_result(run_id, RunStatus.INTERRUPTED, "Run interrupted by the harness before a Finish Report.", usage["steps"], usage["usage_tokens"], reason)
+            report = self._interrupted_report(run_id, "Run interrupted by the harness before a Finish Report.", reason)
+            self.store.commit_run_result(run_id, RunStatus.INTERRUPTED, report, usage["steps"], usage["usage_tokens"], reason)
             # The clean owner shutdown and the stale-run watchdog share this
             # path but are not the same event. An unknown reason keeps the old
             # kind so a caller that only knows "interrupted" stays auditable.
@@ -2455,7 +2783,11 @@ class Reactor:
                 self.store.commit_run_result(
                     interrupted_run_id,
                     recovery_status,
-                    "Run interrupted by a process restart before a Finish Report.",
+                    self._interrupted_report(
+                        interrupted_run_id,
+                        "Run interrupted by a process restart before a Finish Report.",
+                        "process_restart",
+                    ),
                     usage["steps"],
                     usage["usage_tokens"],
                     "process_restart",
@@ -2506,12 +2838,28 @@ class Reactor:
         The fixed string "autonomous planning next bounded work" recalled nothing
         useful about the actual situation; the goal title, the previous outcome
         and the intended next step are what the planning decision depends on.
+
+        Which key carries the previous outcome is decided by the writer, not by
+        this reader's assumption. The reactor records a run's outcome as
+        ``{"report": <the run's Finish Report>, "status": <status>}`` where it
+        commits the result, so asking for ``"summary"`` alone left this part
+        EMPTY on every live planner call: measured over the 180 ``run_started``
+        envelopes that carry a previous outcome, ``report`` is non-empty on
+        180/180 and ``summary`` on 0/180. Both keys are read and the writer's
+        wins, so an envelope from an older summary-only writer still works.
+
+        The part stays first in the list. Moving it would change which memories
+        are recalled on nearly every case -- measured with the key already
+        repaired, blanking this part alters the 24-term window on 130/133
+        labelled cases when the part is next to last and on 2/133 when it stays
+        first, because the parts after it supply 23.77 terms against a window of
+        24 -- and that is a separate question this fix does not answer.
         """
         next_plan = state.next_plan if isinstance(state.next_plan, dict) else {}
         previous = next_plan.get("previous_outcome")
         parts: list[str] = []
         if isinstance(previous, dict):
-            parts.append(str(previous.get("summary", "")))
+            parts.append(str(previous.get("report") or previous.get("summary") or ""))
         parts.append(str(next_plan.get("initial_prompt", "")))
         parts.append(str(next_plan.get("next", "")))
         parts.append("autonomous planning")

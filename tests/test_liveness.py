@@ -16,6 +16,8 @@ from skynet.dialogue import AcknowledgeInboxTool
 from skynet.metrics import format_report, memory_health
 from skynet.models import AgentRunResult, ModelTurn, RunStatus, ToolCall
 from skynet.planner import PortfolioPlanner
+from skynet.providers.errors import ProviderError
+from skynet.providers.fallback import is_chain_wide_cooldown_abort
 from skynet.reactor import Reactor, ReactorConfig
 from skynet.time import parse_timestamp, utc_datetime_now
 
@@ -218,6 +220,91 @@ class LivenessTests(unittest.TestCase):
             self.assertEqual(row["consecutive_model_failures"], 0)
             self.assertEqual(
                 reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='task_gave_up'").fetchone()[0],
+                0,
+            )
+            reactor.close()
+
+    def test_the_unreachable_chain_predicate_separates_the_two_live_classes(self) -> None:
+        """The predicate is defined by the recorded strings, not by a guess.
+
+        Read off the live ledger (174 committed runs, 2026-09-25): 5 runs died
+        with the chain-wide cooldown text and 12 with a ladder that had struck at
+        least one provider first. The two sets are disjoint, and the shared
+        "all providers failed" substring is what made them indistinguishable.
+        """
+        zero_strike = [
+            "all providers failed after 0 attempts: every provider is in cooldown (nemotron=21.0s)",
+            "all providers failed after 0 attempts: every provider is in cooldown (openrouter=29.9s)",
+            "all providers failed after 0 attempts: every provider is in cooldown (nemotron=17.2s)",
+            "all providers failed after 0 attempts: every provider is in cooldown (openrouter=12.3s)",
+            "all providers failed after 0 attempts: every provider is in cooldown (openrouter=23.8s)",
+        ]
+        not_this_class = [
+            "all providers failed after 2 attempts: nemotron[server]: nemotron request failed: HTTP 500",
+            "all providers failed after 1 attempts: openrouter[network]: openrouter SSE stream ended before [DONE] | blocked_until={'openrouter': 30.0}",
+            "all providers failed after 0 attempts",  # the count alone is not the class
+            "time budget",
+            "",
+        ]
+        for failure in zero_strike:
+            self.assertTrue(is_chain_wide_cooldown_abort(failure), failure)
+        for failure in not_this_class:
+            self.assertFalse(is_chain_wide_cooldown_abort(failure), failure)
+
+    def test_a_zero_strike_cooldown_abort_is_recorded_per_run_and_task(self) -> None:
+        """The class the shipped exemption cannot name must be countable.
+
+        `_run_had_provider_failure` matches the shared "all providers failed"
+        substring, so it reports every one of these episodes as an outage and
+        never charges the model-side give-up budget. That exemption is right;
+        what was missing is a run-scoped row that NAMES the unreachable-chain
+        case, because the chain's own `fallback_all_cooling` event is written
+        with run_id NULL and cannot be attributed to the task that paid for it.
+        """
+        class CooldownProvider:
+            """Every call is refused with the chain's own declared horizon."""
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                if _is_memory_request(messages):
+                    return ModelTurn(text=MEMORY_JSON, usage_tokens=1)
+                raise ProviderError(
+                    "all providers failed after 0 attempts: every provider is in cooldown (nemotron=17.2s)",
+                    category="unavailable",
+                    retryable=True,
+                    cooldown_seconds=17.2,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, CooldownProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            task_id = reactor.store.add_task("bounded diagnostic", goal_id)
+            self.assertEqual(reactor.tick("test"), RunStatus.NEEDS_RECOVERY)
+            rows = reactor.store.connection.execute(
+                "SELECT run_id, payload FROM event_log WHERE kind='provider_unreachable'"
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            payload = json.loads(rows[0]["payload"])
+            self.assertEqual(payload["task_id"], task_id)
+            self.assertTrue(payload["attempt_charged"])
+            self.assertFalse(payload["model_failure_charged"])
+            # The measured counter deltas: this class costs the task one attempt
+            # (the run did start) and no model-side failure.
+            row = self._task_row(reactor, task_id)
+            self.assertEqual((row["attempts"], row["consecutive_model_failures"]), (1, 0))
+            self.assertEqual(row["status"], "pending")
+            reactor.close()
+
+    def test_a_provider_strike_is_not_recorded_as_an_unreachable_chain(self) -> None:
+        """A ladder that struck a provider failed differently; keep it distinct."""
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, DownProvider())
+            goal_id = reactor.store.add_goal("liveness", priority=1.0)
+            reactor.store.add_task("bounded diagnostic", goal_id)
+            self.assertEqual(reactor.tick("test"), RunStatus.NEEDS_RECOVERY)
+            self.assertEqual(
+                reactor.store.connection.execute(
+                    "SELECT COUNT(*) FROM event_log WHERE kind='provider_unreachable'"
+                ).fetchone()[0],
                 0,
             )
             reactor.close()
@@ -1031,6 +1118,39 @@ class LivenessTests(unittest.TestCase):
             self.assertIn("the gate rejected a patch", query)
             self.assertIn("multi-line anchor", query)
             self.assertNotEqual(query, "autonomous planning next bounded work")
+            reactor.close()
+
+    def test_planner_memory_query_reads_the_outcome_key_the_reactor_writes(self) -> None:
+        # The reactor records a run's outcome as {"report": ..., "status": ...} --
+        # the shape `previous_outcome` is written with after every run -- so a
+        # reader that asked only for "summary" took nothing from the previous
+        # run: measured on the live ledger, previous_outcome["report"] is
+        # non-empty on 180/180 run_started envelopes and ["summary"] on 0/180.
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, ProseProvider())
+            state = reactor.store.state()
+            state.next_plan = {
+                "previous_outcome": {"report": "the gate rejected a patch", "status": "COMPLETED"},
+                "initial_prompt": "retry with a multi-line anchor",
+            }
+            query = reactor._planner_memory_query(state, [{"title": "Advance the SkyNet roadmap"}])
+            self.assertIn("the gate rejected a patch", query)
+            self.assertIn("retry with a multi-line anchor", query)
+            self.assertIn("Advance the SkyNet roadmap", query)
+            reactor.close()
+
+    def test_planner_memory_query_still_reads_an_older_summary_only_envelope(self) -> None:
+        # An envelope written by an older writer carries "summary" and no
+        # "report"; repairing the reader must not make that shape dead again.
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, ProseProvider())
+            state = reactor.store.state()
+            state.next_plan = {
+                "previous_outcome": {"summary": "the gate rejected a patch"},
+                "initial_prompt": "retry with a multi-line anchor",
+            }
+            query = reactor._planner_memory_query(state, [{"title": "Advance the SkyNet roadmap"}])
+            self.assertIn("the gate rejected a patch", query)
             reactor.close()
 
     def test_memory_query_is_built_from_the_task_envelope(self) -> None:

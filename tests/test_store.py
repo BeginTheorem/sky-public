@@ -214,7 +214,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             row = store.connection.execute("SELECT version, name FROM schema_migrations ORDER BY version DESC").fetchone()
-            self.assertEqual((row[0], row[1]), (12, "run-progress"))
+            self.assertEqual((row[0], row[1]), (13, "affect-valence"))
             store.close()
 
     def test_schema_v4_upgrade_adds_alerts_area_and_pinned(self) -> None:
@@ -244,7 +244,8 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(upgraded.connection.execute("SELECT area FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "general")
             self.assertEqual(upgraded.connection.execute("SELECT content FROM memories").fetchone()[0], "legacy memory")
             versions = [row[0] for row in upgraded.connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
-            self.assertEqual(versions[-1], 12)
+            self.assertEqual(versions[-1], 13)
+            self.assertIn("valence", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(affect_state)")})
             # v11 names the decay clock: the column must exist after an upgrade
             # even though an older database already had every earlier column.
             self.assertIn("decayed_at", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(memories)")})
@@ -652,6 +653,73 @@ class CoreTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_prune_run_history_holds_the_history_of_a_run_whose_verification_is_owed(self) -> None:
+        # The run-count sweep released transcript and snapshot rows for runs whose
+        # own report is still owed (needs_recovery/interrupted/failed), while the
+        # 30-day event window -- the clock that governs exactly those runs' audit
+        # rows -- still held them. Measured on the live ledger (192 runs): 31 runs
+        # have no terminal COMPLETED report, 26 of them are offside the first-fire
+        # window, and the transcript is the only copy of 690,880 B of those runs'
+        # 766,392 B of provider_response text.
+        #
+        # The discharged control sits next to it and must still be reclaimed, or
+        # the guard would silently disable the sweep.
+        from skynet.models import Budget, RunRecord
+        from skynet.time import utc_now
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            # Insertion order is eviction order, and the window is the newest
+            # keep_runs: both the owed run and the discharged control must be
+            # older than it, or the guard is not what holds either one.
+            for run_id, status in (
+                ("run-owed", RunStatus.NEEDS_RECOVERY),
+                ("run-discharged", RunStatus.COMPLETED),
+                ("run-pad", RunStatus.COMPLETED),
+                ("run-fresh", RunStatus.COMPLETED),
+            ):
+                store.create_run(RunRecord(run_id, 1, status, utc_now(), Budget()))
+                store.append_transcript("react_history", {"messages": [{"role": "tool", "content": run_id}]}, run_id)
+                store.snapshot_episode(run_id)
+                store.append_event("run_started", {"run_id": run_id}, run_id)
+            store.connection.commit()
+
+            pruned = store.prune_run_history(2)
+            held = {
+                str(row[0])
+                for row in store.connection.execute("SELECT DISTINCT run_id FROM transcript WHERE run_id IS NOT NULL")
+            }
+            self.assertEqual(
+                held, {"run-owed", "run-pad", "run-fresh"}, "the owed run keeps its history, the discharged one does not"
+            )
+            self.assertEqual(pruned["transcript"], 1, "only the discharged run's transcript is released")
+            self.assertEqual(pruned["episodes"], 1, "only the discharged run's snapshot is released")
+            self.assertEqual(pruned["owed"], 1, "the skip is counted, so a firing is not read as a clean pass")
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM episode_snapshots WHERE run_id='run-owed'").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM episode_snapshots WHERE run_id='run-discharged'").fetchone()[0],
+                0,
+            )
+
+            # Bounded, not cumulative: the hold ends when the event window
+            # releases the owed run's audit rows, and the next sweep reclaims it.
+            # Without this the guard would be the unbounded pin generation 173
+            # removed for growing 11.72 MB with no release path.
+            store.connection.execute("DELETE FROM event_log WHERE run_id='run-owed'")
+            store.connection.commit()
+            released = store.prune_run_history(2)
+            self.assertEqual(released["owed"], 0)
+            self.assertEqual(released["transcript"], 1, "the released run is now reclaimed")
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM transcript WHERE run_id='run-owed'").fetchone()[0],
+                0,
+                "once the event window releases the run, its history is reclaimed",
+            )
+            self.assertEqual(store.connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            store.close()
     def test_prune_run_history_keeps_the_newest_runs_and_the_audit_trail(self) -> None:
         from skynet.models import Budget, RunRecord
         from skynet.time import utc_now
@@ -776,6 +844,38 @@ class CoreTests(unittest.TestCase):
             # exclusion (not the row shape) is what protected it.
             self.assertEqual(store.repair_status_consistency()["tasks"], 1)
             self.assertEqual(store.connection.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "cancelled")
+            store.close()
+
+    def test_repair_status_consistency_retires_a_stale_stack_but_keeps_the_newest_instance(self) -> None:
+        """One live safety-net instance, not a permanent exemption for the family.
+
+        The exclusion used to cover the fingerprint outright, so stacked copies
+        of the external-seek template stayed pending forever with a terminal
+        hypothesis (measured on the live ledger 2026-09-25, read-only: 6 stale
+        instances, oldest 2026-09-21, all unselectable). The newest live
+        instance is still kept, and a running one is never touched.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("g", priority=1.0)
+            fingerprint = "safety-net-template-hf"
+            structural = "safety-net-template-sf"
+            oldest = store.add_task("template [generation 1]", goal_id, hypothesis_fingerprint=fingerprint, structural_fingerprint=structural)
+            store.connection.execute("UPDATE tasks SET created_at='2026-09-21T11:58:57Z' WHERE task_id=?", (oldest,))
+            middle = store.add_task("template [generation 2]", goal_id, hypothesis_fingerprint=fingerprint, structural_fingerprint=structural)
+            store.connection.execute("UPDATE tasks SET created_at='2026-09-23T02:19:53Z', status='running' WHERE task_id=?", (middle,))
+            newest = store.add_task("template [generation 3]", goal_id, hypothesis_fingerprint=fingerprint, structural_fingerprint=structural)
+            store.connection.execute("UPDATE tasks SET created_at='2026-09-25T11:48:11Z' WHERE task_id=?", (newest,))
+            store.connection.execute("UPDATE hypotheses SET status='completed' WHERE fingerprint=?", (fingerprint,))
+            store.connection.commit()
+            repaired = store.repair_status_consistency(exclude_fingerprints=(fingerprint, structural))
+            statuses = dict(store.connection.execute("SELECT task_id, status FROM tasks WHERE hypothesis_fingerprint=?", (fingerprint,)).fetchall())
+            self.assertEqual(repaired["tasks"], 1, "only the stale instance is retired")
+            self.assertEqual(statuses[oldest], "cancelled")
+            self.assertEqual(statuses[middle], "running", "a running instance is never retired by this path")
+            self.assertEqual(statuses[newest], "pending", "the newest live instance keeps the safety net alive")
+            # Idempotent: the survivor is never re-evaluated into a cancel.
+            self.assertEqual(store.repair_status_consistency(exclude_fingerprints=(fingerprint, structural)), {"hypotheses": 0, "tasks": 0})
             store.close()
 
     def test_task_update_without_status_keeps_current_status(self) -> None:
