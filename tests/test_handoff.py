@@ -21,7 +21,7 @@ from skynet.store import StateStore
 
 
 class HandoffTests(unittest.TestCase):
-    def test_seed_creates_the_roadmap_goal_tasks_and_pinned_memories(self) -> None:
+    def test_seed_creates_the_roadmap_goal_tasks_and_searchable_memories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             store.add_goal("genesis", priority=1.0)
@@ -43,9 +43,16 @@ class HandoffTests(unittest.TestCase):
                 (ROADMAP_AREA,),
             ).fetchone()[0]
             self.assertEqual(missing, 0)
+            # The canonical set is seeded as ordinary searchable rows, never
+            # pinned: the one-shot pin injection stays free for the organism's
+            # own pins and the model reaches these facts through memory.search.
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM memories WHERE kind='procedure'").fetchone()[0],
+                len(CANONICAL_MEMORIES),
+            )
             self.assertEqual(
                 store.connection.execute("SELECT COUNT(*) FROM memories WHERE pinned=1").fetchone()[0],
-                len(CANONICAL_MEMORIES),
+                0,
             )
             self.assertEqual(
                 store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='roadmap_seeded'").fetchone()[0],
@@ -62,7 +69,7 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(second["tasks_created"], 0)
             self.assertEqual(second["tasks_skipped"], len(ROADMAP_TASKS))
             self.assertEqual(second["goal_id"], first["goal_id"])
-            self.assertEqual(second["memories_pinned"], 0)
+            self.assertEqual(second["memories_upserted"], 0)
             # A re-run converges the goal priority instead of leaving a stale one.
             store.connection.execute("UPDATE goals SET priority=4.0 WHERE title=?", (ROADMAP_GOAL_TITLE,))
             seed(store, root=directory)
@@ -81,6 +88,43 @@ class HandoffTests(unittest.TestCase):
             )
             store.close()
 
+    def test_seed_rehomes_pending_items_after_the_last_goal_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            seed(store, root=directory)
+            dead_goal = store.connection.execute(
+                "SELECT goal_id FROM goals WHERE title=?", (ROADMAP_GOAL_TITLE,)
+            ).fetchone()["goal_id"]
+            survivor = store.connection.execute(
+                "SELECT task_id FROM tasks WHERE area=? AND status='pending' ORDER BY title LIMIT 1",
+                (ROADMAP_AREA,),
+            ).fetchone()["task_id"]
+            # Finish every curated item but one, then close the goal: the survivor
+            # is now invisible to the scheduler (task_work needs an active goal),
+            # present in the table but unselectable -- the live stall state.
+            store.connection.execute(
+                "UPDATE tasks SET status='completed' WHERE area=? AND task_id!=?",
+                (ROADMAP_AREA, survivor),
+            )
+            store.connection.execute("UPDATE goals SET status='completed' WHERE goal_id=?", (dead_goal,))
+            store.connection.commit()
+            summary = seed(store, root=directory)
+            self.assertTrue(summary["goal_created"])
+            self.assertEqual(summary["tasks_rehomed"], 1)
+            new_goal = store.connection.execute(
+                "SELECT goal_id FROM goals WHERE title=? AND status='active'", (ROADMAP_GOAL_TITLE,)
+            ).fetchone()
+            self.assertIsNotNone(new_goal)
+            assert new_goal is not None
+            self.assertNotEqual(new_goal["goal_id"], dead_goal)
+            self.assertEqual(
+                store.connection.execute("SELECT goal_id FROM tasks WHERE task_id=?", (survivor,)).fetchone()["goal_id"],
+                new_goal["goal_id"],
+            )
+            # The re-homed item is selectable again, so the organism is not idle.
+            self.assertIsNotNone(PortfolioPlanner(store).select())
+            store.close()
+
     def test_seed_never_points_the_organism_at_a_document(self) -> None:
         source = inspect.getsource(handoff)
         self.assertNotIn("Architecture", source)
@@ -95,7 +139,7 @@ class HandoffTests(unittest.TestCase):
             ).fetchone()
             self.assertIn("genuinely open item", row["constraints"])
             self.assertNotIn("Architecture", row["constraints"])
-            memories = store.connection.execute("SELECT content FROM memories WHERE pinned=1").fetchall()
+            memories = store.connection.execute("SELECT content FROM memories").fetchall()
             for memory in memories:
                 self.assertNotIn("Architecture", memory["content"])
             store.close()

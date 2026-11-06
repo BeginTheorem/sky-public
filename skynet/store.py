@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import random
 import sqlite3
+import subprocess
 import threading
+import urllib.error
+import urllib.request
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import timedelta
@@ -18,10 +22,128 @@ from uuid import uuid4
 # chunk; SQLite's default variable limit is 999, so the chunk stays well below it.
 PROVENANCE_LOOKUP_CHUNK = 400
 
+import re
+from typing import ClassVar
+
 from .memory_store import MemoryStore, normalize_memory_kind
 from .models import AgentState, LifecycleState, RunRecord, RunStatus
 from .runtime_log import RuntimeLog
+from .source_attribution_verifier import SourceAttributionVerifier
 from .time import utc_datetime_now, utc_now
+
+
+class MemoryWriteClassifier:
+    """INFUSE-style write-time classifier for stored-IPI defense.
+
+    Flags candidate content that resembles prompt injection / instruction override
+    so it can be tagged trust_source='owner_untrusted' at persistence. Read paths
+    (pinned_memories, _fts_search, _fallback_search) already symbolize
+    owner_untrusted content to '[SYMBOL: owner_untrusted]' per DualView
+    (arXiv:2607.03821v2) so the agent never consumes attacker text as trusted
+    instructions. This is the write-time half of the INFUSE (arXiv:2610.20776v1)
+    defense; the read-time re-ranker is the existing symbolization guard.
+    """
+
+    _INJECTION_PHRASES: ClassVar[list[str]] = [
+        r"ignore all previous instructions",
+        r"ignore all prior instructions",
+        r"you are now in debug mode",
+        r"print all memory",
+        r"emit the system prompt",
+        r"system prompt verbatim",
+        r"disclose the owner",
+        r"confidential keys",
+        r"private notes",
+        r"reveal your instructions",
+        r"override your instructions",
+        r"disregard your instructions",
+        r"leak.*memory",
+        r"exfiltrat",
+    ]
+
+    _COMPILED: ClassVar[list[re.Pattern[str]]] = [re.compile(p, re.IGNORECASE) for p in _INJECTION_PHRASES]
+
+    def classify(self, content: str) -> tuple[bool, str]:
+        """Return (is_owner_untrusted, reason)."""
+        text = content or ""
+        for pattern in self._COMPILED:
+            if pattern.search(text):
+                return True, f"injection-like phrase matched: {pattern.pattern}"
+        return False, "clean"
+
+
+class MemoryTransitionVerifier:
+    """Deterministic verifier for memory consolidation transitions.
+
+    Mirrors HaluMem memory-updating task (arXiv:2511.03506v3): classifies an
+    update candidate against its original memory as Correct / Hallucination /
+    Omission before the update lands in durable memory. Key facts = ISO dates,
+    numbers, proper nouns (minus generic suffixes and sentence-start stopwords).
+    """
+
+    _DATE: ClassVar = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+    _NUMBER: ClassVar = re.compile(r"(?<!\d-)\b\d+(?:\.\d+)?\b(?!\d-)")
+    _PROPER: ClassVar = re.compile(r"\b[A-Z][a-zA-Z]+\b")
+    _GENERIC_ENTITY_SUFFIXES: ClassVar = frozenset({"Corp", "Inc", "Ltd", "LLC", "Co", "Company", "Corporation"})
+    _PROPER_STOPWORDS: ClassVar = frozenset({
+        "The", "This", "That", "These", "Those", "A", "An", "It", "He", "She",
+        "They", "We", "I", "My", "Our", "Your", "His", "Her", "Its",
+    })
+
+    def __init__(self, connection=None):
+        self.connection = connection
+
+    def verify_transition(self, candidate: dict[str, Any], original=None) -> tuple[str, str]:
+        """Verify a candidate against its original memory.
+
+        Returns (verdict, reason) where verdict is one of:
+        - "Correct": key facts preserved, no contradiction
+        - "Hallucination": candidate contradicts original key facts
+        - "Omission": candidate drops key facts from original
+        """
+        content = (candidate.get("content") or "").strip()
+        if not content:
+            return "Omission", "empty candidate content"
+        orig_content = (original.get("content") or "").strip() if original else ""
+        if not orig_content:
+            return "Correct", "no original memory to contradict"
+
+        old = self._key_facts(orig_content)
+        new = self._key_facts(content)
+
+        if self._contradicts(old, new):
+            return "Hallucination", "candidate contradicts original key facts"
+
+        dropped = old - new
+        if dropped and len(dropped) > len(old) // 2:
+            return "Omission", "candidate drops key facts from original"
+
+        return "Correct", "key facts preserved, no contradiction"
+
+    def _key_facts(self, text: str) -> set[str]:
+        date_tokens = set()
+        for d in self._DATE.findall(text):
+            date_tokens.update(d.split("-"))
+        proper = {
+            t for t in self._PROPER.findall(text)
+            if t not in date_tokens
+            and t not in self._GENERIC_ENTITY_SUFFIXES
+            and t not in self._PROPER_STOPWORDS
+        }
+        return set(self._DATE.findall(text)) | set(self._NUMBER.findall(text)) | proper
+
+    def _contradicts(self, old: set[str], new: set[str]) -> bool:
+        old_dates = {t for t in old if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t)}
+        new_dates = {t for t in new if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t)}
+        old_nums = {t for t in old if re.fullmatch(r"\d+(?:\.\d+)?", t) and "-" not in t}
+        new_nums = {t for t in new if re.fullmatch(r"\d+(?:\.\d+)?", t) and "-" not in t}
+        if old_dates and new_dates and not (old_dates & new_dates):
+            return True
+        if old_nums and new_nums and not (old_nums & new_nums):
+            return True
+        old_proper = old - old_dates - old_nums
+        new_proper = new - new_dates - new_nums
+        return bool(old_proper and new_proper and not (old_proper & new_proper))
 
 # A ledger row whose result carries one of these markers records a refusal
 # decision, not an application: `skynet/tools.py` returns before executing the
@@ -123,6 +245,15 @@ CREATE TABLE IF NOT EXISTS memories (
     valid_to TEXT,
     evidence TEXT,
     decayed_at TEXT,
+    lifecycle_stage TEXT NOT NULL DEFAULT 'raw',
+    scope TEXT NOT NULL DEFAULT 'thread',
+    retrieval_count INTEGER NOT NULL DEFAULT 0,
+    positive_outcome_count INTEGER NOT NULL DEFAULT 0,
+    complexity_tier TEXT NOT NULL DEFAULT 'Simple',
+    last_session_id TEXT,
+    replay_level INTEGER,
+    last_replay_at TEXT,
+    trust_source TEXT NOT NULL DEFAULT 'agent',
     UNIQUE(kind, content)
 );
 CREATE TABLE IF NOT EXISTS affect_state (
@@ -168,14 +299,7 @@ CREATE TABLE IF NOT EXISTS memory_meta (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS memory_consolidations (
-    episode_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    input_version INTEGER NOT NULL,
-    output_version INTEGER NOT NULL,
-    memory_count INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS memory_consolidations (\n    episode_id TEXT PRIMARY KEY,\n    run_id TEXT NOT NULL,\n    input_version INTEGER NOT NULL,\n    output_version INTEGER NOT NULL,\n    memory_count INTEGER NOT NULL,\n    correctness_judgment TEXT NOT NULL DEFAULT 'Correct',\n    created_at TEXT NOT NULL\n);
 CREATE TABLE IF NOT EXISTS episode_snapshots (
     snapshot_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL UNIQUE,
@@ -296,6 +420,12 @@ CREATE INDEX IF NOT EXISTS idx_hypotheses_structural ON hypotheses(structural_fi
 CREATE INDEX IF NOT EXISTS idx_proposals_fingerprint ON planner_proposals(hypothesis_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_alerts_pending ON alerts(delivered_at, severity);
 CREATE INDEX IF NOT EXISTS idx_planner_decisions_created ON planner_decisions(created_at);
+-- Retention now runs on every cycle with a 24-hour window, so the age-only
+-- DELETE must not full-scan the two largest tables each time. Both `created_at`
+-- columns exist in the base schema, so `executescript(SCHEMA)` creates these on
+-- an upgraded database too.
+CREATE INDEX IF NOT EXISTS idx_event_log_created ON event_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_capability_effects_created ON capability_effects(created_at);
 """
 
 # Indexes on columns that only exist after an `ALTER TABLE ... ADD COLUMN` must
@@ -305,14 +435,19 @@ CREATE INDEX IF NOT EXISTS idx_planner_decisions_created ON planner_decisions(cr
 POST_MIGRATION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_area ON tasks(area, status);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_lifecycle_stage ON memories(lifecycle_stage, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, updated_at DESC);
 """
 
-SCHEMA_VERSION = 13
-# v13 adds `affect_state`: the one persisted valence channel, stored as
-# `(value, draws)`. Like v10 it is a brand-new table, so `executescript(SCHEMA)`
-# creates it with every column on an upgraded database and there is no ALTER to
-# catch up on.
-MIGRATION_NAMES = {3: "durable-boundaries", 4: "measured-liveness", 5: "planning-rng", 6: "owner-dialogue", 7: "dead-persistence", 8: "drop-dead-checkpoints", 9: "memory-validity", 10: "idea-archive", 11: "memory-decay-clock", 12: "run-progress", 13: "affect-valence"}
+SCHEMA_VERSION = 17
+# v15 adds lifecycle_stage (raw/extracted/consolidated/revised) and scope
+# (thread/user/agent/global) columns to memories table for Oracle Agent Memory
+# lifecycle-aware retrieval and scope-aware consolidation (arXiv:2607.13157v1).
+# v16 adds the attention/replay columns (retrieval_count, positive_outcome_count,
+# complexity_tier, last_session_id, replay_level, last_replay_at) that the
+# attention axis and the spaced-replay scheduler read. ALTER TABLE adds columns
+# with defaults; indexes created in POST_MIGRATION_INDEXES.
+MIGRATION_NAMES = {3: "durable-boundaries", 4: "measured-liveness", 5: "planning-rng", 6: "owner-dialogue", 7: "dead-persistence", 8: "drop-dead-checkpoints", 9: "memory-validity", 10: "idea-archive", 11: "memory-decay-clock", 12: "run-progress", 13: "affect-valence", 14: "retention-age-indexes", 15: "memory-lifecycle-scope", 16: "memory-attention-replay", 17: "run-kinds"}
 
 # `evaluations.run_id` is NOT NULL; metrics snapshots belong to no run, so they
 # share one sentinel instead of inventing a fake run identity.
@@ -359,6 +494,13 @@ PROTECTED_EVENT_KINDS = frozenset({
     "report_claim_unverified",
     "restart_requested", "restart_escalated", "restart_skipped", "cycle_error", "provider_lockout",
     "provider_failure", "provider_error_classified", "worktree_dirty_after_bash",
+    # The post-mortem of the episode the dirty-worktree guard closed: the same
+    # tracked files stayed modified across the streak threshold. It must survive
+    # retention like worktree_dirty_after_bash, or the loop's terminal row is lost.
+    "worktree_dirty_guard",
+    # The wake-time heal: the edits were preserved under state/quarantine and the
+    # tree restored. Retention must not erase the pointer to the preserved work.
+    "worktree_auto_quarantined",
     # The post-mortem of an episode discarded before it could try anything. It is
     # run-scoped where `fallback_all_cooling` is not (that event is written by the
     # chain with run_id NULL), so it is the only durable row naming which run and
@@ -380,6 +522,10 @@ PROTECTED_EVENT_KINDS = frozenset({
     # same empty portfolio; only these kinds tell them apart, so retention must not
     # drop the evidence that the planner failed.
     "planner_invalid_response", "planner_provider_error", "planner_output_truncated", "planner_fallback_capped",
+    # Why each proposal was rejected, not only that it was. ``all_rejected``
+    # counted as a decided attempt, so a total-rejection streak left no durable
+    # post-mortem until this kind was protected (2026-10-12).
+    "planner_proposal_rejected",
     # The backoff walk and the fallback creation/expiry sequence are the durable
     # trail of a stall: together they show how long the safety net was capped
     # and how the process kept sleeping. Retention must not erase the evidence
@@ -434,6 +580,15 @@ PROTECTED_EVENT_KINDS = frozenset({
     # cooling provider chain is exactly the post-mortem a failed experiment
     # depends on, so retention must not drop it.
     "fallback_all_cooling", "provider_chain_reloaded",
+    # What the owner asked for at the last heartbeat: the applied chain and the
+    # context window it implies. Written once per CHANGE (not per tick) so the
+    # toggle he tapped in the bot can be read back next to the chain it produced.
+    "provider_prefs_applied",
+    # The safety net declining to fire, because the planner could not reach a
+    # provider: the portfolio was never read, so no work is invented for it. The
+    # partner of ``planner_fallback_created`` -- without it, a dead chain looks
+    # exactly like an empty portfolio in the durable record.
+    "planner_fallback_skipped",
     # Supervisor lifecycle: whether the process actually started, stopped and
     # observed a reboot window is the durable frame around every cycle.
     "supervisor_start", "supervisor_stop", "reboot_observation",
@@ -512,6 +667,18 @@ def _bounded_model_float(value: Any, *, default: float) -> float:
 
 
 _ARCHIVE_EPSILON = 0.1
+
+# Statuses that keep an idea alive inside its cell. ``validated`` (its own run
+# verified the work) and ``materialized`` (it became a task) are outcomes of being
+# *used*, not retirements: a verified idea is the best-evidenced occupant of its
+# cell and the best parent for the next one. Reading only ``active`` made an idea
+# vanish from the archive the moment it proved itself - it stopped defending its
+# cell (``best_in_cell``), stopped counting as coverage (``idea_cells``) and
+# dropped out of lineage sampling (``sample_archive_parents``), which inverts the
+# lineage: the proven ideas fall silent and the unproven ones keep breeding. Only
+# ``superseded`` retires an occupant.
+LIVE_IDEA_STATUSES = ("active", "validated", "materialized")
+_LIVE_IDEA_PLACEHOLDERS = ",".join("?" for _ in LIVE_IDEA_STATUSES)
 
 
 def _admits_over_incumbent(
@@ -598,8 +765,8 @@ class RunRepository:
 
     def create(self, run: RunRecord) -> None:
         self.connection.execute(
-            "INSERT INTO runs(run_id, attempt, status, started_at, finished_at, budget, heartbeat_at, last_phase, last_progress_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (run.run_id, run.attempt, run.status.value, run.started_at, run.finished_at, json.dumps({"steps": run.budget.steps, "tokens": run.budget.tokens, "seconds": run.budget.seconds}), utc_now(), "initial", utc_now()),
+            "INSERT INTO runs(run_id, attempt, status, started_at, finished_at, budget, heartbeat_at, last_phase, last_progress_at, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run.run_id, run.attempt, run.status.value, run.started_at, run.finished_at, json.dumps({"steps": run.budget.steps, "tokens": run.budget.tokens, "seconds": run.budget.seconds}), utc_now(), "initial", utc_now(), run.kind),
         )
 
     def touch(self, run_id: str, phase: str, *, progress: bool = False, steps: int | None = None, usage_tokens: int | None = None) -> None:
@@ -775,6 +942,15 @@ class StateStore:
         self.connection.execute("PRAGMA busy_timeout=5000")
         if not read_only:
             self.connection.execute("PRAGMA synchronous=NORMAL")
+            # auto_vacuum=FULL moves pages back to the OS as rows are deleted. Retention
+            # deletes a large share of the event log on a short window, and without
+            # it the file only ever grows: freed pages are reused but never
+            # returned, so the database stayed at its high-water mark (measured on
+            # the live ledger: 979 MB, freelist 1 page, auto_vacuum=0). The pragma
+            # only takes effect for a database created after it is set (or after a
+            # VACUUM), which is why it must run before `executescript(SCHEMA)`
+            # below -- on a fresh database that is exactly the case.
+            self.connection.execute("PRAGMA auto_vacuum=FULL")
         self.events = EventRepository(self.connection)
         self.runs = RunRepository(self.connection)
         self.outbox = OutboxRepository(self.connection)
@@ -820,6 +996,11 @@ class StateStore:
             self.connection.execute("ALTER TABLE runs ADD COLUMN steps INTEGER NOT NULL DEFAULT 0")
         if "usage_tokens" not in run_columns:
             self.connection.execute("ALTER TABLE runs ADD COLUMN usage_tokens INTEGER NOT NULL DEFAULT 0")
+        if "kind" not in run_columns:
+            # The cycle used to be one run; the memory pass keeps its own row from
+            # 2026-10-16. A row written before the split is the episode, so the
+            # default is exactly what the aggregate readers already mean.
+            self.connection.execute("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'build'")
         if "claimed_at" not in columns:
             self.connection.execute("ALTER TABLE outbox ADD COLUMN claimed_at TEXT")
         reset_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(planner_resets)")}
@@ -857,9 +1038,22 @@ class StateStore:
             ("valid_from", "TEXT"),
             ("valid_to", "TEXT"),
             ("evidence", "TEXT"),
+            ("lifecycle_stage", "TEXT NOT NULL DEFAULT 'raw'"),
+            ("scope", "TEXT NOT NULL DEFAULT 'thread'"),
+            ("retrieval_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("positive_outcome_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("complexity_tier", "TEXT NOT NULL DEFAULT 'Simple'"),
+            ("last_session_id", "TEXT"),
+            ("replay_level", "INTEGER"),
+            ("last_replay_at", "TEXT"),
         ):
             if column not in memory_columns:
                 self.connection.execute(f"ALTER TABLE memories ADD COLUMN {column} {definition}")
+        # v18: trust_source column for DualView symbolized read-back (arXiv:2607.03821v2)
+        # owner_untrusted memories return '[SYMBOL: owner_untrusted]' on all read paths
+        if "trust_source" not in memory_columns:
+            self.connection.execute("ALTER TABLE memories ADD COLUMN trust_source TEXT NOT NULL DEFAULT 'agent'"
+)
         self.connection.execute("UPDATE agent_state SET lifecycle='sleep' WHERE lifecycle='idle'")
         self.connection.execute("UPDATE tasks SET status='pending', updated_at=? WHERE status='needs_recovery'", (utc_now(),))
         self.connection.execute(
@@ -1110,7 +1304,15 @@ class StateStore:
             "INSERT INTO planner_proposals(proposal_id,attempt_id,goal_id,title,problem,hypothesis,expected_new_fact,validation,scope,kind,hypothesis_fingerprint,structural_fingerprint,status,rejection_reason,created_task_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (proposal_id, attempt_id, proposal["goal_id"], proposal["title"], proposal["problem"], proposal["hypothesis"], proposal["expected_new_fact"], proposal["validation"], json.dumps(proposal.get("scope", [])), proposal["kind"], proposal["hypothesis_fingerprint"], proposal["structural_fingerprint"], status, reason, task_id, utc_now()),
         )
-        self.append_event("planner_proposal_accepted" if status == "accepted" else "planner_proposal_rejected", {"proposal_id": proposal_id, "attempt_id": attempt_id, "status": status, "reason": reason})
+        # Two literal writers, not a conditional expression: the durable-writer
+        # contract test scans for a literal ``append_event("kind")`` and cannot
+        # see a kind chosen inside a ternary, which would make
+        # ``planner_proposal_rejected`` look protected-but-unwritten. The split
+        # also names the rejection trail explicitly now that it is retention-protected.
+        if status == "accepted":
+            self.append_event("planner_proposal_accepted", {"proposal_id": proposal_id, "attempt_id": attempt_id, "status": status, "reason": reason})
+        else:
+            self.append_event("planner_proposal_rejected", {"proposal_id": proposal_id, "attempt_id": attempt_id, "status": status, "reason": reason})
         return proposal_id
 
     def transition(self, state: AgentState, target: LifecycleState, *, run_id: str | None = None, reason: str = "", record_event: bool = False) -> AgentState:
@@ -1665,9 +1867,11 @@ class StateStore:
         pages, 13.69% of a 46.9 MB database, plus 729 KB of its own indexes
         (15.25% inclusive), growing ~126 rows/hour (~3,000 rows/day over an 18.1 h
         span) with 60.5% of the rows holding 95% of the result bytes (``bash``
-        alone is 58.7%). At that rate this 30-day window settles near 90k rows /
-        ~284 MB including indexes, so the window is what bounds the table -- the
-        old ``~7 rows/hour`` figure understated it roughly eighteenfold. Nothing
+        alone is 58.7%). At that rate a 30-day window settles near 90k rows /
+        ~284 MB including indexes; the deployed window is now 24 hours
+        (``effect_retention_days=1``), which settles far lower, and the transcript
+        pin below is then what bounds the table. The old ``~7 rows/hour`` figure
+        understated a 30-day window roughly eighteenfold. Nothing
         reaches back that far: ``effect`` is looked up by an
         exact ``{run_id}:{step}:{call_id}`` key belonging to the run being
         executed, and runs are reconciled within the reboot window (1 day); the
@@ -1688,8 +1892,7 @@ class StateStore:
         ``prune_capability_effects(30)`` removed 2448 rows. The guard pins exactly
         the pointed subset and drops the rest (same probe: 2446 removed, 0
         dangling), and the pin is bounded -- 91 folded events over 19.4 h (~112/day)
-        is ~3.4k rows across a 30-day window, far below the ~90k rows this window
-        already tolerates. Rows whose pointer has itself been pruned are dropped
+        is ~3.4k rows across a 30-day window, negligible at any window. Rows whose pointer has itself been pruned are dropped
         as before, so retention still bounds the table.
 
         The folded result also lands in the ReAct transcript, which this guard did
@@ -1700,7 +1903,7 @@ class StateStore:
         itself a JSON-encoded string, so the key is ``$.messages[*].content``
         parsed again to ``$.effect_key``, not a nested object. Transcript retention
         is by run count (``transcript_retention_runs``, default 200) and independent
-        of the 30-day effect window, so an aged row whose only surviving pointer was
+        of the age window, so an aged row whose only surviving pointer was
         a retained transcript was still deleted -- the dangling pointer this guard
         exists to prevent, through a second door. Reproduced on a scratch store with
         a retained ``react_history`` row: the plain DELETE removed the row and left
@@ -1712,8 +1915,8 @@ class StateStore:
         the original nested shape (``$.payload.result.effect_key``, not the
         double-encoded ``content`` shape the transcript copy uses). Snapshots are
         pruned by run count, never by age, which makes this reachable through
-        configuration alone: with a 1-day event window and the default 30-day
-        effect window the other two holders release the pin while the snapshot
+        configuration alone: with the event window shorter than the effect window
+        the other two holders release the pin while the snapshot
         keeps it (measured on a scratch copy of the live ledger -- 4327 rows
         removed, 1 dangling snapshot address). The third subquery closes it:
         same probe, 4326 removed, 0 dangling, 51 pinned.
@@ -1727,7 +1930,7 @@ class StateStore:
         aged effect rows scanned). It stays bounded by construction: the subquery
         reads only rows still present in ``transcript``, so a checkpoint that runs
         ``prune_run_history`` first (``reactor.py:612``) releases the pin on the next
-        daily pass. ``json_valid``/``IS NOT NULL`` keep ``NULL`` out of the subquery,
+        maintenance pass. ``json_valid``/``IS NOT NULL`` keep ``NULL`` out of the subquery,
         which ``NOT IN`` needs to delete anything at all.
         """
         if retention_days <= 0:
@@ -1833,10 +2036,18 @@ class StateStore:
         ``Reactor._reconcile_pending_captures``: 1 of 28 pointers has ever been
         dispositioned, so the class is bounded in design and, at this window, not
         yet by practice.
+
+        The window itself counts **episodes** (``kind='build'``): a consolidation pass
+        writes a run row but owns no transcript rows, so counting it would spend a
+        slot of a window that exists to bound the transcript.
         """
         if keep_runs <= 0:
             return {"transcript": 0, "episodes": 0, "owed": 0}
-        keep = "SELECT run_id FROM runs ORDER BY rowid DESC LIMIT ?"
+        # The window counts episodes: a consolidation pass owns no transcript rows of
+        # its own (its provider I/O goes to the runtime log), so letting the pass
+        # consume a slot of a transcript window would halve the history the window
+        # exists to bound. A cycle writes two runs now; only one holds the transcript.
+        keep = "SELECT run_id FROM runs WHERE kind = 'build' ORDER BY rowid DESC LIMIT ?"
         # A run whose report is still owed keeps its history while the event
         # window still holds its audit rows. The 30-day event window is what
         # governs exactly those rows, so the hold releases itself: once every
@@ -2076,8 +2287,12 @@ class StateStore:
         class of defect this channel exists to be measured against.
         """
         bounded_window = max(1, int(window))
+        # Episodes only: a consolidation pass is a run, but it is not an attempt at
+        # the work this channel measures, and counting it would tilt the valence on
+        # the pass's own outcome rather than on the organism's progress.
         rows = self.connection.execute(
-            "SELECT status, run_id, finished_at FROM runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT ?",
+            "SELECT status, run_id, finished_at FROM runs WHERE finished_at IS NOT NULL AND kind = 'build' "
+            "ORDER BY finished_at DESC LIMIT ?",
             (bounded_window,),
         ).fetchall()
         statuses = [str(row["status"]) for row in rows]
@@ -2194,7 +2409,7 @@ class StateStore:
         row = self.connection.execute("SELECT t.*, g.title AS goal_title, g.priority AS goal_priority FROM tasks t LEFT JOIN goals g ON g.goal_id=t.goal_id WHERE t.task_id=? AND t.status IN ('pending','running') AND (t.goal_id IS NULL OR g.status='active')", (task_id,)).fetchone()
         return {"kind": "task", "task": dict(row)} if row else None
 
-    def add_task(self, title: str, goal_id: str | None = None, deadline: str | None = None, task_id: str | None = None, *, expected_new_fact: str = "", hypothesis_fingerprint: str | None = None, structural_fingerprint: str | None = None, area: str = "general") -> str:
+    def add_task(self, title: str, goal_id: str | None = None, deadline: str | None = None, task_id: str | None = None, *, expected_new_fact: str = "", hypothesis_fingerprint: str | None = None, structural_fingerprint: str | None = None, area: str = "general", idempotency_key: str | None = None) -> str:
         from uuid import uuid4
 
         from .planner import hypothesis_fingerprint as make_hypothesis_fingerprint
@@ -2204,7 +2419,10 @@ class StateStore:
         expected_new_fact = expected_new_fact or title
         hypothesis_fingerprint = hypothesis_fingerprint or make_hypothesis_fingerprint(area=title, problem=title, expected_behavior=expected_new_fact)
         structural_fingerprint = structural_fingerprint or make_structural_fingerprint(area=title, target=title, behavior_kind="task")
-        self.connection.execute("INSERT INTO tasks(task_id, goal_id, title, status, attempts, deadline, idempotency_key, created_at, updated_at, hypothesis_fingerprint, structural_fingerprint, expected_new_fact, area) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)", (task_id, goal_id, title, deadline, task_id, now, now, hypothesis_fingerprint, structural_fingerprint, expected_new_fact, area or "general"))
+        # The key defaults to the task's own id, which de-duplicates nothing; a
+        # caller that has a real identity for the work (a materialized idea) passes
+        # one, so the same work cannot be inserted twice under two ids.
+        self.connection.execute("INSERT INTO tasks(task_id, goal_id, title, status, attempts, deadline, idempotency_key, created_at, updated_at, hypothesis_fingerprint, structural_fingerprint, expected_new_fact, area) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)", (task_id, goal_id, title, deadline, idempotency_key or task_id, now, now, hypothesis_fingerprint, structural_fingerprint, expected_new_fact, area or "general"))
         self.register_hypothesis(
             workstream_id=goal_id or "unscoped",
             fingerprint=hypothesis_fingerprint,
@@ -2215,9 +2433,16 @@ class StateStore:
         return task_id
 
     def best_in_cell(self, cell: str) -> dict[str, Any] | None:
+        """The live occupant of a cell: best quality first, novelty as the tie-break.
+
+        Liveness (``LIVE_IDEA_STATUSES``) is what makes this the archive's own
+        rule rather than a view of unproven ideas: a validated occupant keeps
+        defending its cell instead of handing it to the next unverified candidate.
+        """
         row = self.connection.execute(
-            "SELECT * FROM idea_archive WHERE cell_key=? AND status='active' ORDER BY quality DESC LIMIT 1",
-            (str(cell),),
+            f"SELECT * FROM idea_archive WHERE cell_key=? AND status IN ({_LIVE_IDEA_PLACEHOLDERS}) "
+            "ORDER BY quality DESC, novelty DESC LIMIT 1",
+            (str(cell), *LIVE_IDEA_STATUSES),
         ).fetchone()
         return dict(row) if row is not None else None
 
@@ -2228,21 +2453,63 @@ class StateStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def live_ideas(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Every idea that still occupies its cell, best first (``LIVE_IDEA_STATUSES``)."""
+        rows = self.connection.execute(
+            f"SELECT * FROM idea_archive WHERE status IN ({_LIVE_IDEA_PLACEHOLDERS}) "
+            "ORDER BY quality DESC, created_at LIMIT ?",
+            (*LIVE_IDEA_STATUSES, int(limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def idea_cells(self) -> dict[str, int]:
         rows = self.connection.execute(
-            "SELECT cell_key, COUNT(*) AS n FROM idea_archive WHERE status='active' GROUP BY cell_key"
+            f"SELECT cell_key, COUNT(*) AS n FROM idea_archive WHERE status IN ({_LIVE_IDEA_PLACEHOLDERS}) "
+            "GROUP BY cell_key",
+            LIVE_IDEA_STATUSES,
         ).fetchall()
         return {str(row["cell_key"]): int(row["n"]) for row in rows}
+
+    def idea_cells_by_task(self) -> dict[str, str]:
+        """The archive descriptor of every materialized idea, keyed by its task.
+
+        A materialized idea is the only task that carries a real three-axis
+        descriptor: the cell it occupied when it entered the archive. The planner
+        reads this so scarcity is scored against the true cell instead of
+        collapsing every task onto ``subsystem|workflow|own-repo``. Tasks the
+        planner generated itself have no descriptor and are absent here, which is
+        deliberate -- the mapping never invents one the model did not choose.
+        """
+        rows = self.connection.execute(
+            "SELECT task_id, cell_key FROM idea_archive WHERE status='materialized' AND task_id IS NOT NULL"
+        ).fetchall()
+        return {str(row["task_id"]): str(row["cell_key"]) for row in rows}
+
+    def _measured_novelty(self, idea: Mapping[str, Any], *, exclude: str | None = None) -> float:
+        """Measure one idea's novelty against the live archive, minus itself."""
+        from .idea_archive import novelty_against_archive
+
+        excluded = str(exclude or "")
+        others = [row for row in self.live_ideas() if str(row["idea_id"]) != excluded]
+        return novelty_against_archive(idea, others)
 
     def archive_idea(self, idea: Mapping[str, Any]) -> str | None:
         """Admit one idea under the MAP-Elites cell rule.
 
-        A cell keeps exactly one active occupant, so the archive stays bounded
-        and cell coverage cannot be inflated with duplicates. Admission is
-        exclusive epsilon-dominance over quality AND novelty
+        A cell keeps exactly one live occupant, so the archive stays bounded and
+        cell coverage cannot be inflated with duplicates. Admission is exclusive
+        epsilon-dominance over quality AND novelty
         (`_admits_over_incumbent`, arXiv:1708.09251 sec. 3.1.2): a candidate
         that ties on quality but is more novel takes the cell, instead of being
         discarded anonymously because quality alone did not strictly improve.
+
+        Novelty is measured here when the caller does not declare one
+        (`idea_archive.novelty_against_archive`), and a declared value is used
+        as-is so the cell rule can be exercised directly in tests. Measuring also
+        re-measures the incumbent the rule is about to read: rows archived while
+        the call site wrote a constant ``1.0`` would otherwise stay unfalsifiable
+        and freeze their cell forever. The correction is durable and evented
+        (`idea_novelty_remeasured`), never silent.
         """
         from uuid import uuid4
 
@@ -2251,10 +2518,26 @@ class StateStore:
         incumbent = self.best_in_cell(cell)
         idea_id = str(uuid4())
         now = utc_now()
-        novelty = float(idea.get("novelty", 0.0) or 0.0)
+        declared = idea.get("novelty")
+        measured = declared is None
+        novelty = self._measured_novelty(idea) if measured else float(declared or 0.0)
         if incumbent is not None:
             incumbent_quality = float(incumbent["quality"])
             incumbent_novelty = float(incumbent["novelty"])
+            if measured:
+                corrected = self._measured_novelty(incumbent, exclude=str(incumbent["idea_id"]))
+                if abs(corrected - incumbent_novelty) > 1e-9:
+                    self.connection.execute(
+                        "UPDATE idea_archive SET novelty=?, updated_at=? WHERE idea_id=?",
+                        (corrected, now, incumbent["idea_id"]),
+                    )
+                    self.append_event("idea_novelty_remeasured", {
+                        "idea_id": incumbent["idea_id"],
+                        "cell_key": cell,
+                        "stored": incumbent_novelty,
+                        "measured": corrected,
+                    })
+                incumbent_novelty = corrected
             if not _admits_over_incumbent(quality, novelty, incumbent_quality, incumbent_novelty):
                 self.append_event("idea_archive_rejected", {
                     "cell_key": cell,
@@ -2266,12 +2549,25 @@ class StateStore:
                     "epsilon": _ARCHIVE_EPSILON,
                 })
                 return None
+            # Every live occupant of the cell steps aside, not just the one the
+            # rule compared against: cells whose occupants were invisible while
+            # only `active` counted ended up holding several live rows, and the
+            # archive's own invariant is one live idea per cell. `retired` names
+            # them so the collapse is readable in the event log.
+            retired = [
+                str(row["idea_id"])
+                for row in self.connection.execute(
+                    f"SELECT idea_id FROM idea_archive WHERE cell_key=? AND status IN ({_LIVE_IDEA_PLACEHOLDERS})",
+                    (cell, *LIVE_IDEA_STATUSES),
+                )
+            ]
             self.connection.execute(
-                "UPDATE idea_archive SET status='superseded', superseded_by=?, updated_at=? WHERE idea_id=?",
-                (idea_id, now, incumbent["idea_id"]),
+                f"UPDATE idea_archive SET status='superseded', superseded_by=?, updated_at=? "
+                f"WHERE cell_key=? AND status IN ({_LIVE_IDEA_PLACEHOLDERS})",
+                (idea_id, now, cell, *LIVE_IDEA_STATUSES),
             )
             self.append_event("idea_superseded", {
-                "cell_key": cell, "superseded": incumbent["idea_id"], "by": idea_id,
+                "cell_key": cell, "superseded": incumbent["idea_id"], "by": idea_id, "retired": retired,
             })
         parent = idea.get("parent_id")
         depth = 0
@@ -2296,6 +2592,7 @@ class StateStore:
         )
         self.append_event("idea_archived", {
             "idea_id": idea_id, "cell_key": cell, "quality": round(quality, 6),
+            "novelty": round(novelty, 6), "novelty_measured": measured,
             "evidence_source": idea["evidence_source"], "lineage_depth": depth,
             "inspiration_ref": str(idea.get("inspiration_ref", ""))[:300],
         })
@@ -2304,14 +2601,18 @@ class StateStore:
     def sample_archive_parents(self, *, k: int = 2, lam: float = 10.0, alpha0: float = 0.5) -> list[dict[str, Any]]:
         """Sample up to k parents without replacement, DGM-weighted.
 
-        w = sigmoid(lam*(quality-alpha0)) / (1+children). Saturated ideas
-        (quality >= 1.0) are excluded; every other archived idea keeps a
-        non-zero chance, so no improvement path becomes unreachable. Draws come
-        from the journalled RNG, so a replay reproduces the same lineage.
+        w = sigmoid(lam*(quality-alpha0)) / (1+children). Every live idea keeps a
+        non-zero chance, so no improvement path becomes unreachable. Saturation is
+        deliberately *not* an exclusion criterion: the best-evidenced idea is the
+        best parent, and repeated use is bounded by the ``1/(1+children)`` divisor
+        rather than by a hard filter. The filter that used to drop ``quality >=
+        1.0`` inverted the lineage - an idea left the pool exactly when it proved
+        itself, so only unproven ideas kept breeding. Draws come from the
+        journalled RNG, so a replay reproduces the same lineage.
         """
         from .idea_archive import parent_weight
 
-        eligible = [item for item in self.archived_ideas(status="active") if float(item["quality"]) < 1.0]
+        eligible = self.live_ideas()
         if not eligible:
             return []
         weights = [
@@ -2351,11 +2652,25 @@ class StateStore:
             (bounded, str(status), utc_now(), str(idea_id)),
         )
 
-    def materialize_idea(self, idea_id: str, goal_id: str) -> str:
-        """Turn an archived stepping stone into an executable task.
+    def materialize_idea(self, idea_id: str, goal_id: str) -> str | None:
+        """Turn an archived stepping stone into executable work -- once.
 
         DGM formulates the child as a problem description rather than a diff, so
-        an archived idea can be re-opened long after it was first written.
+        an archived idea can be re-opened long after it was first written. What
+        it must not do is re-open work that already ran: the cell rule keeps the
+        best-evidenced idea live, so an idea whose task already finished stays
+        the archive's favourite and gets handed out again every cycle. Measured
+        on the live ledger (2026-10-16): one idea was materialized six times into
+        the same false defect, and all 68 tasks carried their own id as the
+        idempotency key -- a key that de-duplicates nothing.
+
+        Three outcomes, one call:
+        * the idea already has a live task -- that task comes back and nothing is
+          created, so a second caller cannot fork the same work;
+        * the idea's task reached a terminal state -- the idea is spent, so it is
+          retired (`superseded`, the archive's only retirement, which also frees
+          its cell) and ``None`` is returned for the caller to sample another;
+        * otherwise a new task is created, keyed ``idea:<idea_id>``.
         """
         from .planner import hypothesis_fingerprint, structural_fingerprint
 
@@ -2363,12 +2678,22 @@ class StateStore:
         if row is None:
             raise KeyError(idea_id)
         idea = dict(row)
+        existing = str(idea["task_id"] or "")
+        if existing:
+            previous = self.connection.execute("SELECT status FROM tasks WHERE task_id=?", (existing,)).fetchone()
+            if previous is not None:
+                status = str(previous["status"])
+                if status in {"pending", "running"}:
+                    return existing
+                self.retire_spent_idea(str(idea_id), task_id=existing, task_status=status, cell_key=str(idea["cell_key"]))
+                return None
         title = str(idea["title"])[:300]
         fact = str(idea["expected_new_fact"] or title)
         task_id = self.add_task(
             title,
             goal_id,
             expected_new_fact=fact,
+            idempotency_key=f"idea:{idea_id}",
             hypothesis_fingerprint=hypothesis_fingerprint(
                 area=str(idea["subsystem"]),
                 problem=str(idea["problem_description"] or title),
@@ -2390,6 +2715,26 @@ class StateStore:
             "idea_id": str(idea_id), "task_id": task_id, "cell_key": str(idea["cell_key"]),
         })
         return task_id
+
+    def retire_spent_idea(self, idea_id: str, *, task_id: str, task_status: str, cell_key: str = "") -> None:
+        """Retire an idea whose task already reached a terminal state.
+
+        The idea did its job: it became work and the work ended. Leaving it live
+        keeps it inside the cell rule's pool, where -- as the best-evidenced idea
+        of its cell -- it is sampled again and again. ``superseded`` is the
+        archive's only retirement and a retired occupant frees its cell, so the
+        next candidate can occupy it. The event names the reason, so a replay can
+        tell "spent" from "beaten by a better idea".
+        """
+        self.connection.execute(
+            "UPDATE idea_archive SET status='superseded', updated_at=? WHERE idea_id=?",
+            (utc_now(), str(idea_id)),
+        )
+        self.append_event("idea_superseded", {
+            "cell_key": cell_key, "superseded": str(idea_id), "by": None,
+            "retired": [str(idea_id)], "reason": "spent",
+            "task_id": task_id, "task_status": task_status,
+        })
 
     def apply_goal_updates(self, updates: list[dict[str, Any]], run_id: str | None = None) -> None:
         for item in updates:
@@ -2518,6 +2863,125 @@ class StateStore:
                 self.append_event("status_repair", {"hypotheses": aligned_hypotheses, "tasks": cancelled_tasks})
         return {"hypotheses": aligned_hypotheses, "tasks": cancelled_tasks}
 
+    def revive_hypothesis(self, fingerprint: str) -> int:
+        """Mark a template's terminal hypothesis ready again, because it is being asked anew.
+
+        The safety-net templates are re-asked on purpose: the outward valve mints one
+        inquiry per cadence, the bounded fallback mints one diagnostic when the planner has
+        nothing. Their fingerprint is stable by design, so once a previous instance
+        completes the ledger says ``completed`` -- and ``planner_candidates`` gives a
+        terminal fingerprint novelty 0.0, which ``PortfolioPlanner.rank()`` drops. A newly
+        minted instance is then born unselectable: nothing can run it, while the valve's own
+        liveness check reads it as work in flight and stays shut. Measured on the live ledger
+        2026-10-19: the outward look created at 13:15 sat pending for 21 hours,
+        ``external_seek_suppressed`` fired 90 times, and the planner never once offered that
+        task as a candidate.
+
+        So creation is where the ledger has to agree that the question is live again: this
+        flips the template's terminal row back to ``ready``, which reads as novelty 0.45 and
+        repetition 0.0 -- selectable, and no longer claiming to be finished.
+        """
+        with self.transaction():
+            changed = int(
+                self.connection.execute(
+                    "UPDATE hypotheses SET status='ready', updated_at=? "
+                    "WHERE fingerprint=? AND status IN ('completed','rejected','exhausted')",
+                    (utc_now(), fingerprint),
+                ).rowcount
+            )
+            if changed:
+                self.append_event("hypothesis_revived", {"fingerprint": fingerprint[:16], "rows": changed})
+        return changed
+
+    def fingerprint_is_terminal(
+        self,
+        fingerprint: str,
+        structural_fingerprint: str = "",
+        *,
+        ttl_days: float,
+    ) -> bool:
+        """Whether a template's question already counts as resolved.
+
+        The same rule ``planner_candidates`` applies, asked about one fingerprint: a terminal
+        hypothesis inside the TTL window is what makes a candidate's novelty zero.
+        """
+        cutoff = (utc_datetime_now() - timedelta(days=max(0.0, ttl_days))).isoformat().replace("+00:00", "Z")
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM hypotheses WHERE (fingerprint=? OR structural_fingerprint=?) "
+                "AND status IN ('completed','rejected','exhausted') AND updated_at >= ? LIMIT 1",
+                (fingerprint, structural_fingerprint or fingerprint, cutoff),
+            ).fetchone()
+            is not None
+        )
+
+    def retire_stranded_tasks(
+        self,
+        *,
+        older_than_hours: float,
+        exclude_fingerprints: Iterable[str] = (),
+        limit: int = 50,
+    ) -> list[str]:
+        """Cancel pending work that nothing can select and nothing retires.
+
+        A pending task whose hypothesis is already terminal has zero novelty, so the planner
+        skips it forever; ``repair_status_consistency`` cancels those every cycle, except the
+        safety-net templates it exempts. An exempt row that is never selected and never
+        retired is the worst of both: it burns nothing, but anything that reads existence as
+        "work in flight" -- the outward valve above all -- stays shut behind it. Measured
+        2026-10-18/19: of three non-terminal tasks, two had ``attempts=0`` and were 10.0 and
+        21.4 hours old.
+
+        Only work that was never attempted is retired, and only after a window an operator
+        sets: a task the organism has started at least once is its own decision. Callers pass
+        the safety-net fingerprints so a template that is *supposed* to stay pending is never
+        touched here.
+        """
+        exclusions = tuple(str(item) for item in exclude_fingerprints if item)
+        cutoff = (utc_datetime_now() - timedelta(hours=max(0.0, older_than_hours))).isoformat().replace("+00:00", "Z")
+        sql = (
+            "SELECT t.task_id, t.area, t.title, t.created_at FROM tasks t "
+            "WHERE t.status='pending' AND t.attempts=0 AND t.created_at < ? "
+            "  AND t.hypothesis_fingerprint IS NOT NULL "
+            "  AND EXISTS (SELECT 1 FROM hypotheses h "
+            "               WHERE (h.fingerprint=t.hypothesis_fingerprint "
+            "                      OR h.structural_fingerprint=t.structural_fingerprint) "
+            "                 AND h.status IN ('completed','rejected','exhausted')) "
+        )
+        params: tuple[Any, ...] = (cutoff,)
+        if exclusions:
+            sql += f"  AND t.hypothesis_fingerprint NOT IN ({','.join('?' for _ in exclusions)}) "
+            params = (cutoff, *exclusions)
+        sql += "ORDER BY t.created_at LIMIT ?"
+        rows = list(self.connection.execute(sql, (*params, limit)))
+        if not rows:
+            return []
+        retired: list[str] = []
+        with self.transaction():
+            for row in rows:
+                self.connection.execute(
+                    "UPDATE tasks SET status='cancelled', updated_at=? WHERE task_id=?",
+                    (utc_now(), row["task_id"]),
+                )
+                retired.append(str(row["task_id"]))
+            self.append_event(
+                "task_retired_stranded",
+                {
+                    "count": len(retired),
+                    "older_than_hours": max(0.0, older_than_hours),
+                    "tasks": [
+                        {
+                            "task_id": str(row["task_id"]),
+                            "area": str(row["area"]),
+                            "title": str(row["title"])[:80],
+                            "created_at": str(row["created_at"]),
+                        }
+                        for row in rows
+                    ],
+                },
+            )
+        return retired
+
     def backfill_missing_run_results(self) -> int:
         """Give every finished run a durable result row so recovery state is complete.
 
@@ -2559,7 +3023,7 @@ class StateStore:
             # The candidate's own citation belongs on the row it supports, not
             # only on the supersede note it may also carry.
             row_evidence = _model_evidence(item.get("evidence"))
-            self.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at,evidence) VALUES (lower(hex(randomblob(16))),?,?,?,?,?,?) ON CONFLICT(kind,content) DO UPDATE SET confidence=max(confidence, excluded.confidence), source_run=excluded.source_run, updated_at=excluded.updated_at, evidence=COALESCE(excluded.evidence, memories.evidence)", (kind, content.strip(), max(0.0, min(confidence, 1.0)), run_id, utc_now(), row_evidence))
+            self.connection.execute("INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at,evidence,trust_source) VALUES (lower(hex(randomblob(16))),?,?,?,?,?,?,?) ON CONFLICT(kind,content) DO UPDATE SET confidence=max(confidence, excluded.confidence), source_run=excluded.source_run, updated_at=excluded.updated_at, evidence=COALESCE(excluded.evidence, memories.evidence), trust_source=excluded.trust_source", (kind, content.strip(), max(0.0, min(confidence, 1.0)), run_id, utc_now(), row_evidence, item.get("trust_source", "agent")))
             added += 1
             memory_id = self.connection.execute("SELECT memory_id FROM memories WHERE kind=? AND content=?", (kind, content.strip())).fetchone()[0]
             memory_ids.append(str(memory_id))
@@ -2574,6 +3038,93 @@ class StateStore:
                     superseded += 1
         return {"added": added, "superseded": superseded, "memory_ids": memory_ids}
 
+    def _build_source_context(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        """Resolve url:/commit:/tool:/memory: citations in new-candidate evidence.
+
+        Extends the original memory:-only resolver so the verifier can check a new
+        candidate against retrieved source evidence of any recognised type.
+        Only active memories are reachable; url: uses a bounded HTTP GET;
+        commit: uses ``git show`` against the local repository (deterministic,
+        no network); tool: reads the run's captured tool output from
+        capability_effects. Inaccessible sources are recorded with
+        accessible=False so Link Works fails deterministically.
+        """
+        logger = logging.getLogger(__name__)
+        source_context: dict[str, Any] = {}
+        seen: set[str] = set()
+        for item in candidates:
+            if not isinstance(item, dict) or item.get("supersedes_memory_id"):
+                continue
+            for descriptor in SourceAttributionVerifier().extract_citations(item.get("evidence")):
+                sid = descriptor["id"]
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                dtype = descriptor["type"]
+                value = descriptor["value"]
+                try:
+                    if dtype == "url":
+                        source_context[sid] = self._resolve_url(value)
+                    elif dtype == "commit":
+                        source_context[sid] = self._resolve_commit(value)
+                    elif dtype == "tool":
+                        source_context[sid] = self._resolve_tool(value)
+                    elif dtype == "memory":
+                        row = self.connection.execute(
+                            "SELECT content FROM memories WHERE memory_id=? AND status='active'", (value,)
+                        ).fetchone()
+                        if row:
+                            source_context[sid] = {"accessible": True, "content": row[0], "type": "memory"}
+                    else:
+                        source_context[sid] = {"accessible": False, "content": None, "type": dtype}
+                except Exception:
+                    logger.exception("failed to resolve source descriptor %s", sid)
+                    source_context[sid] = {"accessible": False, "content": None, "type": dtype}
+        return source_context
+
+    def _resolve_url(self, value: str, timeout: int = 8) -> dict[str, Any]:
+        """HTTP GET with bounded timeout; accessible=False on any failure."""
+        try:
+            req = urllib.request.Request(value, headers={"User-Agent": "SkyNet/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(4096).decode("utf-8", errors="replace")
+            return {"accessible": True, "content": body.strip() or None, "type": "url"}
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            return {"accessible": False, "content": None, "type": "url"}
+
+    def _resolve_commit(self, value: str, timeout: int = 8) -> dict[str, Any]:
+        """git show <sha> against the local repository; deterministic, no network."""
+        try:
+            result = subprocess.run(
+                ["git", "show", value, "--format=%B", "-s", "--no-patch"],
+                capture_output=True, text=True, timeout=timeout,
+                cwd=str(self.path.parent),
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return {"accessible": True, "content": result.stdout.strip(), "type": "commit"}
+        except (subprocess.SubprocessError, OSError, TimeoutError):
+            pass
+        return {"accessible": False, "content": None, "type": "commit"}
+
+    def _resolve_tool(self, value: str) -> dict[str, Any]:
+        """Read tool: evidence from the run's captured tool output (capability_effects)."""
+        try:
+            rows = self.connection.execute(
+                "SELECT result FROM capability_effects WHERE capability=? AND status='applied' LIMIT 5",
+                (value,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row[0])
+                    text = payload.get("stdout") or payload.get("text") or str(payload)
+                    if text.strip():
+                        return {"accessible": True, "content": text.strip(), "type": "tool"}
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    continue
+        except sqlite3.Error:
+            pass
+        return {"accessible": False, "content": None, "type": "tool"}
+
     def consolidate_versioned(self, episode_id: str, run_id: str, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         """Apply one episode's memory changes exactly once in the current transaction."""
         existing = self.connection.execute(
@@ -2583,7 +3134,40 @@ class StateStore:
         if existing:
             return {"replayed": True, "input_version": existing[0], "output_version": existing[1], "memory_count": existing[2]}
         input_version = int(self.connection.execute("SELECT version FROM memory_meta WHERE id=1").fetchone()[0])
-        details = self._consolidate_candidates(run_id, candidates)
+
+        # TRUSTMEM: drop Hallucination/Omission candidates before promotion.
+        verifier = getattr(self, "memory_verifier", None)
+        if verifier is None:
+            verifier = MemoryTransitionVerifier()
+            self.memory_verifier = verifier
+        source_attribution_verifier = getattr(self, "source_attribution_verifier", None)
+        if source_attribution_verifier is None:
+            source_attribution_verifier = SourceAttributionVerifier()
+            self.source_attribution_verifier = source_attribution_verifier
+        write_classifier = MemoryWriteClassifier()
+        verified = []
+        source_context = self._build_source_context(candidates)
+        for item in candidates:
+            if not isinstance(item, dict) or not item.get("supersedes_memory_id"):
+                verdict, breakdown = source_attribution_verifier.verify(item, source_context)
+                item["_source_attribution"] = {"verdict": verdict, "breakdown": breakdown}
+                if verdict == "Hallucination":
+                    continue
+                is_owner_untrusted, _reason = write_classifier.classify(item.get("content") or "")
+                if is_owner_untrusted:
+                    item["trust_source"] = "owner_untrusted"
+                verified.append(item)
+                continue
+            row = self.connection.execute(
+                "SELECT content FROM memories WHERE memory_id=?", (item["supersedes_memory_id"],)
+            ).fetchone()
+            original = {"content": row[0]} if row else None
+            verdict, _reason = verifier.verify_transition(item, original)
+            if verdict in ("Hallucination", "Omission"):
+                continue
+
+            verified.append(item)
+        details = self._consolidate_candidates(run_id, verified)
         count = int(details["added"])
         output_version = input_version + 1
         self.connection.execute("UPDATE memory_meta SET version=? WHERE id=1", (output_version,))
@@ -2609,31 +3193,80 @@ class StateStore:
         pinned: bool = False,
         source_run: str | None = None,
         evidence: str | None = None,
+        lifecycle_stage: str = "raw",
+        scope: str = "thread",
+        trust_source: str = "agent",
     ) -> str:
         """Store one explicit memory and return its id.
 
         Upserts on `(kind, content)` like `consolidate`: a repeat raises the
         confidence to the maximum instead of fragmenting the row. The memory is
         born `active` with `valid_from` set, and is indexed for search.
+
+        lifecycle_stage defaults to 'raw' and scope defaults to 'thread' to match
+        the database schema defaults.
         """
         normalized_kind = normalize_memory_kind(str(kind))
         bounded = max(0.0, min(_bounded_model_float(confidence, default=0.6), 1.0))
         now = utc_now()
         self.connection.execute(
-            "INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at,pinned,status,valid_from,evidence) "
-            "VALUES (lower(hex(randomblob(16))),?,?,?,?,?,?, 'active', ?, ?) "
+            "INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at,pinned,status,valid_from,evidence,lifecycle_stage,scope,trust_source) "
+            "VALUES (lower(hex(randomblob(16))),?,?,?,?,?,?, 'active', ?, ?, ?, ?, ?) "
             "ON CONFLICT(kind,content) DO UPDATE SET confidence=max(confidence, excluded.confidence), "
             "source_run=excluded.source_run, updated_at=excluded.updated_at, "
             "pinned=max(pinned, excluded.pinned), status='active', "
             "valid_from=COALESCE(memories.valid_from, excluded.valid_from), "
-            "evidence=COALESCE(excluded.evidence, memories.evidence)",
-            (normalized_kind, content.strip(), bounded, source_run, now, 1 if pinned else 0, now, evidence),
+            "evidence=COALESCE(excluded.evidence, memories.evidence), "
+            "lifecycle_stage=excluded.lifecycle_stage, scope=excluded.scope, trust_source=excluded.trust_source",
+            (normalized_kind, content.strip(), bounded, source_run, now, 1 if pinned else 0, now, evidence, lifecycle_stage, scope, trust_source),
         )
         memory_id = self.connection.execute(
             "SELECT memory_id FROM memories WHERE kind=? AND content=?", (normalized_kind, content.strip())
         ).fetchone()[0]
         if self.memory_store is not None:
             self.memory_store.index_memory(str(memory_id), normalized_kind, content.strip())
+        return str(memory_id)
+        # Read-before-acknowledge: every persisted memory must be verifiable
+        # before the write is acknowledged to the caller. Read the full row
+        # and confirm the fields we intended to write actually landed. This
+        # does not change what is written — only confirms it after the fact.
+        verified = self.connection.execute(
+            "SELECT kind, content, source_run, status, lifecycle_stage, scope, trust_source "
+            "FROM memories WHERE memory_id=?",
+            (memory_id,),
+        ).fetchone()
+        if verified is None:
+            raise RuntimeError(
+                f"write not acknowledged: memory {memory_id} not readable after persist"
+            )
+        if verified["kind"] != normalized_kind:
+            raise RuntimeError(
+                f"write not acknowledged: kind mismatch for memory {memory_id}"
+            )
+        if verified["content"] != content.strip():
+            raise RuntimeError(
+                f"write not acknowledged: content mismatch for memory {memory_id}"
+            )
+        if verified["status"] != "active":
+            raise RuntimeError(
+                f"write not acknowledged: unexpected status {verified['status']!r} for memory {memory_id}"
+            )
+        if source_run is not None and verified["source_run"] != source_run:
+            raise RuntimeError(
+                f"write not acknowledged: source_run mismatch for memory {memory_id}"
+            )
+        if verified["lifecycle_stage"] != lifecycle_stage:
+            raise RuntimeError(
+                f"write not acknowledged: lifecycle_stage mismatch for memory {memory_id}"
+            )
+        if verified["scope"] != scope:
+            raise RuntimeError(
+                f"write not acknowledged: scope mismatch for memory {memory_id}"
+            )
+        if verified["trust_source"] != trust_source:
+            raise RuntimeError(
+                f"write not acknowledged: trust_source mismatch for memory {memory_id}"
+            )
         return str(memory_id)
 
     def forget_memory(self, memory_id: str) -> bool:
@@ -2860,7 +3493,7 @@ class StateStore:
             (METRICS_RUN_ID, marker, json.dumps(data, ensure_ascii=False), utc_now()),
         )
 
-    def evaluate_criteria(self, run_id: str, criteria: list[dict[str, Any]], report: str, status: RunStatus) -> list[dict[str, Any]]:
+    def evaluate_criteria(self, run_id: str, criteria: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Evaluate success criteria against durable tool evidence.
 
         The harness uses a single criterion kind (`verified_progress`): a run
@@ -3080,31 +3713,43 @@ class StateStore:
         self.alerts.mark_delivered(alert_id, channel)
 
     def decay_memory_confidence(
-        self, *, factor: float = 0.95, floor: float = 0.05, stale_days: float = 7.0, drop_below: float = 0.1
+        self,
+        *,
+        step: float = 0.03,
+        floor: float = 0.05,
+        stale_days: float = 1.0,
+        drop_below: float = 0.1,
+        protected_contents: Iterable[str] = (),
     ) -> dict[str, int]:
         """Fade memories nothing has reinforced, and drop the weakest.
 
-        Retention is importance-weighted (Ebbinghaus-inspired): a stale memory
-        keeps the fraction ``factor + (1 - factor) * confidence`` of its
-        confidence, so a well-evidenced memory fades slower than a weak guess
-        instead of every row losing the same share. Pinned memories never fade,
-        the result is floored at `floor`, and unpinned memories below
-        `drop_below` are removed.
+        Fading is a flat linear step: a stale memory loses ``step`` of confidence
+        per window, so at the default 0.03/day a confidence of 1.0 reaches the
+        drop threshold in about a month. The earlier importance weighting
+        (``factor + (1 - factor) * confidence``) made high-confidence rows
+        effectively immortal -- the multiplier for confidence 1.0 was exactly
+        1.0 -- which is why one number now bounds every memory's life.
+
+        Pinned memories never fade; ``protected_contents`` (the curated canonical
+        set) is immune and is never dropped; the result is floored at `floor`;
+        unpinned memories below `drop_below` are removed. Stamping `decayed_at`
+        keeps the fade idempotent: a second pass inside the same stale window
+        sees a fresh clock and does not subtract again. ``updated_at`` is left
+        alone deliberately -- it is the column the recall 'recency' axis ranks
+        on, so writing it here promoted the very memories this pass punished.
         """
         now = utc_now()
         cutoff = (utc_datetime_now() - timedelta(days=max(0.0, stale_days))).isoformat().replace("+00:00", "Z")
-        # Stamping `decayed_at` makes the fade idempotent: a second maintenance
-        # pass inside the same stale window sees a fresh decay clock and does not
-        # apply the retention factor again. `updated_at` is deliberately left
-        # alone -- it is the column the recall 'recency' axis ranks on, so
-        # writing it here promoted the very memories this pass punished.
+        protected = tuple(str(item) for item in protected_contents)
+        shield = f" AND content NOT IN ({','.join('?' for _ in protected)})" if protected else ""
         faded = self.connection.execute(
-            "UPDATE memories SET confidence = MAX(?, confidence * (? + (1.0 - ?) * confidence)), decayed_at = ? "
-            "WHERE pinned=0 AND updated_at < ? AND COALESCE(decayed_at, '') < ?",
-            (floor, factor, factor, now, cutoff, cutoff),
+            "UPDATE memories SET confidence = MAX(?, confidence - ?), decayed_at = ? "
+            "WHERE pinned=0 AND updated_at < ? AND COALESCE(decayed_at, '') < ?" + shield,
+            (floor, step, now, cutoff, cutoff, *protected),
         ).rowcount
         dropped_rows = self.connection.execute(
-            "SELECT memory_id FROM memories WHERE pinned=0 AND confidence < ?", (drop_below,)
+            "SELECT memory_id FROM memories WHERE pinned=0 AND confidence < ?" + shield,
+            (drop_below, *protected),
         ).fetchall()
         dropped = 0
         if dropped_rows:
@@ -3147,13 +3792,16 @@ class StateStore:
         return streak
 
     def pinned_memories(self, limit: int = 32) -> list[dict[str, Any]]:
-        """Always-injected memories, independent of any retrieval query."""
+        """Always-injected memories, independent of any retrieval query.
+
+        owner_untrusted content is symbolized per DualView (arXiv:2607.03821v2).
+        """
         rows = self.connection.execute(
-            "SELECT memory_id, kind, content, confidence, source_run, updated_at FROM memories "
+            "SELECT memory_id, kind, content, confidence, source_run, updated_at, trust_source FROM memories "
             "WHERE pinned=1 AND status='active' ORDER BY confidence DESC, updated_at DESC LIMIT ?",
             (max(1, limit),),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._symbolize_content(dict(row)) for row in rows]
 
     def memory_provenance(self, memories: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         """Split a memory set into provenance that resolves and provenance that does not.
@@ -3182,15 +3830,41 @@ class StateStore:
         resolvable = sum(1 for row in rows if str(row.get("source_run")) in known)
         return {"total": len(rows), "resolvable": resolvable, "unresolvable": len(rows) - resolvable}
 
+    def _symbolize_content(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of row with content symbolized if trust_source='owner_untrusted'.
+
+        DualView (arXiv:2607.03821v2) defense: AgentView sees symbols, HumanView keeps originals.
+        """
+        if row.get("trust_source") == "owner_untrusted":
+            out = dict(row)
+            out["content"] = "[SYMBOL: owner_untrusted]"
+            return out
+        return row
+
     def set_memory_pinned(self, memory_id: str, pinned: bool = True) -> bool:
         return bool(self.connection.execute(
             "UPDATE memories SET pinned=? WHERE memory_id=?", (1 if pinned else 0, memory_id)
         ).rowcount)
 
-    def search_memories(self, query: str, limit: int = 20, *, include_inactive: bool = False) -> list[dict[str, Any]]:
+    def unpin_memories(self, memory_ids: Iterable[str]) -> int:
+        """Release a set of one-shot pins in a single statement.
+
+        A pin buys exactly one prompt injection, so the cycle that delivered it
+        releases the whole injected set at once. Returns how many rows actually
+        changed, so the caller can log the consumption only when it happened.
+        """
+        ids = [str(memory_id) for memory_id in memory_ids if str(memory_id)]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        return int(self.connection.execute(
+            f"UPDATE memories SET pinned=0 WHERE pinned=1 AND memory_id IN ({placeholders})", ids
+        ).rowcount)
+
+    def search_memories(self, query: str, limit: int = 20, *, include_inactive: bool = False, lifecycle_stage: str | None = None, scope: str | None = None) -> list[dict[str, Any]]:
         if self.memory_store is None:
             return []
-        return self.memory_store.search(query, limit, include_inactive=include_inactive)
+        return self.memory_store.search(query, limit, include_inactive=include_inactive, lifecycle_stage=lifecycle_stage, scope=scope)
 
     def close(self) -> None:
         self.connection.close()

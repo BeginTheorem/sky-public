@@ -24,6 +24,10 @@ class LLMProvider(Protocol):
         this contract: it is an optional capability. A provider that honours it
         sets ``accepts_timeout_override = True`` and widens its own signature;
         the fallback strike ladder checks that flag before passing the keyword.
+
+        Forcing one tool is the same shape of contract: a provider that can honour
+        ``tool_choice`` sets ``accepts_tool_choice = True`` and takes that keyword, and the caller
+        checks the flag first. The closing turn uses it to be a call rather than prose.
         Requiring it here made every fake provider in the suite protocol-
         incompatible without changing behaviour.
         """

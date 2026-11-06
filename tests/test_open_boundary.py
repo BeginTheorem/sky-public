@@ -130,6 +130,8 @@ class IdeaArchiveTests(unittest.TestCase):
             idea_id = store.archive_idea(_idea("scheduler|control-logic|own-repo", quality=0.5, title="materialize me"))
             self.assertIsNotNone(idea_id)
             task_id = store.materialize_idea(str(idea_id), goal_id)
+            self.assertIsNotNone(task_id, "a fresh idea always becomes work")
+            assert task_id is not None
             self.assertIsNotNone(store.task_work(task_id))
             self.assertEqual(
                 store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='idea_materialized'").fetchone()[0],
@@ -168,20 +170,158 @@ class IdeaArchiveTests(unittest.TestCase):
                 self.assertEqual(children, 1)
             store.close()
 
-    def test_saturated_idea_is_never_a_parent(self) -> None:
+    def test_a_saturated_idea_stays_eligible_as_a_parent(self) -> None:
+        """Proving itself must not retire an idea from the lineage.
+
+        The pool used to exclude ``quality >= 1.0``, so an idea left it exactly
+        when it verified and only unproven ideas kept breeding - visible on the
+        live archive, where the only two ideas that ever had children were the
+        ones since marked ``validated``. Both ideas must be reachable now, with
+        the better-evidenced one carrying the larger weight:
+        sigmoid(10*(1.0-0.5)) = 0.993 against sigmoid(0) = 0.5.
+        """
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             saturated = store.archive_idea(_idea("memory|workflow|own-repo", quality=1.0, title="saturated"))
             parent = store.archive_idea(_idea("tools|workflow|own-repo", quality=0.5, title="parent"))
             self.assertIsNotNone(saturated)
             self.assertIsNotNone(parent)
-            draws = iter([0.1, 0.5, 0.9, 0.25, 0.75])
-            store.next_random = lambda: next(draws)  # type: ignore[method-assign]
-            for _ in range(5):
-                picked = store.sample_archive_parents(k=1)
-                self.assertEqual(len(picked), 1)
-                self.assertEqual(str(picked[0]["idea_id"]), parent)
-                self.assertNotEqual(str(picked[0]["idea_id"]), saturated)
+            low = iter([0.1])
+            store.next_random = lambda: next(low)  # type: ignore[method-assign]
+            picked = store.sample_archive_parents(k=1)
+            self.assertEqual(len(picked), 1)
+            self.assertEqual(str(picked[0]["idea_id"]), saturated)
+            high = iter([0.9])
+            store.next_random = lambda: next(high)  # type: ignore[method-assign]
+            picked = store.sample_archive_parents(k=1)
+            self.assertEqual(str(picked[0]["idea_id"]), parent)
+            store.close()
+
+    def test_novelty_is_measured_against_the_archive(self) -> None:
+        """Novelty is a relation: an echoed idea is stale, an unrelated one is new."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            text = {
+                "title": "consolidate memory on recurrence",
+                "hypothesis": "buffering interactions and consolidating only on recurrence cuts consolidation calls",
+                "expected_new_fact": "fewer consolidation calls per session",
+                "validation": "measure consolidation token cost per session",
+            }
+            first = store.archive_idea(_idea("memory|memory-structure|internal-benchmark", quality=0.5, **text))
+            echo = store.archive_idea(_idea("tools|new-tool|internal-benchmark", quality=0.5, **text))
+            novel = store.archive_idea(
+                _idea(
+                    "providers|workflow|own-repo",
+                    quality=0.5,
+                    title="rotate provider keys on 429",
+                    hypothesis="a key pool outlives a single quota",
+                    expected_new_fact="fewer provider lockouts",
+                    validation="count lockouts per day",
+                )
+            )
+            for admitted in (first, echo, novel):
+                self.assertIsNotNone(admitted)
+            rows = {str(row["idea_id"]): float(row["novelty"]) for row in store.live_ideas()}
+            self.assertLess(rows[str(echo)], 0.2, "an echo of an archived idea is not new")
+            self.assertGreater(rows[str(novel)], rows[str(echo)], "an unrelated idea outranks an echo")
+            event = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='idea_archived' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()[0]
+            self.assertTrue(json.loads(event)["novelty_measured"], "the archive must know it measured it")
+            store.close()
+
+    def test_a_declared_constant_novelty_is_remeasured_where_the_rule_reads_it(self) -> None:
+        """Rows archived while the call site wrote a constant must not freeze a cell.
+
+        The live archive carries seven such rows, all at ``novelty = 1.0``; a
+        measured candidate can never dominate an unfalsifiable maximum, so the
+        incumbent is re-measured from its own text before the comparison.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            cell = "general|workflow|own-repo"
+            twins = {
+                "hypothesis": "buffer interactions with hash embeddings and consolidate on recurrence",
+            }
+            legacy = store.archive_idea(_idea(cell, quality=1.0, novelty=1.0, title="recurrence buffer", **twins))
+            neighbour = store.archive_idea(_idea("general|workflow|internal-benchmark", quality=0.5, novelty=1.0, title="recurrence buffer", **twins))
+            self.assertIsNotNone(legacy)
+            self.assertIsNotNone(neighbour)
+            challenger = store.archive_idea(
+                _idea(
+                    cell,
+                    quality=1.0,
+                    title="rotate provider keys on 429",
+                    hypothesis="a key pool outlives a single quota",
+                )
+            )
+            self.assertIsNotNone(challenger)
+            self.assertEqual(str(cast(dict, store.best_in_cell(cell))["idea_id"]), challenger)
+            stored = float(
+                store.connection.execute("SELECT novelty FROM idea_archive WHERE idea_id=?", (legacy,)).fetchone()[0]
+            )
+            self.assertLess(stored, 0.5, "the legacy constant is replaced by a measurement")
+            remeasured = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='idea_novelty_remeasured' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(remeasured, "the correction is durable and evented, never silent")
+            self.assertEqual(json.loads(remeasured[0])["idea_id"], legacy)
+            store.close()
+
+    def test_a_contested_cell_collapses_to_one_live_occupant(self) -> None:
+        """Legacy cells hold several live rows; taking one over retires them all.
+
+        While only ``active`` counted as an occupant, a validated idea stopped
+        defending its cell and a later admission stacked a second live row into
+        it - three of the live cells carry two or three. The archive's invariant
+        is one live idea per cell, so the takeover retires every live occupant
+        and names them in the event.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            cell = "general|workflow|own-repo"
+            twins = "buffer interactions with hash embeddings and consolidate on recurrence"
+            for name in ("legacy-a", "legacy-b"):
+                store.connection.execute(
+                    "INSERT INTO idea_archive(idea_id, lineage_depth, subsystem, change_type, evidence_source, "
+                    "cell_key, title, hypothesis, quality, novelty, status, children, created_at, updated_at) "
+                    "VALUES (?,0,'general','workflow','own-repo',?,?,?,1.0,1.0,'active',0,?,?)",
+                    (name, cell, "recurrence buffer", twins, utc_now(), utc_now()),
+                )
+            self.assertEqual(len(store.live_ideas()), 2, "the legacy state stacks live rows")
+            challenger = store.archive_idea(
+                _idea(cell, quality=1.0, title="rotate provider keys on 429", hypothesis="a key pool outlives a single quota")
+            )
+            self.assertIsNotNone(challenger)
+            self.assertEqual(
+                [str(row["idea_id"]) for row in store.live_ideas()], [str(challenger)], "one live occupant remains"
+            )
+            event = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='idea_superseded' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()[0]
+            self.assertEqual(sorted(json.loads(event)["retired"]), ["legacy-a", "legacy-b"])
+            store.close()
+
+    def test_a_validated_idea_keeps_its_cell_and_its_place_in_the_lineage(self) -> None:
+        """``validated`` is an outcome of being used, not a retirement.
+
+        Reading only ``active`` made a proven idea invisible to its own archive:
+        it stopped holding its cell (so a weaker idea could claim it unchallenged)
+        and it stopped being a parent.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            cell = "reactor|control-logic|own-repo"
+            idea_id = store.archive_idea(_idea(cell, quality=0.5, title="stall watchdog"))
+            self.assertIsNotNone(idea_id)
+            store.record_idea_outcome(str(idea_id), quality=1.0, status="validated")
+            self.assertEqual(str(cast(dict, store.best_in_cell(cell))["idea_id"]), idea_id)
+            self.assertEqual(store.idea_cells()[cell], 1)
+            self.assertIn(str(idea_id), {str(row["idea_id"]) for row in store.live_ideas()})
+            picked = store.sample_archive_parents(k=1)
+            self.assertEqual(str(picked[0]["idea_id"]), idea_id)
+            weaker = store.archive_idea(_idea(cell, quality=0.5, novelty=1.0, title="a weaker idea"))
+            self.assertIsNone(weaker, "a validated occupant defends its cell")
             store.close()
 
 
@@ -481,6 +621,179 @@ class ExternalSeekTests(unittest.TestCase):
                 self.assertIsNotNone(reactor._seek_external_evidence(state, goals))
                 reactor.close()
 
+    def test_valve_opens_an_outstanding_look_the_planner_cannot_select(self) -> None:
+        """An instance born unselectable is opened, not obeyed.
+
+        Measured on the live ledger 2026-10-19: the outward look created at 13:15 stayed
+        pending for 21 hours with ``attempts=0``, the valve recorded 90 suppressions in that
+        time, and the planner never once offered that task as a candidate -- the template's
+        hypothesis read ``completed``, so ``planner_candidates`` gave it novelty 0.0 and
+        ``rank()`` dropped it. The duplication check read the same row as work in flight and
+        stayed shut behind it, which is the one thing a valve must never do.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"webfetch": Mock()},
+                ReactorConfig(
+                    state_path=Path(directory) / "state.sqlite3",
+                    external_seek_every_generations=1,
+                    external_seek_cooldown_seconds=0.0,
+                ),
+            )
+            reactor.store.add_goal("g", priority=1.0)
+            goals = reactor.store.active_work()[0]
+            state = reactor.store.state()
+            first = reactor._seek_external_evidence(state, goals)
+            self.assertIsNotNone(first)
+            task_id = cast(dict, first)["task"]["task_id"]
+
+            hypothesis, structural = _EXTERNAL_SEEK_FINGERPRINTS
+            reactor.store.register_hypothesis(
+                workstream_id="research",
+                fingerprint=hypothesis,
+                structural_fingerprint=structural,
+                problem="p",
+                expected_behavior="b",
+            )
+            reactor.store.mark_hypothesis(hypothesis, "completed")
+            self.assertTrue(reactor.store.fingerprint_is_terminal(hypothesis, structural, ttl_days=7))
+
+            reopened = reactor._seek_external_evidence(state, goals)
+            self.assertIsNotNone(
+                reopened,
+                "an outstanding look the planner can never select must be opened, not obeyed",
+            )
+            self.assertEqual(cast(dict, reopened)["task"]["task_id"], task_id)
+
+            kinds = [
+                str(row[0])
+                for row in reactor.store.connection.execute(
+                    "SELECT kind FROM event_log WHERE kind LIKE 'external_seek_%' ORDER BY sequence"
+                )
+            ]
+            self.assertIn("external_seek_revived", kinds)
+            self.assertNotIn("external_seek_suppressed", kinds)
+
+            candidates = reactor.store.planner_candidates(limit=50, terminal_ttl_days=7)
+            rows = [row for row in candidates if row["task_id"] == task_id]
+            self.assertEqual(len(rows), 1, "after the reopen the planner must be able to offer it again")
+            self.assertNotEqual(rows[0]["fingerprint_state"], "terminal")
+            reactor.close()
+
+    def test_a_starvation_is_reported_once_its_window_is_full(self) -> None:
+        """90 suppressions over 21 hours told the owner nothing; the count now does."""
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {},
+                ReactorConfig(
+                    state_path=Path(directory) / "state.sqlite3",
+                    outward_starvation_suppressions=2,
+                    outward_starvation_hours=24.0,
+                ),
+            )
+            for _ in range(2):
+                reactor.store.append_event("external_seek_suppressed", {"generation": 1})
+            reactor._alert_if_outward_starved()
+            row = reactor.store.connection.execute(
+                "SELECT kind, severity, payload FROM alerts WHERE kind='outward_pool_starved'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["severity"], "warning")
+            self.assertEqual(json.loads(row["payload"])["suppressed_events"], 2)
+            reactor.close()
+
+    def test_a_single_suppression_raises_no_alarm(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {},
+                ReactorConfig(
+                    state_path=Path(directory) / "state.sqlite3",
+                    outward_starvation_suppressions=12,
+                ),
+            )
+            reactor.store.append_event("external_seek_suppressed", {"generation": 1})
+            reactor._alert_if_outward_starved()
+            self.assertEqual(
+                reactor.store.connection.execute(
+                    "SELECT COUNT(*) FROM alerts WHERE kind='outward_pool_starved'"
+                ).fetchone()[0],
+                0,
+            )
+            reactor.close()
+
+    def test_the_bounded_diagnostic_has_a_wall_clock_ceiling(self) -> None:
+        """The generation window bounded the interval, not the count.
+
+        Measured 2026-10-18/19: with a four-generation window the same self-diagnosis was
+        minted 17 times in a day -- 31.3M tokens, 29% of that epoch, the largest single sink
+        in it. The daily ceiling is the wall-clock bound on top of the interval one.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {},
+                ReactorConfig(
+                    state_path=Path(directory) / "state.sqlite3",
+                    fallback_daily_limit=2,
+                    fallback_daily_window_hours=24.0,
+                    # the interval cap off, so this test measures only the daily ceiling
+                    fallback_repeat_generations=0,
+                    fallback_repeat_seconds=0.0,
+                ),
+            )
+            reactor.store.add_goal("g", priority=1.0)
+            goals = reactor.store.active_work()[0]
+            created: list[str] = []
+            for generation in range(4):
+                task_id = reactor._create_planner_fallback(goals, 10 + generation)
+                if task_id:
+                    created.append(task_id)
+                    reactor.store.connection.execute(
+                        "UPDATE tasks SET status='completed', updated_at=? WHERE task_id=?",
+                        (utc_now(), task_id),
+                    )
+            self.assertEqual(len(created), 2, "the third and fourth diagnostics must be capped")
+            capped = json.loads(
+                reactor.store.connection.execute(
+                    "SELECT payload FROM event_log WHERE kind='planner_fallback_capped' ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()[0]
+            )
+            self.assertEqual(capped["reason"], "daily limit")
+            self.assertEqual(capped["limit"], 2)
+            reactor.close()
+
+    def test_a_capped_cycle_still_leaves_the_valve_open(self) -> None:
+        """Capping the inward last resort must not close the outward path."""
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"webfetch": Mock()},
+                ReactorConfig(
+                    state_path=Path(directory) / "state.sqlite3",
+                    fallback_daily_limit=1,
+                    fallback_repeat_generations=0,
+                    fallback_repeat_seconds=0.0,
+                    external_seek_every_generations=1,
+                    external_seek_cooldown_seconds=0.0,
+                ),
+            )
+            reactor.store.add_goal("g", priority=1.0)
+            goals = reactor.store.active_work()[0]
+            first = reactor._create_planner_fallback(goals, 5)
+            self.assertIsNotNone(first)
+            reactor.store.connection.execute(
+                "UPDATE tasks SET status='completed', updated_at=? WHERE task_id=?", (utc_now(), first)
+            )
+            self.assertIsNone(reactor._create_planner_fallback(goals, 6), "the daily ceiling is reached")
+            self.assertIsNotNone(
+                reactor._seek_external_evidence(reactor.store.state(), goals),
+                "a capped inward cycle still has the outward path",
+            )
+            reactor.close()
+
     def test_a_stale_stack_is_repaired_down_to_the_newest_live_instance(self) -> None:
         """The exemption keeps one reachable instance, not every stacked copy.
 
@@ -545,10 +858,16 @@ class ExternalSeekTests(unittest.TestCase):
                 self.assertEqual(statuses[stale_id], "cancelled")
             surviving = _live_external_seek_tasks(reactor.store.connection)
             self.assertEqual([row["task_id"] for row in surviving], [first_id], "one instance of the family stays live")
-            # Pinned residual behaviour: the survivor is pending with a terminal
-            # hypothesis, so it still holds the valve shut. Retiring it is a
-            # separate change with its own evidence.
-            self.assertIsNone(reactor._seek_external_evidence(state, goals))
+            # The valve now OPENS the survivor instead of blocking on it. A row whose
+            # hypothesis is terminal is unselectable, and a duplication check that reads
+            # existence as "work in flight" stays shut behind it forever -- which is exactly
+            # what happened: measured on the live ledger 2026-10-19, this state held the valve
+            # shut for 21 hours (90 suppressions) while no outward work ran and the planner
+            # never once offered the task as a candidate. The repair keeps the instance
+            # reachable; the valve is what makes it real.
+            reopened = reactor._seek_external_evidence(state, goals)
+            self.assertIsNotNone(reopened, "the survivor is opened, not obeyed")
+            self.assertEqual(cast(dict, reopened)["task"]["task_id"], first_id)
             reactor.close()
 
 

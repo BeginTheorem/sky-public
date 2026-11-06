@@ -44,6 +44,6 @@ SSH_ARGS=(
 # The server repository carries the shared history, so a rollback is a plain
 # hard reset to a commit or tag that is already present. No mirror involved.
 ssh "${SSH_ARGS[@]}" "$REMOTE_USER@$REMOTE_HOST" \
-    "set -eu; target=$REMOTE_DIR; git -C \"\$target\" rev-parse --verify \"$TARGET^{commit}\" >/dev/null; sudo -n systemctl stop skynet.service; git -C \"\$target\" reset --hard \"$TARGET\"; printf '%s\n' \"\$(git -C \"\$target\" rev-parse HEAD)\" | sudo -n tee \"\$target/.deployed-commit\" >/dev/null; touch \"\$target/.deployment-refresh\"; sudo -n systemctl start skynet.service"
+    "set -eu; target=$REMOTE_DIR; git -C \"\$target\" rev-parse --verify \"$TARGET^{commit}\" >/dev/null; export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user stop skynet.service || true; git -C \"\$target\" reset --hard \"$TARGET\"; printf '%s\n' \"\$(git -C \"\$target\" rev-parse HEAD)\" > \"\$target/.deployed-commit\"; touch \"\$target/.deployment-refresh\"; systemctl --user start skynet.service"
 
 printf 'Rollback requested for %s on %s.\n' "$TARGET" "$REMOTE_HOST"

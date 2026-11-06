@@ -10,11 +10,15 @@ from urllib import error, request
 from ..models import ModelTurn, ToolCall
 from ..provider import Message, ToolSchema
 from .errors import ProviderError, tool_arguments
-from .openai_compatible import OpenAICompatibleProvider, _as_finish_reason, _as_int, _looks_like_reasoning_leak
+from .openai_compatible import OpenAICompatibleProvider, _as_finish_reason, _as_int, _looks_like_reasoning_leak, _retry_after_seconds
 
 
 class OpenRouterProvider(OpenAICompatibleProvider):
     """OpenAI-compatible streaming client for the OpenRouter API."""
+
+    # The patient cycle bounds a streaming rung by SILENCE between chunks (the
+    # idle timer is refreshed on every received chunk), not by the whole wait.
+    streams = True
 
     def __init__(
         self,
@@ -22,7 +26,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         base_url: str,
         api_key: str,
         model: str,
-        name: str = "openrouter",
+        name: str = "openrouter_deepseek",
         timeout_seconds: float = 30.0,
         max_attempts: int = 3,
         retry_delay_seconds: float = 1.0,
@@ -48,7 +52,15 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         self.chunk_timeout_seconds = max(0.1, chunk_timeout_seconds or 900.0)
         self.stream_deadline_seconds = stream_deadline_seconds
 
-    def complete(self, messages: Sequence[Message], *, max_tokens: int, tools: Sequence[ToolSchema] = (), timeout_seconds: float | None = None) -> ModelTurn:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int,
+        tools: Sequence[ToolSchema] = (),
+        timeout_seconds: float | None = None,
+        tool_choice: dict[str, Any] | None = None,
+    ) -> ModelTurn:
         # ``timeout_seconds`` from the fallback ladder is an idle/hang budget, not
         # a total-stream deadline: a slow but active reasoning stream must not be
         # cut off. The overall cap lives in ``stream_deadline_seconds``.
@@ -56,7 +68,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         last_error: ProviderError | None = None
         for attempt in range(self.max_attempts):
             try:
-                return self._complete_once(messages, max_tokens=max_tokens, tools=tools, idle_seconds=idle_seconds)
+                return self._complete_once(messages, max_tokens=max_tokens, tools=tools, idle_seconds=idle_seconds, tool_choice=tool_choice)
             except ProviderError as exc:
                 last_error = exc
                 if not exc.retryable or attempt + 1 >= self.max_attempts:
@@ -67,7 +79,15 @@ class OpenRouterProvider(OpenAICompatibleProvider):
             raise AssertionError("retry loop exited without an error to raise")
         raise last_error
 
-    def _complete_once(self, messages: Sequence[Message], *, max_tokens: int, tools: Sequence[ToolSchema] = (), idle_seconds: float | None = None) -> ModelTurn:
+    def _complete_once(
+        self,
+        messages: Sequence[Message],
+        *,
+        max_tokens: int,
+        tools: Sequence[ToolSchema] = (),
+        idle_seconds: float | None = None,
+        tool_choice: dict[str, Any] | None = None,
+    ) -> ModelTurn:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": list(messages),
@@ -77,6 +97,8 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         }
         if tools:
             payload["tools"] = list(tools)
+        if tool_choice is not None and tools:
+            payload["tool_choice"] = tool_choice
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -98,11 +120,16 @@ class OpenRouterProvider(OpenAICompatibleProvider):
             except OSError:
                 detail = "response body unavailable"
             category, retryable, cooldown = self._classify_status(exc.code, detail)
+            explicit = category == "quota"
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                cooldown, explicit = retry_after, True
             raise ProviderError(
                 f"openrouter request failed: HTTP {exc.code}: {detail}",
                 category=category,
                 retryable=retryable,
                 cooldown_seconds=cooldown,
+                cooldown_explicit=explicit,
                 provider=self.name,
                 model=self.model,
                 http_status=exc.code,
@@ -124,6 +151,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         usage_tokens = 0
         prompt_tokens = 0
         completion_tokens = 0
+        cached_tokens = 0
         finish_reason: str | None = None
         saw_done = False
         try:
@@ -153,6 +181,11 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                         usage_tokens = _as_int(usage.get("total_tokens", 0))
                         prompt_tokens = _as_int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
                         completion_tokens = _as_int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
+                        # Cache hits ride inside the usage block, in one of two shapes
+                        # (see the non-streaming parser); copied, never inferred.
+                        details = usage.get("prompt_tokens_details")
+                        details = details if isinstance(details, dict) else {}
+                        cached_tokens = _as_int(details.get("cached_tokens", usage.get("cache_read_input_tokens", 0)))
                 choices = chunk.get("choices") or []
                 for choice in choices:
                     # The stop reason arrives on the final content chunk, and
@@ -258,7 +291,7 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 provider=self.name,
                 model=self.model,
             )
-        return ModelTurn(text=text, reasoning_content=reasoning_content, tool_calls=calls, usage_tokens=usage_tokens, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, finish_reason=finish_reason)
+        return ModelTurn(text=text, reasoning_content=reasoning_content, tool_calls=calls, usage_tokens=usage_tokens, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached_tokens=cached_tokens, finish_reason=finish_reason)
 
     def _read_timeout(self, idle_seconds: float, deadline: float | None) -> float:
         timeout = idle_seconds

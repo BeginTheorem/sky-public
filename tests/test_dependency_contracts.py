@@ -59,6 +59,16 @@ class DependencyContractTests(unittest.TestCase):
         """judge_health reads planner_attempts through arguments, not imports."""
         self.assertEqual(_internal_imports(_module("judge_health")), set())
 
+    def test_scheduler_is_a_pure_scorer(self) -> None:
+        """scheduler.py scores (task, provider) pairs from plain inputs.
+
+        It is deliberately unwired: it may not reach the store, the chain, or the
+        reactor, and it must not grow into a second work-selection contour (see
+        AGENTS.md, the one-planner invariant). A purity assertion, not a style
+        nit: an import here is how that contour would start.
+        """
+        self.assertEqual(_internal_imports(_module("scheduler")), set())
+
 
 if __name__ == "__main__":
     unittest.main()

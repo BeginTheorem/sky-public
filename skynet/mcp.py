@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import selectors
+import shlex
 import signal
 import subprocess
 import sys
@@ -26,6 +27,31 @@ class MCPError(RuntimeError):
 class MCPRemoteError(MCPError):
     """A JSON-RPC application error returned by an otherwise-live server."""
 
+
+def configured_servers(environ: Mapping[str, str] | None = None) -> dict[str, list[str]]:
+    """The MCP servers an environment asks for: ``SKYNET_MCP_<NAME>_COMMAND``, minus parked ones.
+
+    The sensors used to be hardcoded keys, so adding one meant editing code. Any
+    ``SKYNET_MCP_<NAME>_COMMAND`` now registers a server, and ``SKYNET_MCP_<NAME>_DISABLED=1``
+    removes one *without touching the command* — which is how a sensor gets parked while
+    staying installed. The caller passes its own mapping when it must not read the live
+    process environment.
+    """
+    source = os.environ if environ is None else environ
+    prefix, suffix = "SKYNET_MCP_", "_COMMAND"
+    config: dict[str, list[str]] = {}
+    for key in sorted(source):
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        name = key[len(prefix) : -len(suffix)].lower()
+        if not name:
+            continue
+        if str(source.get(f"{prefix}{name.upper()}_DISABLED", "")).strip().casefold() in {"1", "true", "yes", "on"}:
+            continue
+        command = shlex.split(str(source.get(key, "") or ""))
+        if command:
+            config[name] = command
+    return config
 
 
 def _env_timeout(name: str, default: float) -> float:
@@ -366,6 +392,8 @@ def start_mcp_servers(
     *,
     timeout_seconds: float = 30.0,
     skip_failures: bool = False,
+    start_attempts: int = 2,
+    retry_backoff_seconds: float = 2.0,
 ) -> tuple[MCPToolMap, MCPClientList]:
     """Start configured stdio servers and expose their discovered tools.
 
@@ -373,30 +401,53 @@ def start_mcp_servers(
     server that cannot start is logged and skipped, while the remaining
     servers still come up. Without it the first failure aborts startup.
     Skipped server names are recorded on both returned containers.
+
+    A failed start is retried ``start_attempts`` times before it counts as
+    unavailable. The handshake deadline is wall-clock, and a cold boot (several
+    interpreters importing at once off a cold page cache) can overrun it on a
+    server that is perfectly healthy — while a skipped sensor stays blind for
+    the whole run, not just for the handshake. The retry reads from a cache the
+    failed attempt has already warmed, so it is cheap when the stall was IO.
     """
     tools: dict[str, MCPTool] = {}
     clients: list[MCPStdioClient] = []
     skipped: list[str] = []
+    attempts = max(1, start_attempts)
     try:
         for server_name, command in config.items():
-            client = MCPStdioClient(command, timeout_seconds=timeout_seconds)
-            client.server_name = server_name
-            try:
-                client.start()
-                discovered = discover_mcp_tools(client)
-            except Exception as exc:
-                client.close()
+            failure: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                client = MCPStdioClient(command, timeout_seconds=timeout_seconds)
+                client.server_name = server_name
+                try:
+                    client.start()
+                    discovered = discover_mcp_tools(client)
+                except Exception as exc:
+                    client.close()
+                    failure = exc
+                    if attempt < attempts:
+                        log.warning(
+                            "MCP server %s failed to start (attempt %d/%d): %s; retrying in %gs",
+                            server_name,
+                            attempt,
+                            attempts,
+                            exc,
+                            retry_backoff_seconds,
+                        )
+                        time.sleep(retry_backoff_seconds)
+                    continue
+                client.tool_names = list(discovered)
+                clients.append(client)
+                for tool_name, tool in discovered.items():
+                    exposed_name = tool_name if tool_name not in tools else f"{server_name}_{tool_name}"
+                    tool.name = exposed_name
+                    tools[exposed_name] = tool
+                break
+            else:
                 if not skip_failures:
-                    raise
-                log.warning("MCP server %s unavailable: %s", server_name, exc)
+                    raise failure if failure is not None else MCPError(f"MCP server {server_name} did not start")
+                log.warning("MCP server %s unavailable after %d attempt(s): %s", server_name, attempts, failure)
                 skipped.append(server_name)
-                continue
-            client.tool_names = list(discovered)
-            clients.append(client)
-            for tool_name, tool in discovered.items():
-                exposed_name = tool_name if tool_name not in tools else f"{server_name}_{tool_name}"
-                tool.name = exposed_name
-                tools[exposed_name] = tool
         return MCPToolMap(tools, skipped_servers=skipped), MCPClientList(clients, skipped_servers=skipped)
     except Exception:
         for client in clients:

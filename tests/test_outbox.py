@@ -417,6 +417,12 @@ class AlertScriptTests(unittest.TestCase):
         result = subprocess.run(["bash", "-n", str(self.SCRIPT)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
 
+    def test_journal_is_read_from_the_user_bus(self):
+        # The failing units are systemd *user* units, so a bare `journalctl -u`
+        # found nothing and the alert carried no journal lines.
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("journalctl --user", text)
+
 
 class SystemdUnitsTests(unittest.TestCase):
     ROOT = Path(__file__).resolve().parent.parent
@@ -428,6 +434,15 @@ class SystemdUnitsTests(unittest.TestCase):
         alert = (self.ROOT / "deploy" / "skynet-alert@.service.in").read_text(encoding="utf-8")
         self.assertIn("Type=oneshot", alert)
         self.assertIn("scripts/alert.sh %i", alert)
+
+    def test_startup_rollback_is_rate_limited(self):
+        # OnFailure= starts the rollback on every failed start, including each
+        # attempt of an auto-restart loop (five starts in the CAPABILITIES
+        # incident). A destructive rollback must not hammer, so the unit is
+        # limited to a single start per window.
+        text = (self.ROOT / "deploy" / "skynet-rollback.service.in").read_text(encoding="utf-8")
+        self.assertIn("StartLimitBurst=1", text)
+        self.assertIn("StartLimitIntervalSec=", text)
 
 
 if __name__ == "__main__":

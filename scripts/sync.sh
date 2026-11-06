@@ -9,10 +9,9 @@
 # so a genuine divergence is reported instead of silently resolved.
 #
 #   scripts/sync.sh                    pull/push the shared branch
-#   scripts/sync.sh --prune-worktrees  also drop the server's registered
-#                                      self-improvement worktrees (root-owned,
-#                                      removed via sudo -n) and prune stale ones
-#   scripts/sync.sh --public           also run publish-public.sh --check
+#   scripts/sync.sh --prune-worktrees  also drop the host's registered
+#                                      self-improvement worktrees (owned by the
+#                                      service account) and prune stale ones
 #
 # Infrastructure values live in config/deploy.env (gitignored), never here.
 
@@ -31,13 +30,11 @@ REMOTE_DIR="${REMOTE_DIR:-$HOME/project-skynet}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/deploy_key}"
 
 PRUNE_WORKTREES=false
-RUN_PUBLIC=false
 for arg in "$@"; do
     case "$arg" in
         --prune-worktrees) PRUNE_WORKTREES=true ;;
-        --public) RUN_PUBLIC=true ;;
         -h|--help)
-            printf 'usage: %s [--prune-worktrees] [--public]\n' "$0"
+            printf 'usage: %s [--prune-worktrees]\n' "$0"
             exit 0
             ;;
         *)
@@ -84,7 +81,7 @@ REMOTE_URL="ssh://${REMOTE_USER}@${REMOTE_HOST}${REMOTE_DIR}"
 if [[ "$PRUNE_WORKTREES" == true ]]; then
     printf 'Pruning server worktrees under %s...\n' "$REMOTE_DIR"
     ssh "${SSH_ARGS[@]}" "$REMOTE_USER@$REMOTE_HOST" \
-        "set -eu; cd '$REMOTE_DIR'; git worktree list --porcelain | awk '/^worktree /{print \$2}' | while read -r p; do if [ \"\$p\" = \"\$PWD\" ]; then continue; fi; printf '  remove %s\\n' \"\$p\"; sudo -n rm -rf \"\$p\"; sudo -n rm -rf \".git/worktrees/\$(basename \"\$p\")\"; done; sudo -n git -c safe.directory=\"\$PWD\" worktree prune"
+        "set -eu; cd '$REMOTE_DIR'; git worktree list --porcelain | awk '/^worktree /{print \$2}' | while read -r p; do if [ \"\$p\" = \"\$PWD\" ]; then continue; fi; printf '  remove %s\\n' \"\$p\"; rm -rf \"\$p\"; rm -rf \".git/worktrees/\$(basename \"\$p\")\"; done; git worktree prune"
 fi
 
 git fetch --quiet "$REMOTE_URL" main
@@ -105,7 +102,3 @@ else
 fi
 
 git log -1 --format='Synced at %h %s'
-
-if [[ "$RUN_PUBLIC" == true ]]; then
-    "$ROOT_DIR/scripts/publish-public.sh" --check
-fi

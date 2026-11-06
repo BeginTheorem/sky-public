@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from urllib import error, request
 
 from .store import StateStore
+from .telegram_ui import question_keyboard
 
 log = logging.getLogger("skynet.outbox")
 
@@ -51,11 +52,45 @@ def _compact_json(value: Any, limit: int = JSON_RENDER_LIMIT) -> str:
     return rendered if len(rendered) <= limit else rendered[:limit] + "…"
 
 
+SEVERITY_WORDS = {
+    "critical": "🔴 КРИТИЧНО",
+    "warning": "🟡 ВНИМАНИЕ",
+    "info": "ℹ️ ИНФО",
+}
+
+
+def _alert_facts(payload: Any, limit: int = 4) -> str:
+    """Payload as one ``key=value`` line — no braces, no quotes, no nesting ceremony."""
+    if not isinstance(payload, dict) or not payload:
+        return ""
+    parts: list[str] = []
+    for key, value in list(payload.items())[:limit]:
+        if isinstance(value, (dict, list)):
+            value = _compact_json(value, 200)
+        text = " ".join(str(value).split())
+        parts.append(f"{key}={text if len(text) <= 160 else text[:160] + chr(8230)}")
+    return " · ".join(parts)
+
+
 def render_alert(payload: dict[str, Any]) -> str:
-    severity = str(payload.get("severity", "warning"))
+    """A raised condition in the owner's language and dense.
+
+    The old shape was ``[WARNING] kind x3`` plus a raw JSON dump — braces and quotes
+    around a handful of facts. Now the severity is a word, the repeat count reads as
+    a count, and the payload arrives as ``key=value`` on a single line. The full
+    record still lives in ``event_log``; this is only the signal.
+    """
+    severity = str(payload.get("severity", "warning")).lower()
     kind = str(payload.get("kind", "alert"))
-    occurrences = payload.get("occurrences", 1)
-    return f"[{severity.upper()}] {kind} x{occurrences}\n{_compact_json(payload.get('payload', {}))}"
+    head = f"{SEVERITY_WORDS.get(severity, severity.upper())} · {kind}"
+    try:
+        occurrences = int(payload.get("occurrences", 1) or 1)
+    except (TypeError, ValueError):
+        occurrences = 1
+    if occurrences > 1:
+        head += f" · повторов {occurrences}"
+    facts = _alert_facts(payload.get("payload"))
+    return f"{head}\n{facts}" if facts else head
 
 
 def render_agent_response(payload: dict[str, Any]) -> str:
@@ -113,6 +148,19 @@ def render_outbox_message(kind: str, payload: dict[str, Any]) -> str:
     return f"{kind}\n{_compact_json(payload)}"
 
 
+def markup_for_outbox(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The keyboard a delivered message carries, when it has one worth carrying.
+
+    Only a queued question gets buttons: its options are a closed set, so a tap is an
+    answer rather than a guess. Alerts and reports stay plain text — there is nothing the
+    owner could usefully tap, and a decorative keyboard is noise on a phone.
+    """
+    if kind != "user_question":
+        return None
+    options = payload.get("options")
+    return question_keyboard(str(payload.get("question_id", "")), options if isinstance(options, list) else [])
+
+
 class TelegramTransport:
     """Deliver outbox text through the bot's existing HTTP/proxy layer."""
 
@@ -130,6 +178,27 @@ class TelegramTransport:
                     "sendMessage",
                     {"chat_id": self.chat_id, "text": part, "parse_mode": "HTML"},
                 )
+            except Exception as exc:
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after is not None:
+                    raise OutboxRateLimitError(float(retry_after)) from exc
+                raise
+
+    def send_markup(self, text: str, markup: dict[str, Any]) -> None:
+        """Same delivery, with a keyboard attached to the last chunk.
+
+        The keyboard must ride the *final* chunk: a keyboard only lives on the message it
+        is attached to, and earlier chunks are plain prose.
+        """
+        from .telegram_bot import chunk_html, redact
+
+        parts = chunk_html(redact(text), self.limit)
+        for position, part in enumerate(parts):
+            payload: dict[str, Any] = {"chat_id": self.chat_id, "text": part, "parse_mode": "HTML"}
+            if position == len(parts) - 1:
+                payload["reply_markup"] = markup
+            try:
+                self.api.call("sendMessage", payload)
             except Exception as exc:
                 retry_after = getattr(exc, "retry_after", None)
                 if retry_after is not None:
@@ -239,7 +308,10 @@ class OutboxDrainer:
             if not isinstance(payload, dict):
                 payload = {"raw": payload}
             try:
-                self._send_with_rate_limit(render_outbox_message(kind, payload), consume_attempt=False)
+                self._send_with_rate_limit(
+                    render_outbox_message(kind, payload), consume_attempt=False,
+                    markup=markup_for_outbox(kind, payload),
+                )
             except OutboxDeferredError:
                 self._defer(message_id)
                 return 0
@@ -322,7 +394,7 @@ class OutboxDrainer:
         if not isinstance(payload, dict):
             payload = {"raw": payload}
         try:
-            self._send_with_rate_limit(render_outbox_message(kind, payload))
+            self._send_with_rate_limit(render_outbox_message(kind, payload), markup=markup_for_outbox(kind, payload))
         except OutboxDeferredError:
             self._defer(message_id)
             return False
@@ -335,10 +407,17 @@ class OutboxDrainer:
         self._mark_delivered(message_id, kind, payload)
         return True
 
-    def _send_with_rate_limit(self, text: str, *, consume_attempt: bool = True) -> None:
+    def _send_with_rate_limit(self, text: str, *, consume_attempt: bool = True, markup: dict[str, Any] | None = None) -> None:
         for attempt in range(RATE_LIMIT_RETRIES + 1):
             try:
-                self.transport.send(text)
+                # A transport that cannot carry a keyboard still gets the text: the
+                # prompt says which buttons the message *would* have, and a fake or
+                # older transport keeps working unchanged.
+                send_with_markup = getattr(self.transport, "send_markup", None)
+                if markup is not None and callable(send_with_markup):
+                    send_with_markup(text, markup)
+                else:
+                    self.transport.send(text)
                 return
             except OutboxRateLimitError as exc:
                 self._rate_limit_pause(exc.retry_after)

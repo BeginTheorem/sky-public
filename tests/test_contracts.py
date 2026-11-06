@@ -20,6 +20,40 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(parse_json_value("null"))
         self.assertEqual(parse_json_value('prose\n```json\n[1, 2]\n```'), [1, 2])
 
+    def test_corrective_reask_names_the_attempted_tool_calls(self) -> None:
+        """The re-ask must say what the model did, not just that it failed.
+
+        Measured 2026-09-28: 29 of 149 Finish turns came back with tool calls and
+        empty text although the request carried no tool definitions, and the old
+        generic warning ("the reply was not one JSON object") let the model
+        answer with another tool call -- 11 ``finish_repair_failed`` events with
+        ``report_chars=0``. Naming the call is the actionable feedback Huang et
+        al. (arXiv:2310.01798v2) require instead of a blind resample.
+        """
+        from skynet.model_contracts import MAX_MODEL_REASKS, corrective_reask_instruction, render_tool_calls
+        from skynet.models import ToolCall
+
+        self.assertEqual(MAX_MODEL_REASKS, 3)
+        calls = [ToolCall("bash", {"command": "ls -la"}), ToolCall("read", {"path": "/tmp/x"})]
+        rendered = render_tool_calls(calls)
+        self.assertIn("bash(", rendered)
+        self.assertIn("ls -la", rendered)
+        self.assertIn("read(", rendered)
+        instruction = corrective_reask_instruction(phase="finish", tool_calls=calls, parser_error="Finish Report invalid: empty")
+        self.assertIn("called tools that do not exist in this phase", instruction)
+        self.assertIn("were NOT executed", instruction)
+        self.assertIn("Parser error: Finish Report invalid: empty", instruction)
+        self.assertIn("Return only one JSON object", instruction)
+        # Without a tool call the warning stays generic but still restates the shape.
+        plain = corrective_reask_instruction(phase="memory loop")
+        self.assertIn("was not a usable answer", plain)
+        self.assertIn("no tool calls", plain)
+        # Both the number of calls and the argument text are bounded.
+        many = [ToolCall(f"t{index}", {"x": "y" * 500}) for index in range(5)]
+        shown = render_tool_calls(many)
+        self.assertIn("... and 2 more", shown)
+        self.assertLess(len(shown), 1200)
+
     def test_finish_and_memory_contracts_still_reject_non_objects(self) -> None:
         from skynet.memory import MemoryLoop
         from skynet.model_contracts import parse_json_object

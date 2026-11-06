@@ -38,6 +38,16 @@ def test_check_integrity_invalid_json(tmp_path):
     assert violations[0][0] == "registry"
 
 
+def test_check_integrity_missing_file_is_not_a_violation(tmp_path):
+    """A registry that does not exist yet is empty, not corrupt.
+
+    ``_read_proposals`` already treats an absent file as ``{}``; the integrity
+    check must agree, otherwise a freshly deployed organism (its ``state/`` just
+    created) logs a bogus "unreadable registry" violation on every start.
+    """
+    assert check_registry_integrity(tmp_path / "absent.json") == []
+
+
 def test_check_integrity_flags_anchor_reason_code_drift(tmp_path):
     """A persisted anchor verdict must agree with the rest of its record.
 

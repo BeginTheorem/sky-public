@@ -84,6 +84,12 @@ VALENCE_PRIOR = 0.5
 VALENCE_WINDOW_DRAWS = 20.0
 VALENCE_TILT_WEIGHT = 0.5
 
+# How many archived ideas one "nothing in the pool" cycle may look at before it
+# concludes the archive is spent. An idea is either materialized (the cycle has
+# work) or retired for having already been run, so this bounds work per cycle
+# without filtering anything: the archive's cell rule still picks the order.
+ARCHIVE_SAMPLE_ATTEMPTS = 5
+
 
 def valence_decidable_band(base: float, *, weight: float = VALENCE_TILT_WEIGHT) -> tuple[float, float]:
     """The interval of thresholds the channel can reach from a base threshold.
@@ -250,6 +256,7 @@ class PortfolioPlanner:
         epsilon: float = 0.0,
         hypothesis_ttl_days: float = 30.0,
         cell_scarcity_weight: float = 0.20,
+        outward_weight: float = 0.0,
         valence: tuple[float, int] | None = None,
         tilt_weight: float = VALENCE_TILT_WEIGHT,
     ) -> None:
@@ -258,6 +265,13 @@ class PortfolioPlanner:
         self.epsilon = max(0.0, min(float(epsilon), 1.0))
         self.hypothesis_ttl_days = max(0.0, float(hypothesis_ttl_days))
         self.cell_scarcity_weight = max(0.0, min(float(cell_scarcity_weight), 1.0))
+        # Owner-directed exploration bias, not a criterion: the curated outward
+        # agenda sits at goal priority 1.0, so on criticality alone it loses to a
+        # 4.0 harness goal on every cycle and the organism only ever polishes its
+        # own skeleton. The bonus lifts an outward (roadmap) candidate back into
+        # contention while staying below the criticality weight, so genuinely
+        # critical harness work still wins when it is fresh.
+        self.outward_weight = max(0.0, float(outward_weight))
         # The charge is passed in and never read here: the caller owns the window
         # (one charge per selection), so the tilt stays a pure function of an
         # argument and a replay can reproduce it from the journal alone.
@@ -276,10 +290,27 @@ class PortfolioPlanner:
         # write one decision whose reason reflects the whole selection step.
         self._pending_decision: tuple[list[PlannerCandidate], PlannerCandidate | None, str, float | None] | None = None
 
-    def _cell_for(self, row: dict[str, Any]) -> str:
+    def _cell_for(self, row: dict[str, Any], cells_by_task: dict[str, str] | None = None) -> str:
+        task_id = str(row.get("task_id") or "")
+        if cells_by_task and task_id in cells_by_task:
+            return cells_by_task[task_id]
         from .idea_archive import cell_key
         area = str(row.get("area") or "general").lower()
         return cell_key(_SUBSYSTEM_BY_AREA.get(area, "general"), "workflow", "own-repo")
+
+    def _cells_by_task(self) -> dict[str, str]:
+        """The true archive cell of every materialized idea, keyed by its task.
+
+        Only an archived idea carries a model-chosen three-axis descriptor, so a
+        materialized task is scored against its real cell; a task the planner
+        generated itself has none and falls back to the area->subsystem mapping
+        rather than inventing a descriptor. A read failure degrades to the
+        fallback, never raises into ranking.
+        """
+        try:
+            return dict(self.store.idea_cells_by_task())
+        except Exception:
+            return {}
 
     def _cell_scarcity(self) -> dict[str, float]:
         """1/(1+occupancy) per filled cell: an empty direction outranks a crowded one.
@@ -298,6 +329,7 @@ class PortfolioPlanner:
     def rank(self) -> list[PlannerCandidate]:
         rows = self.store.planner_candidates(limit=1000, terminal_ttl_days=self.hypothesis_ttl_days)
         scarcity = self._cell_scarcity()
+        cells_by_task = self._cells_by_task()
         best_by_workstream: dict[str, PlannerCandidate] = {}
         seen_fingerprints: set[str] = set()
         seen_structural_fingerprints: set[str] = set()
@@ -320,13 +352,15 @@ class PortfolioPlanner:
             # forever while alternatives exist.
             attempt_penalty = 0.1 * min(attempts, 5)
             expected_value = max(0.0, min(float(row.get("area_success_rate") or 0.0), 1.0))
-            cell = self._cell_for(row)
+            cell = self._cell_for(row, cells_by_task)
             cell_scarcity = scarcity.get(cell, 1.0)
+            outward = self.outward_weight if str(row.get("area") or "").lower() == "roadmap" else 0.0
             score = (
                 0.40 * criticality
                 + 0.30 * novelty
                 + 0.15 * expected_value
                 + self.cell_scarcity_weight * cell_scarcity
+                + outward
                 - 0.35 * repetition
                 - attempt_penalty
             )
@@ -420,12 +454,21 @@ class PortfolioPlanner:
         ).fetchone()
         if goal is None:
             return None
-        parents = self.store.sample_archive_parents(k=1)
-        if not parents:
-            return None
-        task_id = self.store.materialize_idea(str(parents[0]["idea_id"]), str(goal["goal_id"]))
+        for parent in self.store.sample_archive_parents(k=ARCHIVE_SAMPLE_ATTEMPTS):
+            task_id = self.store.materialize_idea(str(parent["idea_id"]), str(goal["goal_id"]))
+            if not task_id:
+                # A spent idea: it already ran, so it was retired rather than
+                # re-materialized. The next sampled candidate gets the chance.
+                continue
+            if record:
+                self.store.record_planner_decision([], None, reason="archive_materialized")
+            else:
+                self._pending_decision = ([], None, "archive_materialized", None)
+            return self.store.task_work(task_id)
+        # Every candidate this cycle looked at had already been run. Saying so is
+        # the honest answer: an archive of spent ideas is not a portfolio.
         if record:
-            self.store.record_planner_decision([], None, reason="archive_materialized")
+            self.store.record_planner_decision([], None, reason="archive_spent")
         else:
-            self._pending_decision = ([], None, "archive_materialized", None)
-        return self.store.task_work(task_id)
+            self._pending_decision = ([], None, "archive_spent", None)
+        return None

@@ -143,7 +143,7 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(pairs[0]["report"]["summary"], "Second run finished cleanly.")
             store.close()
 
-    def test_render_recent_flattens_two_blocks_per_run(self) -> None:
+    def test_render_recent_is_one_dense_block_per_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             goal_id = store.add_goal("reporting", priority=1.0)
@@ -160,16 +160,17 @@ class ReportingTests(unittest.TestCase):
 
             rendered = render_recent(store, 5)
 
-            self.assertEqual(len(rendered), 2)
-            scheduler, report = rendered
-            self.assertTrue(scheduler.startswith("SCHEDULER"))
-            self.assertIn("Fix the reporting pipeline", scheduler)
-            self.assertIn("highest novelty-adjusted criticality", scheduler)
-            self.assertTrue(report.startswith("REPORT"))
-            self.assertIn("status: COMPLETED", report)
-            self.assertIn("Replaced the prose wall with structured blocks.", report)
-            self.assertIn("tools: bash x2, read x1", report)
-            self.assertIn("criteria: 2/2", report)
+            self.assertEqual(len(rendered), 1, "one message per run, not two")
+            block = rendered[0]
+            for expected in (
+                "Fix the reporting pipeline",  # what the planner chose
+                "highest novelty-adjusted criticality",  # and why
+                "Replaced the prose wall with structured blocks.",  # what came out
+                "завершён",
+                "тулы: bash×2, read×1",
+                "критериев 2/2",
+            ):
+                self.assertIn(expected, block)
             store.close()
 
     def test_render_pairs_preserves_order(self) -> None:
@@ -178,11 +179,11 @@ class ReportingTests(unittest.TestCase):
             {"scheduler": {"found": False, "started_at": "2026-09-18T14:00:00+00:00"}, "report": {"status": "FAILED", "finished_at": "2026-09-18T14:05:00+00:00"}},
         ]
         rendered = render_pairs(pairs)
-        self.assertEqual(len(rendered), 4)
-        self.assertIn("15:00", rendered[0])
-        self.assertIn("BLOCKED", rendered[1])
-        self.assertIn("14:00", rendered[2])
-        self.assertIn("FAILED", rendered[3])
+        self.assertEqual(len(rendered), 2, "one block per run")
+        self.assertIn("15:05", rendered[0])
+        self.assertIn("заблокирован", rendered[0])
+        self.assertIn("14:05", rendered[1])
+        self.assertIn("сбой", rendered[1])
 
     def test_run_without_planner_decision_renders_placeholder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -203,8 +204,9 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(len(pairs), 1)
             self.assertFalse(pairs[0]["scheduler"]["found"])
             rendered = render_recent(store, 5)
-            self.assertIn("no planner decision", rendered[0])
-            self.assertIn("status: NEEDS_RECOVERY", rendered[1])
+            self.assertEqual(len(rendered), 1)
+            self.assertIn("решения нет", rendered[0])
+            self.assertIn("нужно восстановление", rendered[0])
             store.close()
 
 

@@ -26,11 +26,22 @@ from uuid import uuid4
 
 import socks
 
-from . import metrics
+from . import metrics, status_card
 from .outbox import OutboxDrainer, TelegramTransport
-from .providers import money_boost_state_path
+from .providers import (
+    active_chain_names,
+    applied_chain_names,
+    configured_provider_names,
+    context_ceiling_tokens,
+    load_provider_prefs,
+    money_boost_enabled,
+    provider_class,
+    set_provider_off,
+)
+from .revive import PARK_FILE, clear_park, park_state, set_park
 from .store import StateStore
-from .time import display_timestamp
+from .systemctl import systemctl_command
+from .telegram_ui import help_keyboard, logs_keyboard, parse_callback, providers_keyboard, status_keyboard
 
 log = logging.getLogger("skynet.telegram")
 MAX_MESSAGE = 3900
@@ -90,7 +101,6 @@ MAX_LOG_RUNS = 10
 NO_LOGS_TEXT = "Логов пока нет."
 SECRET_RE = re.compile(r"(?i)(token|api[_-]?key|password|secret)=\S+")
 BOT_TOKEN_RE = re.compile(r"\d{8,12}:[A-Za-z0-9_-]{30,}")
-SENSITIVE_KEYS = {"reasoning_content", "api_key", "token", "password", "secret"}
 
 
 def outbox_enabled() -> bool:
@@ -109,22 +119,6 @@ def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
         return max(minimum, int(os.getenv(name, str(default))))
     except (TypeError, ValueError):
         return default
-def runtime_event_kind(record: dict[str, Any]) -> str:
-    """Return the operational kind for direct and wrapped runtime events."""
-    payload = record.get("payload")
-    if record.get("kind") == "event" and isinstance(payload, dict):
-        nested = payload.get("event_kind")
-        if isinstance(nested, str):
-            return nested
-    return str(record.get("kind", "event"))
-TELEGRAM_EVENT_KINDS = {
-    "run_started", "run_finished", "run_failure", "tool_call", "tool_result",
-    "tool_failure", "tool_retry", "provider_error_classified", "provider_retry",
-    "finish_report", "emergency_finish",
-    "memory_loop_started", "memory_loop_finished", "memory_loop_failed", "memory_consolidated",
-    "proposal_created", "proposal_failed",
-    "supervisor_start", "supervisor_stop", "watchdog_timeout", "owner_stop",
-}
 
 
 class TelegramRateLimitError(RuntimeError):
@@ -268,36 +262,6 @@ def chunk_html(text: str, limit: int = MAX_MESSAGE) -> list[str]:
     return parts or ["(empty)"]
 
 
-def sanitize(value: Any, key: str = "") -> Any:
-    """Remove reasoning and credential-shaped fields before remote delivery."""
-    if key.lower() in SENSITIVE_KEYS or key.lower().endswith("_token"):
-        return "[redacted]"
-    if isinstance(value, dict):
-        return {name: sanitize(item, name) for name, item in value.items() if name.lower() not in SENSITIVE_KEYS}
-    if isinstance(value, list):
-        return [sanitize(item) for item in value]
-    return value
-
-
-def format_runtime_record(record: dict[str, Any]) -> str:
-    timestamp = "unknown time"
-    if record.get("timestamp"):
-        try:
-            timestamp = display_timestamp(str(record["timestamp"]))
-        except (TypeError, ValueError):
-            log.warning("ignoring invalid runtime timestamp=%r", record.get("timestamp"))
-    kind = runtime_event_kind(record)
-    run_id = record.get("run_id")
-    payload = record.get("payload", {})
-    if record.get("kind") == "event" and isinstance(payload, dict):
-        payload = payload.get("payload", payload)
-    payload = sanitize(payload)
-    prefix = f"[{timestamp}] {kind}"
-    if run_id:
-        prefix += f" run={run_id}"
-    return redact(prefix + "\n" + json.dumps(payload, ensure_ascii=False, indent=2, default=str))
-
-
 class TelegramAPI:
     def __init__(self, token: str, proxy: str, timeout: float = 45.0) -> None:
         self.base = f"https://api.telegram.org/bot{token}/"
@@ -316,12 +280,12 @@ class TelegramAPI:
                     parsed = parse.urlparse(self.proxy)
                     if parsed.hostname is None or parsed.port is None:
                         raise ValueError("Telegram proxy must include host and port")
-                    # Keep hostname resolution inside Tor so the proxy can choose
+                    # Keep hostname resolution inside the proxy so it can choose
                     # a reachable address instead of receiving a stale local IP.
                     socks.set_default_proxy(socks.SOCKS5, parsed.hostname, parsed.port, rdns=True)
                     socket.socket = socks.socksocket
                     # Preserve the hostname in the sockaddr so PySocks performs
-                    # remote DNS through Tor, while avoiding IPv6 socket attempts.
+                    # remote DNS through the proxy, while avoiding IPv6 socket attempts.
                     def ipv4_getaddrinfo(host, port, _family=0, type=0, proto=0, _flags=0):
                         return [(socket.AF_INET, type or socket.SOCK_STREAM, proto, "", (host, port))]
 
@@ -346,9 +310,40 @@ class TelegramAPI:
             raise ApiError(str(result.get("description", "")), result)
         return result
 
-    def send(self, chat_id: int, text: str) -> None:
-        for part in chunk_html(redact(text)):
-            self.call("sendMessage", {"chat_id": chat_id, "text": part, "parse_mode": "HTML"})
+    def send(self, chat_id: int, text: str, markup: dict[str, Any] | None = None) -> None:
+        parts = chunk_html(redact(text))
+        for position, part in enumerate(parts):
+            payload: dict[str, Any] = {"chat_id": chat_id, "text": part, "parse_mode": "HTML"}
+            if markup is not None and position == len(parts) - 1:
+                payload["reply_markup"] = markup
+            self.call("sendMessage", payload)
+
+    def edit_message(self, chat_id: int, message_id: int, text: str, markup: dict[str, Any] | None = None) -> bool:
+        """Rewrite one message in place; returns False when nothing had to change.
+
+        Telegram answers ``400 message is not modified`` when the text and keyboard are
+        identical, which is the refresh button pressed twice rather than a failure — and
+        an edited card beats a chat that grows a new status message per tap. Long text
+        falls back to the caller's own chunked send: an edit cannot be split.
+        """
+        parts = chunk_html(redact(text))
+        if len(parts) != 1:
+            return False
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": parts[0], "parse_mode": "HTML"}
+        if markup is not None:
+            payload["reply_markup"] = markup
+        try:
+            self.call("editMessageText", payload)
+            return True
+        except ApiError as exc:
+            if "not modified" in str(exc).lower():
+                return False
+            raise
+
+    def answer_callback(self, callback_id: str, text: str) -> None:
+        """Toast for a button tap. A failure here must not break the action it acknowledges."""
+        with contextlib.suppress(Exception):
+            self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:200]})
 
 
 class PrivateBot:
@@ -467,19 +462,28 @@ class PrivateBot:
 
     def execute(self, chat_id: int, command: str, argument: str) -> None:
         if command == "/help":
-            self.api.send(chat_id, "Команды: /status [дни], /alerts, /metrics, /answer <текст>, /start, /stop, /restart, /provider, /provider_on, /provider_off, /reset_memory, /logs [число]. Обычный текст без «/» уходит организму как сообщение.")
+            self.api.send(
+                chat_id,
+                "Канал управления SkyNet.\n"
+                "/status — карточка состояния (кнопки: обновить, логи, метрики)\n"
+                "/logs [число] — последние прогоны\n"
+                "/metrics — метрики и ресурсы\n"
+                "/alerts — оповещения\n"
+                "/provider — провайдеры и money-boost\n"
+                "/answer [id] <текст> — ответить на открытый вопрос; у вопроса есть кнопки\n"
+                "/start | /stop | /restart — сервис\n"
+                "/reset_memory | /provider_on | /provider_off — обслуживание\n"
+                "Обычный текст без «/» уходит организму как сообщение.",
+                help_keyboard(),
+            )
         elif command == "/status":
-            self.send_metrics(chat_id, argument, verbose=False)
+            self.send_card(chat_id)
         elif command == "/metrics":
             self.send_metrics(chat_id, argument, verbose=True)
         elif command == "/alerts":
             self.send_alerts(chat_id)
-        elif command == "/provider":
-            path = money_boost_state_path()
-            enabled = False
-            with contextlib.suppress(OSError, ValueError, TypeError, json.JSONDecodeError):
-                enabled = bool(json.loads(path.read_text()).get("enabled", False))
-            self.api.send(chat_id, json.dumps({"money_boost": enabled, "state_path": str(path)}, ensure_ascii=False))
+        elif command in {"/provider", "/providers"}:
+            self.send_providers(chat_id)
         elif command in {"/provider_on", "/provider_off"}:
             self.confirm(chat_id, "provider_on" if command.endswith("on") else "provider_off")
         elif command in {"/stop", "/restart", "/reset_memory"}:
@@ -750,7 +754,8 @@ class PrivateBot:
             return DEFAULT_LOG_RUNS
         return min(MAX_LOG_RUNS, max(1, value))
 
-    def send_metrics(self, chat_id: int, argument: str, *, verbose: bool) -> None:
+    def status_text(self, argument: str = "", *, verbose: bool = False) -> str:
+        """The status card's text, so the /status command and its button cannot drift apart."""
         data = metrics.snapshot(
             self.store(),
             since_days=self.status_days(argument),
@@ -766,7 +771,28 @@ class PrivateBot:
                 default=str,
             )
             text = f"{text}\n\n{extra}"
-        self.api.send(chat_id, text)
+        return text
+
+    def card_text(self) -> str:
+        """The status card: what she is doing *now*, not a window of statistics.
+
+        ``/metrics`` keeps the aggregate dump; this is the one screen the owner opens to
+        learn whether she is alive, busy, stuck, waiting for him, and whether the running
+        code is the committed code.
+        """
+        return status_card.card(
+            self.store(),
+            service=self.service,
+            repo=self.state_path.parent.parent,
+            state_dir=self.state_path.parent,
+            registry_path=self.state_path.parent / "self-improvement-proposals.json",
+        )
+
+    def send_card(self, chat_id: int) -> None:
+        self.api.send(chat_id, self.card_text(), status_keyboard())
+
+    def send_metrics(self, chat_id: int, argument: str, *, verbose: bool) -> None:
+        self.api.send(chat_id, self.status_text(argument, verbose=verbose), status_keyboard())
 
     def send_alerts(self, chat_id: int) -> None:
         alerts = sorted(
@@ -784,12 +810,22 @@ class PrivateBot:
         self.api.send(chat_id, "\n".join(lines))
 
     def systemctl(self, chat_id: int, action: str) -> None:
+        # The park is written BEFORE the unit moves: the revive timer ticks every 30
+        # minutes and a stop it does not know about is a stop it undoes -- the owner's
+        # 22:07:54 `/stop` came back at 01:00:30 exactly that way, and his own voice
+        # command has to beat a timer. The path is the bot's own ledger: one file,
+        # named by whoever knows where the state lives.
+        park_file = self.state_path.with_name(PARK_FILE)
+        if action == "stop":
+            set_park("owner /stop from the Telegram bot", park_file)
+        elif action == "start":
+            clear_park(park_file)
         try:
-            result = subprocess.run(["systemctl", action, self.service], capture_output=True, text=True, timeout=20)
+            result = subprocess.run(systemctl_command(action, self.service), capture_output=True, text=True, timeout=20)
         except subprocess.TimeoutExpired:
             self.api.send(chat_id, f"{action}: timeout; проверяю фактическое состояние")
             try:
-                state = subprocess.run(["systemctl", "is-active", self.service], capture_output=True, text=True, timeout=10)
+                state = subprocess.run(systemctl_command("is-active", self.service), capture_output=True, text=True, timeout=10)
                 actual = state.stdout.strip() or state.stderr.strip() or "unknown"
                 self.api.send(chat_id, f"{action}: {actual}")
             except subprocess.TimeoutExpired:
@@ -799,7 +835,7 @@ class PrivateBot:
         if result.returncode:
             self.api.send(chat_id, f"{action}: failed\n{result.stderr.strip()}")
             return
-        state = subprocess.run(["systemctl", "is-active", self.service], capture_output=True, text=True, timeout=10)
+        state = subprocess.run(systemctl_command("is-active", self.service), capture_output=True, text=True, timeout=10)
         actual = state.stdout.strip() or state.stderr.strip() or "unknown"
         self.api.send(chat_id, f"{action}: {actual}")
 
@@ -827,10 +863,77 @@ class PrivateBot:
             log.exception("could not render recent run logs")
             messages = []
         if not messages:
-            self.api.send(chat_id, NO_LOGS_TEXT)
+            self.api.send(chat_id, NO_LOGS_TEXT, logs_keyboard(limit))
             return
-        for message in messages:
-            self.api.send(chat_id, message)
+        for position, message in enumerate(messages):
+            # The window buttons ride the last message only: a keyboard belongs to the
+            # message it sits on, and one set of controls is enough.
+            self.api.send(chat_id, message, logs_keyboard(limit) if position == len(messages) - 1 else None)
+
+    def providers_text(self) -> str:
+        """The rung list the owner switches, in the three states he must tell apart.
+
+        ON, switched off from the phone (and therefore waiting for the next heartbeat)
+        and parked by an ``*_ENABLED`` flag in the environment all look identical from
+        inside the chain, so the card names every one. The flags are the owner's older
+        switches and this command does not touch them; what it changes is only the
+        desired state the reactor copies across at the next tick.
+        """
+        configured = configured_provider_names()
+        off = {str(item) for item in load_provider_prefs()["off"]}
+        live = set(active_chain_names())
+        applied = applied_chain_names()
+        paid = [name for name in configured if provider_class(name) == "paid"]
+        free = [name for name in configured if provider_class(name) != "paid"]
+
+        def line(name: str) -> str:
+            mark = "✅" if name in live else "⛔"
+            if name in off:
+                state = "выключен тобой"
+            elif name not in live:
+                state = "запаркован флагом"
+            else:
+                state = "работает"
+            return f"{mark} {name} — {state}"
+
+        active = next((name for name in configured if name in live), "")
+        waiting = [name for name in configured if applied is not None and (name in live) != (name in applied)]
+        boost = money_boost_enabled()
+        lines = ["🧠 Провайдеры", "", "Платные:", *[line(name) for name in paid], "Бесплатные:", *[line(name) for name in free], ""]
+        lines.append(f"Цепочка: {len(live)} из {len(configured)} рангов")
+        if active:
+            lines.append(f"Потолок класса {provider_class(active)}: {context_ceiling_tokens(active)} токенов — по первому живому рангу")
+        if waiting:
+            lines.append("Ждут следующего heartbeat: " + ", ".join(waiting))
+        lines.append(f"Money boost: {'вкл' if boost else 'выкл'}")
+        lines.append(f"Стоянка владельца: {'да' if park_state(self.state_path.with_name(PARK_FILE)) else 'нет'}")
+        return "\n".join(lines)
+
+    def send_providers(self, chat_id: int, message_id: Any = None) -> None:
+        """Render the provider card, in place when it was tapped from a card."""
+        live = set(active_chain_names())
+        entries = [(f"{'✅' if name in live else '⛔'} {name}", name) for name in configured_provider_names()]
+        text = self.providers_text()
+        keyboard = providers_keyboard(entries)
+        if isinstance(message_id, int) and self.api.edit_message(chat_id, message_id, text, keyboard):
+            return
+        self.api.send(chat_id, text, keyboard)
+
+    def toggle_provider(self, args: list[str], callback_id: str, message_id: Any = None) -> None:
+        """Flip one rung's owner switch (DESIRED state only) and re-render the card.
+
+        Nothing about the running chain changes here: the reactor copies the desired
+        state into the applied chain at the next heartbeat, so the toast says what will
+        happen instead of implying the ladder already moved.
+        """
+        if not args:
+            self.api.answer_callback(callback_id, "Кнопка устарела")
+            return
+        name = args[0]
+        off_now = name in {str(item) for item in load_provider_prefs()["off"]}
+        set_provider_off(name, not off_now)
+        self.api.answer_callback(callback_id, f"{name}: {'включён' if off_now else 'выключен'} — со следующего heartbeat")
+        self.send_providers(self.allowed_chat, message_id)
 
     def process(self, update: dict[str, Any]) -> None:
         update_id = update.get("update_id")
@@ -842,13 +945,7 @@ class PrivateBot:
             return
         callback = update.get("callback_query")
         if callback:
-            action = str(callback.get("data", ""))
-            log.info("authorized Telegram callback=%s chat_id=%s", action, self.allowed_chat)
-            self.api.call("answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": "Принято"})
-            if action == "cancel":
-                self.api.send(self.allowed_chat, "Отменено.")
-            elif action.startswith("confirm:"):
-                self.confirm(self.allowed_chat, action.split(":", 1)[1])
+            self.handle_callback(callback)
             return
         message = update.get("message")
         if message and isinstance(message.get("text"), str):
@@ -860,6 +957,95 @@ class PrivateBot:
             else:
                 log.info("authorized Telegram message chat_id=%s", self.allowed_chat)
                 self.handle_freeform(self.allowed_chat, text, message)
+
+    def handle_callback(self, callback: dict[str, Any]) -> None:
+        """Route one button tap. Authorization already happened in ``process``.
+
+        Each kind maps onto the same code path its text command uses — answering a
+        question, running a service action, rendering a card — so a button and a typed
+        command can never drift apart, and the callback grammar (``telegram_ui``) carries
+        actions only, never text to execute.
+        """
+        data = str(callback.get("data", ""))
+        callback_id = str(callback.get("id", ""))
+        log.info("authorized Telegram callback=%s chat_id=%s", data, self.allowed_chat)
+        kind, args = parse_callback(data)
+        raw_message = callback.get("message")
+        message: dict[str, Any] = raw_message if isinstance(raw_message, dict) else {}
+        message_id = message.get("message_id")
+        if kind == "cancel":
+            self.api.answer_callback(callback_id, "Отменено")
+            self.api.send(self.allowed_chat, "Отменено.")
+        elif kind == "confirm":
+            self.api.answer_callback(callback_id, "Принято")
+            self.confirm(self.allowed_chat, args[0] if args else "")
+        elif kind == "q":
+            self.api.answer_callback(callback_id, self.answer_from_button(args, message))
+        elif kind == "pv":
+            self.toggle_provider(args, callback_id, message_id)
+        elif kind == "ui":
+            self.api.answer_callback(callback_id, "Принято")
+            self.run_card_action(args, message_id)
+        else:
+            self.api.answer_callback(callback_id, "Кнопка устарела")
+
+    def answer_from_button(self, args: list[str], message: dict[str, Any]) -> str:
+        """Record the answer a question button stands for; returns the toast text.
+
+        The option index is resolved against the question the store still holds open, not
+        against the label printed on the button: the store's options are the authority, and
+        a question that expired or was answered meanwhile is reported as closed instead of
+        being answered twice. This is also how a sudo approval is granted — the question
+        simply carries ``Разрешить`` / ``Запретить`` as its options.
+        """
+        if len(args) < 2:
+            return "Кнопка устарела"
+        short_id, index_text = args[0], args[1]
+        open_questions = self.store().open_questions()
+        matches = [item for item in open_questions if str(item["question_id"]).startswith(short_id)]
+        if len(matches) != 1:
+            return "Вопрос уже закрыт"
+        question = matches[0]
+        raw_options = question.get("options")
+        options: list[Any] = raw_options if isinstance(raw_options, list) else []
+        if not options:
+            return "Кнопка устарела"
+        try:
+            answer = str(options[int(index_text)]).strip()
+        except (IndexError, TypeError, ValueError):
+            return "Кнопка устарела"
+        if not answer:
+            return "Кнопка устарела"
+        question_id = str(question["question_id"])
+        if not self.store().answer_question(question_id, answer, source="telegram-button"):
+            return "Вопрос уже закрыт"
+        self.store().add_inbox_event(
+            str(uuid4()), "user_answer", {"question_id": question_id, "answer": answer, "source": "telegram-button"}
+        )
+        if isinstance(message.get("message_id"), int) and isinstance(message.get("text"), str):
+            # Strip the keyboard: the question is answered, and a live button would lie.
+            message_id = message["message_id"]
+            self.api.edit_message(self.allowed_chat, message_id, f"{message['text']}\n\n✅ ответ: {answer}")
+        return f"Ответ: {answer}"
+
+    def run_card_action(self, args: list[str], message_id: Any) -> None:
+        """A card button: refresh in place when it came from a card, else send the view."""
+        action = args[0] if args else ""
+        if action == "status":
+            text = self.card_text()
+            if isinstance(message_id, int) and self.api.edit_message(self.allowed_chat, message_id, text, status_keyboard()):
+                return
+            self.api.send(self.allowed_chat, text, status_keyboard())
+        elif action == "logs":
+            self.send_logs(self.allowed_chat, self.log_run_limit(args[1] if len(args) > 1 else ""))
+        elif action == "metrics":
+            self.send_metrics(self.allowed_chat, "", verbose=True)
+        elif action == "alerts":
+            self.send_alerts(self.allowed_chat)
+        elif action == "provider":
+            self.send_providers(self.allowed_chat, message_id)
+        else:
+            self.api.send(self.allowed_chat, "Неизвестная кнопка.")
 
     def _drain_safely(self) -> None:
         try:
@@ -873,6 +1059,54 @@ class PrivateBot:
         except Exception:
             log.warning("could not notify Telegram command failure")
 
+    def _confirm_backlog(self) -> int:
+        """Confirm a pending Telegram backlog on a cold start without executing it.
+
+        A missing offset file means fresh state (redeploy, purge, state reset):
+        Telegram would then replay every pending update still inside its 24h
+        window, and a stale ``/stop`` left in that backlog would stop the service
+        seconds after it comes up. ``getUpdates(offset=-1)`` returns only the
+        newest update and confirms everything older as soon as the next call uses
+        the returned offset, so a cold start resumes from *now* and never runs a
+        command sent before this process existed. With nothing pending the offset
+        stays 0. Called inside the poll loop so a transient failure is retried by
+        the loop's own handler instead of falling back to a replay.
+        """
+        pending = self.api.call("getUpdates", {"offset": -1, "timeout": 0, "allowed_updates": ALLOWED_UPDATES}).get("result", [])
+        offset = max((int(update["update_id"]) for update in pending), default=-1) + 1
+        self.save_number(self.offset_path, offset)
+        if pending:
+            log.info("cold start: confirmed %d pending Telegram update(s) without executing them; resuming at offset=%d", len(pending), offset)
+        return offset
+
+    def register_commands(self) -> None:
+        """Publish the command menu for this chat; a failure is cosmetic, never fatal.
+
+        The menu is what turns a chat into an interface: the owner types one letter and
+        taps. Scoped to the owner's chat so the bot cannot advertise itself anywhere else,
+        and re-published on every start because the description text lives here, in code.
+        """
+        commands = [
+            {"command": "status", "description": "карточка состояния"},
+            {"command": "logs", "description": "последние прогоны"},
+            {"command": "metrics", "description": "метрики и ресурсы"},
+            {"command": "alerts", "description": "оповещения"},
+            {"command": "providers", "description": "ранги провайдеров: включить/выключить"},
+            {"command": "answer", "description": "ответить на открытый вопрос"},
+            {"command": "start", "description": "запустить сервис"},
+            {"command": "stop", "description": "остановить сервис"},
+            {"command": "restart", "description": "перезапустить сервис"},
+            {"command": "reset_memory", "description": "сбросить короткую память"},
+            {"command": "help", "description": "список команд и кнопки"},
+        ]
+        try:
+            self.api.call(
+                "setMyCommands",
+                {"commands": commands, "scope": {"type": "chat", "chat_id": self.allowed_chat}},
+            )
+        except Exception:
+            log.warning("could not register the Telegram command menu", exc_info=True)
+
     def run(self) -> None:
         startup_delay = 5.0
         while not self._stop.is_set():
@@ -883,10 +1117,15 @@ class PrivateBot:
                 log.warning("Telegram API startup failed; retrying in %.1fs: %s", startup_delay, exc)
                 self._stop.wait(startup_delay)
                 startup_delay = min(60.0, startup_delay * 2)
-        offset = self.load_number(self.offset_path)
+        offset = self.load_number(self.offset_path, default=-1)
+        backlog_confirmed = offset >= 0
         self._drain_safely()
+        self.register_commands()
         while not self._stop.is_set():
             try:
+                if not backlog_confirmed:
+                    offset = self._confirm_backlog()
+                    backlog_confirmed = True
                 updates = self.api.call("getUpdates", {"offset": offset, "timeout": POLL_TIMEOUT, "allowed_updates": ALLOWED_UPDATES}).get("result", [])
                 for update in updates:
                     next_offset = max(offset, int(update["update_id"]) + 1)
@@ -924,7 +1163,7 @@ def main() -> int:
     except (KeyError, ValueError):
         log.exception("Telegram allowlist is not configured")
         return 2
-    proxy = os.getenv("SKYNET_TELEGRAM_PROXY", "socks5://127.0.0.1:9050")
+    proxy = os.getenv("SKYNET_TELEGRAM_PROXY", "")
     bot = PrivateBot(TelegramAPI(token, proxy), Path(args.state), user, chat, args.service)
     bot.install_signal_handlers()
     bot.run()

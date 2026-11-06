@@ -87,7 +87,12 @@ class RetentionProofTests(unittest.TestCase):
             self.assertEqual(reactor.tick("retention-proof"), RunStatus.COMPLETED)
             connection = reactor.store.connection
 
-            kept = {str(row[0]) for row in connection.execute("SELECT run_id FROM runs ORDER BY rowid DESC LIMIT ?", (KEEP_RUNS,)).fetchall()}
+            kept = {str(row[0]) for row in connection.execute("SELECT run_id FROM runs WHERE kind='build' ORDER BY rowid DESC LIMIT ?", (KEEP_RUNS,)).fetchall()}
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM transcript WHERE run_id IN (SELECT run_id FROM runs WHERE kind='memory')").fetchone()[0],
+                0,
+                "a consolidation pass owns no transcript rows, so the window counts episodes",
+            )
             aged = tuple(f"run-{index:03d}" for index in range(SEEDED_RUNS) if f"run-{index:03d}" not in kept)
             fresh = tuple(f"run-{index:03d}" for index in range(SEEDED_RUNS) if f"run-{index:03d}" in kept)
             self.assertTrue(aged, "the seed must exceed the window")

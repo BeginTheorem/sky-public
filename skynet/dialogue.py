@@ -56,7 +56,8 @@ class AskUserTool(Tool):
                     "inbox message and as a memory. Non-blocking by default: wait_seconds=0 queues "
                     "the question and keeps working. Passing wait_seconds>0 blocks up to that long "
                     "for an answer; if none arrives, continue on your own explicit assumption and "
-                    "record it."
+                    "record it. Write the question and its options to the owner in Russian, "
+                    "referring to yourself in the feminine."
                 ),
                 "parameters": {
                     "type": "object",
@@ -301,7 +302,7 @@ class SendMessageToUserTool(Tool):
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": "Send the owner a short status message through the owner channel. Use it to report a decision, a blocker or a result; do not use it for routine narration.",
+                "description": "Send the owner a short status message through the owner channel. Use it to report a decision, a blocker or a result; do not use it for routine narration. Write to the owner in Russian, referring to yourself in the feminine.",
                 "parameters": {
                     "type": "object",
                     "properties": {

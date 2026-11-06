@@ -9,18 +9,25 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=root
 WorkingDirectory=@ROOT@
 EnvironmentFile=@ROOT@/config/skynet.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=TZ=UTC
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 ExecStart=@ROOT@/.venv/bin/python -m skynet --interval 60
-Restart=on-failure
+Restart=always
 RestartSec=10
 TimeoutStopSec=1200
 KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
+# Unprivileged user service: it may never gain more rights than the service
+# account already has (no setuid/file-capability escalation). The client-data
+# boundary is DAC on the owner's home directory (0700, no ACL), not a sandbox.
+# CapabilityBoundingSet is deliberately absent: dropping the bounding set needs
+# CAP_SETPCAP, which a systemd --user manager does not have, so setting it fails
+# the unit at the CAPABILITIES step (status 218). NoNewPrivileges is enough.
+NoNewPrivileges=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

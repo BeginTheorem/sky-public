@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkpoints import CheckpointManager
+from .git_hygiene import git_env
 from .provider import Tool
 from .time import utc_now
 
@@ -30,7 +31,9 @@ def request_path(root: str | Path) -> Path:
 
 
 def _git(root: Path, args: list[str]) -> str:
-    completed = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=False)
+    completed = subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, text=True, check=False, env=git_env(),
+    )
     if completed.returncode:
         raise RuntimeError(completed.stderr.strip() or f"git {' '.join(args)} failed")
     return completed.stdout.strip()

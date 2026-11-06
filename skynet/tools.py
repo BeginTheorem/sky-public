@@ -26,7 +26,8 @@ from .policy import (
     PolicyError,
     resurrection_denial,
     self_preservation_warning,
-    workspace_escape,
+    sudo_denial,
+    workspace_write_denial,
 )
 from .react import register_process_group
 from .structure import StructureTool
@@ -116,7 +117,8 @@ class BashTool:
             "function": {
                 "name": self.name,
                 "description": (
-                    "Execute one bounded command through /bin/bash -lc (system bash) with the permissions of the SkyNet process. "
+                    "Execute one bounded command through /bin/bash -lc (system bash) as the unprivileged SkyNet service account, with no sudo. "
+                    "A command that invokes sudo, doas, pkexec or su is refused: root is reached only through the sudo_exec tool, which asks the owner first and answers 'unavailable' when the unit's NoNewPrivileges flag makes root unreachable. "
                     "The working directory is checked by execution policy; stdout and stderr are each limited to 65536 characters. "
                     "Commands that mutate the resurrection mechanism (anything under state/, deploy/, .git/, scripts/rollback.sh, scripts/skynet-startup-rollback.sh) "
                     "are hard-denied and can never be confirmed. Other critical paths (config, remaining scripts, specific state files) return a warning instead of running; "
@@ -152,9 +154,10 @@ class BashTool:
     def _with_resource_limits(command: str) -> str:
         """Prepend ulimit guards so a runaway command cannot take the host down.
 
-        A guardrail, not a sandbox: bash runs as root by design, so this only
-        stops an accidental fork bomb or a runaway allocation. Zero disables a
-        limit; the defaults sit well above normal use and below the run budget.
+        A guardrail, not a sandbox: bash runs with the service account's own
+        unprivileged rights, so this only stops an accidental fork bomb or a
+        runaway allocation. Zero disables a limit; the defaults sit well above
+        normal use and below the run budget.
         """
         memory_mb = int(os.getenv("SKYNET_BASH_MEMORY_LIMIT_MB", "4096"))
         cpu_seconds = int(os.getenv("SKYNET_BASH_CPU_SECONDS", "900"))
@@ -191,6 +194,22 @@ class BashTool:
                 "protected_path": denied,
                 "error": f"policy denied: this command targets the resurrection mechanism path '{denied}' and cannot be overridden.",
             }
+        sudo_word = sudo_denial(command)
+        if sudo_word is not None:
+            log.warning("sudo denial run_effect=%s word=%s", idempotency_key, sudo_word)
+            return {
+                "ok": False,
+                "policy_denied": True,
+                "protected_path": "root",
+                "error": (
+                    f"policy denied: '{sudo_word}' inside bash is not a path to root — call the sudo_exec tool with "
+                    "the command and the reason it is needed, and the harness asks the owner before anything "
+                    "privileged runs. Root is not a route around a different refusal either: if a path is hard-denied "
+                    "to bash, an approval cannot lift it, and this box's unit sets NoNewPrivileges=yes, so root is "
+                    "unreachable from this process at all (sudo_exec reports 'unavailable' without asking). Bash is "
+                    "not a side door."
+                ),
+            }
         timeout = _number(arguments.get("timeout_seconds"), DEFAULT_COMMAND_TIMEOUT, MAX_COMMAND_TIMEOUT)
         default_cwd = os.getenv("SKYNET_BASH_CWD") or os.getenv("SKYNET_ROOT") or os.getcwd()
         cwd = arguments.get("cwd", default_cwd)
@@ -210,25 +229,31 @@ class BashTool:
             cwd = str(self.policy.check_cwd(cwd))
         except PolicyError as exc:
             return {"ok": False, "error": str(exc)}
+        # The repository is the organism's own tree and is read-only to bash: a
+        # mutation that targets it is hard-denied so every edit goes through
+        # propose_self_improvement. Writing outside it - the scratch directory,
+        # /tmp, the home directory, every root in SKYNET_SANDBOX_ROOTS - is free.
+        write_denied = workspace_write_denial(command, Path(cwd), self.policy.workspace)
+        if write_denied is not None:
+            log.warning("read-only workspace denial run_effect=%s path=%s", idempotency_key, write_denied)
+            return {
+                "ok": False,
+                "policy_denied": True,
+                "protected_path": write_denied,
+                "error": (
+                    "policy denied: the repository is read-only to bash; write prototypes outside it "
+                    "(/tmp, the home directory, SKYNET_SCRATCH_DIR) and change code only through propose_self_improvement."
+                ),
+            }
         protected = self_preservation_warning(command, self.protected_paths)
-        escape = None if protected is not None else workspace_escape(
-            command,
-            Path(cwd),
-            self.policy.workspace,
-            (self.policy.scratch_root,) if self.policy.scratch_root else (),
-        )
-        warning = protected if protected is not None else escape
+        warning = protected
         override = False
         if warning is not None:
             fingerprint = hashlib.sha256(command.encode("utf-8")).hexdigest()
             if fingerprint not in self._warned:
                 self._warned.add(fingerprint)
                 log.warning("soft denylist warning run_effect=%s path=%s", idempotency_key, warning)
-                reason = (
-                    f"would modify SkyNet's own critical path '{warning}'"
-                    if protected is not None
-                    else f"changes directory outside the sandbox workspace to '{warning}'"
-                )
+                reason = f"would modify SkyNet's own critical path '{warning}'"
                 return {
                     "ok": False,
                     "policy_warning": True,
@@ -237,7 +262,7 @@ class BashTool:
                 }
             self._warned.discard(fingerprint)
             override = True
-        log.warning("executing root bash command run_effect=%s cwd=%s command=%r", idempotency_key, cwd, command)
+        log.warning("executing bash command run_effect=%s cwd=%s command=%r", idempotency_key, cwd, command)
         process = subprocess.Popen(
             ["/bin/bash", "-lc", self._with_resource_limits(command)], cwd=cwd,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,

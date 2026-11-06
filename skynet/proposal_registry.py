@@ -85,7 +85,10 @@ def _fingerprint(record: dict[str, Any]) -> str:
 # be retried, and this sweep must close it too. This mirrors the guard's own set
 # (``self_improvement.py:1331``); it cannot be imported because that module
 # imports this one.
-TERMINAL_SIBLING_STATUSES = frozenset({"rejected", "validated", "awaiting_reboot", "accepted"})
+# ``awaiting_owner`` is in both sets for the guard's reason rather than for
+# finality: a change parked at the owner's boundary has spoken for its
+# fingerprint, so nothing may re-attempt it while he decides.
+TERMINAL_SIBLING_STATUSES = frozenset({"rejected", "validated", "awaiting_reboot", "accepted", "awaiting_owner"})
 
 # Statuses whose record claims the promoted commit is the code now running.
 # Only these are checked for liveness; a rejected or environment-blocked record

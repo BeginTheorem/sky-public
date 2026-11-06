@@ -283,6 +283,9 @@ class CoreTests(unittest.TestCase):
                 reactor.store.set_state(state)
             watchdog = StaleRunWatchdog(reactor, interval_seconds=1, timeout_seconds=5)
             with patch("skynet.watchdog.time.sleep"), patch("skynet.watchdog.os.kill") as kill:
+                # First stale check records the strike but does not interrupt;
+                # the second consecutive stale check interrupts.
+                watchdog._check_once()
                 watchdog._check_once()
             kill.assert_called_once_with(os.getpid(), signal.SIGALRM)
             reactor.close()

@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+# Non-interactive shells (an ssh command, a systemd unit) do not read ~/.profile,
+# so the freshly installed launchers are not on PATH by default: add the bin dir
+# so the verification `command -v` calls at the end actually resolve.
+export PATH="${HOME}/.local/bin:${PATH}"
+
 BIN_DIR="${HOME}/.local/bin"
 mkdir -p "$BIN_DIR"
 

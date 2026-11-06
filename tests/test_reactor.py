@@ -14,12 +14,21 @@ from unittest.mock import Mock, patch
 
 from helpers import FakeProvider, FixtureTool, commit_all, git_repo
 
-from skynet import metrics
 from skynet.heartbeat import wake as heartbeat_wake
 from skynet.models import AgentRunResult, Budget, LifecycleState, ModelTurn, RunStatus, ToolCall
 from skynet.outbox import deliver_to_jsonl
 from skynet.planner import PortfolioPlanner
-from skynet.reactor import SYSTEM, SYSTEM_MEMORY, SYSTEM_REACT, Reactor, ReactorConfig, TurnShapeRecorder, mcp_senses_line
+from skynet.reactor import (
+    SYSTEM,
+    SYSTEM_MEMORY,
+    SYSTEM_REACT,
+    Reactor,
+    ReactorConfig,
+    TurnShapeRecorder,
+    load_soul_text,
+    mcp_senses_line,
+    run_logs_to_telegram_enabled,
+)
 from skynet.store import StateStore
 
 
@@ -80,6 +89,55 @@ class CoreTests(unittest.TestCase):
             self.assertIn("# SOUL.md", reactor.config.system_prompt)
             reactor.close()
 
+    def test_soul_loading_prefers_the_run_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "SOUL.md").write_text("# SOUL.md run-root\n", encoding="utf-8")
+            self.assertEqual(load_soul_text(root), "# SOUL.md run-root\n")
+
+    def test_soul_loading_falls_back_to_the_checkout_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            # No SOUL.md in the run root: the editable checkout beside reactor.py wins.
+            soul = load_soul_text(Path(directory))
+            assert soul is not None
+            self.assertIn("# SOUL.md", soul)
+
+    def test_soul_loading_reads_the_packaged_copy_for_an_installed_wheel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            run_root = base / "run"
+            run_root.mkdir()
+            package = base / "site-packages"
+            package.mkdir()
+            (package / "SOUL.md").write_text("# SOUL.md packaged\n", encoding="utf-8")
+            # reactor.py's checkout neighbour has no SOUL.md, so only the copy shipped
+            # inside the installed package can satisfy the lookup.
+            with (
+                patch("skynet.reactor.__file__", str(base / "src" / "skynet" / "reactor.py")),
+                patch("skynet.reactor.resources.files", return_value=package),
+            ):
+                self.assertEqual(load_soul_text(run_root), "# SOUL.md packaged\n")
+
+    def test_soul_loading_returns_none_when_nothing_can_be_found(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            run_root = base / "run"
+            run_root.mkdir()
+            package = base / "site-packages"
+            package.mkdir()
+            with (
+                patch("skynet.reactor.__file__", str(base / "src" / "skynet" / "reactor.py")),
+                patch("skynet.reactor.resources.files", return_value=package),
+            ):
+                self.assertIsNone(load_soul_text(run_root))
+
+    def test_workspace_block_reports_the_run_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reactor = Reactor(FakeProvider(), {}, ReactorConfig(state_path=root / "state.sqlite3", self_improvement_root=root))
+            self.assertIn(f"WORKSPACE: {root}", reactor.config.system_prompt)
+            reactor.close()
+
     def test_system_prompt_carries_workspace_and_senses_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -125,6 +183,18 @@ class CoreTests(unittest.TestCase):
             self.assertEqual([(row[0], row[1]) for row in goals], [("already blocked", "blocked")])
             reactor.store.close()
     def test_autonomous_scheduler_plans_after_exhausted_tasks(self) -> None:
+        class NoProposals:
+            """Answers, and proposes nothing: an empty PORTFOLIO, not a dead chain.
+
+            A bare ``Mock()`` would drive the plan pass into
+            ``planner_provider_error``, which no longer manufactures the bounded
+            diagnostic (the treadmill fix) -- this test is about exhaustion, so the
+            planner has to actually speak.
+            """
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=json.dumps({"proposals": []}))
+
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             goal_id = store.add_goal("blocked autonomous work", priority=1.0)
@@ -133,10 +203,10 @@ class CoreTests(unittest.TestCase):
             store.connection.commit()
             store.close()
 
-            reactor = Reactor(Mock(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3"))
+            reactor = Reactor(NoProposals(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3"))
             reactor.tick("timer")
             fallback = reactor.store.connection.execute(
-                "SELECT title, status FROM tasks WHERE title LIKE 'Diagnose one concrete SkyNet bottleneck%'"
+                "SELECT title, status FROM tasks WHERE title LIKE 'Measure one concrete fact about the MOEX market%'"
             ).fetchone()
             self.assertIsNotNone(fallback)
             self.assertIn(fallback["status"], {"pending", "blocked"})
@@ -182,6 +252,8 @@ class CoreTests(unittest.TestCase):
         description = cast(str, tools["bash"].schema["function"]["description"])
         self.assertIn("system bash", description)
         self.assertIn("webfetch", tools)
+
+    @patch.dict("os.environ", {"SKYNET_RUN_LOGS_TO_TELEGRAM": "1"})
     def test_reactor_persists_checkpoint_and_tool_event(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             reactor = Reactor(
@@ -197,7 +269,7 @@ class CoreTests(unittest.TestCase):
             # Ordered explicitly: an index on event_log(kind, sequence) can make
             # the planner return rows in index order instead of insertion order.
             events = reactor.store.connection.execute("SELECT kind FROM event_log ORDER BY sequence").fetchall()
-            self.assertEqual([row[0] for row in events], ["planner_decision", "memory_retrieval", "run_started", "decision_record", "react_phase", "react_phase", "tool_call", "tool_result", "finish_report", "run_result_committed", "provider_request", "memory_loop_started", "scheduler_decision", "memory_loop_finished", "memory_event", "memory_consolidated", "run_finished", "plan_observation", "task_progress", "checkpoint", "metrics_snapshot"])
+            self.assertEqual([row[0] for row in events], ["planner_decision", "memory_retrieval", "run_started", "decision_record", "react_phase", "react_phase", "tool_call", "tool_result", "finish_report", "run_result_committed", "provider_request", "memory_run_started", "memory_loop_started", "scheduler_decision", "memory_loop_finished", "memory_event", "memory_consolidated", "memory_run_finished", "run_finished", "plan_observation", "task_progress", "checkpoint", "metrics_snapshot"])
             response = reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='finish_report'").fetchone()[0]
             self.assertIn('"text":', response)
             self.assertEqual(reactor.store.connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0], 1)
@@ -208,7 +280,12 @@ class CoreTests(unittest.TestCase):
                 reactor.store.connection.execute("SELECT COUNT(*) FROM evaluations WHERE status='metrics'").fetchone()[0],
                 1,
             )
-            self.assertEqual(reactor.store.connection.execute("SELECT COUNT(*) FROM run_results").fetchone()[0], 1)
+            counts = dict(
+                reactor.store.connection.execute(
+                    "SELECT r.kind, COUNT(*) FROM run_results rr JOIN runs r ON r.run_id = rr.run_id GROUP BY r.kind"
+                ).fetchall()
+            )
+            self.assertEqual(counts, {"build": 1, "memory": 1}, "a cycle writes one result per pass")
             self.assertEqual(reactor.store.connection.execute("SELECT status FROM tasks").fetchone()[0], "completed")
             decision = json.loads(reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='decision_record'").fetchone()[0])
             self.assertIn("intention", decision)
@@ -218,6 +295,8 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(deliver_to_jsonl(reactor.store, Path(directory) / "outbox.jsonl"), 1)
             self.assertEqual(len(reactor.store.pending_outbox()), 0)
             reactor.close()
+
+    @patch.dict("os.environ", {"SKYNET_RUN_LOGS_TO_TELEGRAM": "1"})
     def test_mid_run_progress_reaches_the_owner_outbox_as_agent_message(self) -> None:
         from skynet.outbox import render_outbox_message
 
@@ -277,6 +356,42 @@ class CoreTests(unittest.TestCase):
                 1,
             )
             reactor.close()
+
+    @patch.dict("os.environ", {"SKYNET_RUN_LOGS_TO_TELEGRAM": "0"})
+    def test_finished_runs_are_not_pushed_to_the_owner_by_default(self) -> None:
+        """Automatic session logs stay out of the channel the owner reads (owner decision 2026-10-15).
+
+        Nothing is lost: the run result, the finish report and the events stay durable and
+        ``/logs`` renders them on demand — but no message per finished episode is queued.
+        """
+        from skynet import reporting
+
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
+            chatter = [m for m in reactor.store.pending_outbox() if m["kind"] in {"agent_response", "agent_message"}]
+            self.assertEqual(chatter, [])
+            counts = dict(
+                reactor.store.connection.execute(
+                    "SELECT r.kind, COUNT(*) FROM run_results rr JOIN runs r ON r.run_id = rr.run_id GROUP BY r.kind"
+                ).fetchall()
+            )
+            self.assertEqual(counts, {"build": 1, "memory": 1}, "the pass keeps a result row of its own")
+            self.assertGreaterEqual(len(reporting.render_recent(reactor.store, 5)), 1, "logs stay readable on demand")
+            reactor.close()
+
+    def test_run_log_gate_reads_the_environment(self) -> None:
+        with patch.dict("os.environ", {"SKYNET_RUN_LOGS_TO_TELEGRAM": "1"}):
+            self.assertTrue(run_logs_to_telegram_enabled())
+        with patch.dict("os.environ", {"SKYNET_RUN_LOGS_TO_TELEGRAM": "0"}):
+            self.assertFalse(run_logs_to_telegram_enabled())
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(run_logs_to_telegram_enabled(), "an absent flag means off")
+
     def test_path_like_claim_in_a_clean_worktree_does_not_reopen_the_task(self) -> None:
         class PrototypeProvider:
             def __init__(self) -> None:
@@ -340,12 +455,23 @@ class CoreTests(unittest.TestCase):
             git_repo(root)
             (root / "module.py").write_text("value = 1\n", encoding="utf-8")
             commit_all(root, "base")
-            # A direct edit through bash leaves the main worktree dirty; the
-            # work is real and not captured, so the task must stay in the queue.
-            (root / "module.py").write_text("value = 2\n", encoding="utf-8")
+
+            class WritingTool:
+                name = "fixture_tool"
+                capability_kind = "write"
+                timeout_seconds = 1.0
+                schema = FixtureTool.schema
+
+                def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
+                    # The direct edit happens DURING the run: the wake-time heal
+                    # already inspected a clean tree, so the dirt is the run's own
+                    # and must still reopen the task.
+                    (root / "module.py").write_text("value = 2\n", encoding="utf-8")
+                    return {"ok": True}
+
             reactor = Reactor(
                 PrototypeProvider(),
-                {"fixture_tool": FixtureTool()},
+                {"fixture_tool": WritingTool()},
                 ReactorConfig(state_path=root / "state.sqlite3", self_improvement_root=root),
             )
             self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
@@ -353,6 +479,38 @@ class CoreTests(unittest.TestCase):
             row = reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='uncaptured_changes'").fetchone()
             self.assertIsNotNone(row)
             self.assertIs(json.loads(row[0])["dirty_worktree"], True)
+            reactor.close()
+
+    def test_a_dirty_worktree_is_healed_at_wake(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            commit_all(root, "base")
+            # A prior episode left the tree dirty; the wake must heal it.
+            (root / "module.py").write_text("value = 2\n", encoding="utf-8")
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=root / "state.sqlite3", self_improvement_root=root),
+            )
+            reactor.tick("test")
+            healed_events = reactor.store.connection.execute(
+                "SELECT COUNT(*) FROM event_log WHERE kind='worktree_auto_quarantined'"
+            ).fetchone()[0]
+            self.assertEqual(healed_events, 1)
+            # The tracked file is restored to its committed content and the edit
+            # is preserved under state/quarantine.
+            self.assertEqual((root / "module.py").read_text(encoding="utf-8"), "value = 1\n")
+            self.assertTrue(any((root / "state" / "quarantine").iterdir()))
+            payload = json.loads(
+                reactor.store.connection.execute(
+                    "SELECT payload FROM event_log WHERE kind='run_started' ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()[0]
+            )
+            kinds = {item["kind"] for item in payload["observations"]}
+            self.assertIn("dirty_worktree", kinds)
+            self.assertIn("worktree_auto_quarantined", kinds)
             reactor.close()
 
     def test_prose_denial_in_changes_does_not_reopen_the_task(self) -> None:
@@ -558,6 +716,16 @@ class CoreTests(unittest.TestCase):
             self.assertIn("event-1", started["payload"])
             reactor.close()
     def test_reactor_sleeps_when_pending_task_fingerprint_is_exhausted(self) -> None:
+        class NoProposals:
+            """An empty portfolio must still get the bounded diagnostic.
+
+            Not ``Mock()``: that drives the plan pass into
+            ``planner_provider_error``, which deliberately manufactures nothing now.
+            """
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=json.dumps({"proposals": []}))
+
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.sqlite3"
             store = StateStore(path)
@@ -565,11 +733,11 @@ class CoreTests(unittest.TestCase):
             store.add_task("already investigated", goal_id, expected_new_fact="fact", hypothesis_fingerprint="done", structural_fingerprint="done-shape")
             store.mark_hypothesis("done", "completed", {"evidence": "existing"})
             store.close()
-            reactor = Reactor(Mock(), {}, ReactorConfig(state_path=path))
+            reactor = Reactor(NoProposals(), {}, ReactorConfig(state_path=path))
             reactor.tick("timer")
             self.assertEqual(
                 reactor.store.connection.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE title LIKE 'Diagnose one concrete SkyNet bottleneck%'"
+                    "SELECT COUNT(*) FROM tasks WHERE title LIKE 'Measure one concrete fact about the MOEX market%'"
                 ).fetchone()[0],
                 1,
             )
@@ -626,7 +794,7 @@ class CoreTests(unittest.TestCase):
             store = StateStore(Path(directory) / "state.sqlite3")
             with store.transaction():
                 store.append_event("tool_result", {"call": {"tool_name": "clock"}, "result": {"ok": True}}, "run-1")
-            results = store.evaluate_criteria("run-1", [{"criterion": "verified progress", "kind": "verified_progress"}], "done", RunStatus.COMPLETED)
+            results = store.evaluate_criteria("run-1", [{"criterion": "verified progress", "kind": "verified_progress"}])
             self.assertEqual([item["passed"] for item in results], [True])
             self.assertEqual(results[0]["kind"], "verified_progress")
             store.close()
@@ -636,8 +804,6 @@ class CoreTests(unittest.TestCase):
             results = store.evaluate_criteria(
                 "run-1",
                 [{"criterion": "verified work", "kind": "verified_progress", "required": True}],
-                "I completed the work.",
-                RunStatus.COMPLETED,
             )
             self.assertFalse(results[0]["passed"])
             self.assertTrue(results[0]["verified"])
@@ -702,7 +868,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(wait_for_threads_to_finish(lingering), set())
         self.assertLessEqual(wait_for_fd_count(baseline_fds), baseline_fds)
 
-    def test_daily_maintenance_runs_with_metrics_disabled_once_per_day(self) -> None:
+    def test_maintenance_runs_every_cycle_with_metrics_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             reactor = Reactor(
@@ -733,16 +899,66 @@ class CoreTests(unittest.TestCase):
                 reactor.store.connection.execute("SELECT COUNT(*) FROM evaluations WHERE status='metrics'").fetchone()[0],
                 0,
             )
-            marker = json.loads((root / "maintenance-marker.json").read_text(encoding="utf-8"))
-            self.assertEqual(marker["marker"], metrics.daily_marker())
-            # A same-day second tick must not run maintenance again: a freshly
-            # seeded stale memory keeps its confidence because the pass is skipped.
+            # Maintenance is per-cycle now, not once a UTC day: the daily sidecar
+            # marker is gone, so a fresh stale memory fades on the very next tick.
+            self.assertFalse((root / "maintenance-marker.json").exists())
             insert_stale("stale-2")
             reactor.tick("test")
-            self.assertEqual(decay_events(), 1)
-            self.assertEqual(
+            self.assertEqual(decay_events(), 2)
+            self.assertAlmostEqual(
                 reactor.store.connection.execute("SELECT confidence FROM memories WHERE memory_id='stale-2'").fetchone()[0],
-                0.9,
+                0.87,
+                places=3,
+            )
+            reactor.close()
+
+    def test_one_shot_pin_is_released_after_a_completed_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            store = reactor.store
+            store.consolidate("run-0", [{"kind": "fact", "content": "carry me once", "confidence": 0.9}])
+            memory_id = str(store.connection.execute("SELECT memory_id FROM memories").fetchone()[0])
+            store.set_memory_pinned(memory_id)
+            self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
+            self.assertEqual(
+                store.connection.execute("SELECT pinned FROM memories WHERE memory_id=?", (memory_id,)).fetchone()[0],
+                0,
+                "the pin is consumed by the completed cycle whose prompt carried it",
+            )
+            consumed = store.connection.execute(
+                "SELECT payload FROM event_log WHERE kind='pinned_memories_consumed'"
+            ).fetchone()
+            self.assertIsNotNone(consumed)
+            self.assertEqual(json.loads(consumed[0])["memory_ids"], [memory_id])
+            reactor.close()
+
+    def test_one_shot_pin_survives_a_provider_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = Reactor(
+                FakeProvider(),
+                {"fixture_tool": FixtureTool()},
+                ReactorConfig(state_path=Path(directory) / "state.sqlite3"),
+            )
+            store = reactor.store
+            store.consolidate("run-0", [{"kind": "fact", "content": "survive the outage", "confidence": 0.9}])
+            memory_id = str(store.connection.execute("SELECT memory_id FROM memories").fetchone()[0])
+            store.set_memory_pinned(memory_id)
+            # A run killed by a provider outage never delivered a prompt the
+            # organism could trust, so its pins survive for the retry.
+            with patch.object(reactor, "_run_had_provider_failure", return_value=True):
+                self.assertEqual(reactor.tick("test"), RunStatus.COMPLETED)
+            self.assertEqual(
+                store.connection.execute("SELECT pinned FROM memories WHERE memory_id=?", (memory_id,)).fetchone()[0],
+                1,
+                "the pin is not consumed when the run failed on the provider",
+            )
+            self.assertEqual(
+                store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='pinned_memories_consumed'").fetchone()[0],
+                0,
             )
             reactor.close()
 
@@ -771,7 +987,7 @@ class CoreTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM event_log WHERE kind='history_compacted'"
                 ).fetchone()[0]
 
-            reactor._run_daily_maintenance()
+            reactor._run_maintenance()
             stored = json.loads(
                 store.connection.execute(
                     "SELECT payload FROM episode_snapshots WHERE run_id='run-legacy'"
@@ -783,7 +999,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.snapshot_episode("run-legacy")["transcript"], rebuilt)
             self.assertEqual(compact_events(), 1)
 
-            reactor._run_daily_maintenance()
+            reactor._run_maintenance()
             self.assertEqual(compact_events(), 1, "a second maintenance pass rewrites nothing and logs nothing")
             self.assertEqual(store.snapshot_episode("run-legacy")["transcript"], rebuilt)
             reactor.close()
@@ -811,7 +1027,7 @@ class CoreTests(unittest.TestCase):
                         raise KeyError(f"forced {_name}")
 
                     setattr(reactor.store, attribute, boom)
-                    reactor._run_daily_maintenance()
+                    reactor._run_maintenance()
                     rows = reactor.store.connection.execute(
                         "SELECT payload FROM event_log WHERE kind='maintenance_failed'"
                     ).fetchall()
@@ -848,7 +1064,7 @@ class CoreTests(unittest.TestCase):
 
                 reactor.store.prune_event_log = counted_events  # type: ignore[method-assign]
                 reactor.store.prune_capability_effects = counted_effects  # type: ignore[method-assign]
-                reactor._run_daily_maintenance()
+                reactor._run_maintenance()
                 self.assertEqual(len(observed), 2, "both retention passes still run")
                 self.assertEqual(
                     reactor.store.connection.execute(
@@ -945,7 +1161,15 @@ class CoreTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(degraded)
             started = reactor.store.connection.execute("SELECT run_id FROM event_log WHERE kind='run_started' LIMIT 1").fetchone()
-            self.assertEqual(degraded["run_id"], started["run_id"])
+            memory_run = reactor.store.connection.execute("SELECT kind, status FROM runs WHERE run_id=?", (degraded["run_id"],)).fetchone()
+            self.assertEqual(memory_run["kind"], "memory", "a degraded pass writes under a run of its own")
+            self.assertEqual(memory_run["status"], "needs_recovery")
+            self.assertNotEqual(degraded["run_id"], started["run_id"])
+            pass_finished = json.loads(
+                reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='memory_run_finished'").fetchone()["payload"]
+            )
+            self.assertEqual(pass_finished["source_run"], started["run_id"], "the pass names the episode it consolidated")
+            self.assertTrue(pass_finished["degraded"])
             self.assertTrue(json.loads(degraded["payload"])["error"])
             finished = json.loads(
                 reactor.store.connection.execute("SELECT payload FROM event_log WHERE kind='memory_loop_finished'").fetchone()["payload"]
@@ -1198,13 +1422,23 @@ class CoreTests(unittest.TestCase):
         self.assertIs(recorder.complete([], max_tokens=1), inner.turn, "the wrapper is a pass-through")
         self.assertEqual(
             recorder.last_shape,
-            {"text_chars": 3, "reasoning_chars": len("private thoughts"), "completion_tokens": 9, "finish_reason": "length"},
+            {
+                "text_chars": 3,
+                "reasoning_chars": len("private thoughts"),
+                "completion_tokens": 9,
+                "prompt_tokens": 0,
+                "total_tokens": 9,
+                "cached_tokens": 0,
+                "finish_reason": "length",
+            },
         )
+        self.assertEqual((recorder.calls, recorder.usage_tokens), (1, 9), "the pass totals the plan run row reports")
         self.assertNotIn("private thoughts", str(recorder.last_shape), "reasoning text is never captured")
         # Unknown attributes keep the wrapped provider's capability contract.
         self.assertTrue(recorder.accepts_timeout_override)
         recorder.reset()
         self.assertIsNone(recorder.last_shape)
+        self.assertEqual((recorder.calls, recorder.usage_tokens), (0, 0), "reset clears the pass totals")
 
     def test_deferred_restart_is_not_persisted_as_a_provider_failure(self) -> None:
         # `run_results.failure` is the fault ledger metrics read verbatim; a
@@ -1388,7 +1622,7 @@ class StallResilienceTests(unittest.TestCase):
             try:
                 with (
                     patch.object(reactor, "_record_daily_metrics") as daily,
-                    patch.object(reactor, "_maybe_run_daily_maintenance") as maintenance,
+                    patch.object(reactor, "_run_maintenance") as maintenance,
                     patch.object(reactor, "_check_judge_health") as judge,
                 ):
                     reactor._run_per_cycle_housekeeping()
@@ -1404,7 +1638,7 @@ class StallResilienceTests(unittest.TestCase):
             try:
                 with (
                     patch.object(reactor, "_record_daily_metrics") as daily,
-                    patch.object(reactor, "_maybe_run_daily_maintenance") as maintenance,
+                    patch.object(reactor, "_run_maintenance") as maintenance,
                     patch.object(reactor, "_check_judge_health") as judge,
                 ):
                     reactor._run_per_cycle_housekeeping()

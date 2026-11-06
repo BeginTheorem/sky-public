@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .git_hygiene import git_env, read_only_git
 from .time import utc_now
 
 
@@ -34,7 +35,7 @@ class CheckpointManager:
 
     def _git(self, args: Sequence[str]) -> str:
         result = subprocess.run(
-            ["git", *args], cwd=self.root, capture_output=True, text=True, check=False,
+            ["git", *args], cwd=self.root, capture_output=True, text=True, check=False, env=git_env(),
         )
         if result.returncode:
             raise CheckpointError(result.stderr.strip() or f"git {' '.join(args)} failed")
@@ -50,10 +51,7 @@ class CheckpointManager:
         of HEAD: a stale rollback_commit from an older promotion would silently
         discard every later commit, including the running one.
         """
-        result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
-            cwd=self.root, capture_output=True, text=True, check=False,
-        )
+        result = read_only_git(["merge-base", "--is-ancestor", ancestor, descendant], self.root)
         return result.returncode == 0
 
     def is_clean(self, *, allow_untracked: bool = False) -> bool:

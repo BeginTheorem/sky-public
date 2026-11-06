@@ -16,7 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Built by concatenation so this guard does not flag itself.
-_OPERATOR = "lord" + "-" + "lucifer"
+_OPERATOR = "example" + "-" + "operator"
 FORBIDDEN = (_OPERATOR, "/home/" + _OPERATOR)
 
 # Tracked text files worth scanning; binaries (wheels, sqlite, caches) are skipped.
@@ -59,7 +59,7 @@ class NoHardcodedPersonalPathsTests(unittest.TestCase):
 
     def test_deploy_units_are_templates(self) -> None:
         """Unit files must ship as @ROOT@ templates, not rendered copies."""
-        for name in ("skynet.service.in", "skynet-telegram.service.in", "skynet-rollback.service.in"):
+        for name in ("skynet.service.in", "skynet-telegram.service.in", "skynet-rollback.service.in", "skynet-revive.service.in"):
             text = (REPO_ROOT / "deploy" / name).read_text(encoding="utf-8")
             self.assertIn("@ROOT@", text, f"{name} lost its @ROOT@ placeholder")
             self.assertNotIn("/home/", text, f"{name} carries an absolute home path")

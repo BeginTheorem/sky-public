@@ -91,6 +91,13 @@ class ModelTurn:
     usage_tokens: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Prompt tokens the provider served from its own cache. Providers report this
+    # inside the usage block and, until now, the harness dropped it on the floor:
+    # every question about prompt caching (is the prefix stable, does parking a
+    # sensor help, is compaction cache-hostile) was answered by argument, because
+    # no reader could see a cache hit. Zero means either "no cache" or "the
+    # provider did not say"; the provider's own field is copied verbatim.
+    cached_tokens: int = 0
     # The provider's own stop reason ("stop", "length", "tool_calls", ...).
     # A completion cut off at the output ceiling is otherwise indistinguishable
     # from a short one: the reply is valid JSON-prefix text either way, and the
@@ -107,6 +114,12 @@ class ModelTurn:
     @property
     def total_tokens(self) -> int:
         return self.usage_tokens or self.prompt_tokens + self.completion_tokens
+    # Orchestration strategy that served this turn ('sequential', 'parallel', ...).
+    # The fallback chain stamps it on every completed turn so the capability_effects
+    # ledger can measure cost-latency per strategy on a frozen replay corpus.
+    # Empty string means 'not instrumented / default path'.
+    strategy: str = ""
+
 
 
 @dataclass(slots=True)
@@ -130,6 +143,12 @@ class RunRecord:
     started_at: str
     budget: Budget
     finished_at: str | None = None
+    # Which pass of the cycle this run is: "build" (the ReAct episode, plus the
+    # planning that feeds it) or "memory" (the consolidation pass, which keeps its
+    # own row, budget, result and verdict instead of being bookkept inside the
+    # episode's). Aggregate readers filter on it, so a memory pass is never
+    # counted as another episode.
+    kind: str = "build"
 
 
 @dataclass(slots=True)

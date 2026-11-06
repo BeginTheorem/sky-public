@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import sqlite3
@@ -13,8 +14,8 @@ from typing import cast
 from unittest.mock import patch
 
 from skynet.memory import MemoryLoop
-from skynet.memory_store import _RRF_MAX_LIFT, KIND_ALIASES, MEMORY_KINDS, MemoryStore, normalize_memory_kind
-from skynet.models import AgentRunResult, ModelTurn, RunStatus
+from skynet.memory_store import _RRF_MAX_LIFT, KIND_ALIASES, MEMORY_KINDS, MemoryStore, SpacedReplayScheduler, normalize_memory_kind
+from skynet.models import AgentRunResult, ModelTurn, RunStatus, ToolCall
 from skynet.store import StateStore
 
 
@@ -119,7 +120,8 @@ class CoreTests(unittest.TestCase):
                 return ModelTurn(text='{"memory_candidates": [], "next_plan": {}}')
 
         provider = CapturingProvider()
-        MemoryLoop(provider).consolidate(
+        # The raw path, pinned: this is the bounding rule the digested payload replaces.
+        MemoryLoop(provider, digest=False).consolidate(
             [],
             AgentRunResult(RunStatus.COMPLETED, "report"),
             "system",
@@ -151,7 +153,7 @@ class CoreTests(unittest.TestCase):
 
         provider = CapturingProvider()
         huge = "z" * 400_000
-        MemoryLoop(provider, episode_char_budget=20_000).consolidate(
+        MemoryLoop(provider, episode_char_budget=20_000, digest=False).consolidate(
             [{"kind": "tool_result", "payload": huge}],
             AgentRunResult(RunStatus.COMPLETED, "report"),
             "system",
@@ -172,6 +174,78 @@ class CoreTests(unittest.TestCase):
 
         result = MemoryLoop(InvalidMemoryProvider()).consolidate([], AgentRunResult(RunStatus.COMPLETED, "ok"), "system")
         self.assertEqual(result.evaluation["status"], "degraded")
+    def test_memory_loop_re_asks_after_an_unusable_reply(self) -> None:
+        """A tool call where the memory loop has no tools is re-asked, not fatal.
+
+        Measured 2026-09-28: 14 of the last 30 ``memory_degraded`` events were
+        "structured model response contains no acceptable JSON value", the same
+        shape as the Finish-phase failure (the model emits a tool call in a
+        phase that has none).
+        """
+
+        class ToolCallThenValid:
+            def __init__(self, text: str) -> None:
+                self.text = text
+                self.calls = 0
+                self.reask_prompt = ""
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("bash", {"command": "ls"})])
+                self.reask_prompt = str(messages[-1].get("content", ""))
+                return ModelTurn(text=self.text)
+
+        payload = {
+            "memory_candidates": [],
+            "next_plan": {},
+            "initial_prompt": "prompt",
+            "goal_updates": [],
+            "task_updates": [],
+            "evaluation": {"status": "ok"},
+        }
+        provider = ToolCallThenValid(json.dumps(payload))
+        result = MemoryLoop(provider).consolidate([], AgentRunResult(RunStatus.COMPLETED, "ok"), "system")
+        self.assertNotEqual(result.evaluation.get("status"), "degraded")
+        self.assertEqual(result.initial_prompt, "prompt")
+        self.assertEqual(provider.calls, 2)
+        self.assertIn("called tools that do not exist in this phase", provider.reask_prompt)
+        self.assertIn("bash(", provider.reask_prompt)
+    def test_memory_loop_caps_re_asks_at_three(self) -> None:
+        class AlwaysToolCall:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                return ModelTurn(tool_calls=[ToolCall("bash", {})])
+
+        provider = AlwaysToolCall()
+        result = MemoryLoop(provider).consolidate([], AgentRunResult(RunStatus.COMPLETED, "ok"), "system")
+        self.assertEqual(result.evaluation["status"], "degraded")
+        # Initial reply plus MAX_MODEL_REASKS re-asks, then it stops.
+        self.assertEqual(provider.calls, 4)
+    def test_memory_loop_re_asks_share_one_deadline(self) -> None:
+        """The deadline bounds the whole sequence, not each attempt separately."""
+
+        class InvalidThenHanging:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls > 1:
+                    time.sleep(0.2)
+                return ModelTurn(text="not json")
+
+        provider = InvalidThenHanging()
+        started = time.monotonic()
+        result = MemoryLoop(provider, timeout_seconds=0.05).consolidate([], AgentRunResult(RunStatus.COMPLETED, "ok"), "system")
+        self.assertEqual(result.evaluation["status"], "degraded")
+        # The first reply was instant, the re-ask hit the shared deadline: two
+        # calls, not the four an unbounded re-ask loop would make.
+        self.assertEqual(provider.calls, 2)
+        self.assertLess(time.monotonic() - started, 0.15)
     def test_memory_loop_drops_an_undeclared_field_instead_of_degrading(self) -> None:
         from skynet.memory import MemoryLoop
 
@@ -265,7 +339,7 @@ class CoreTests(unittest.TestCase):
                 return ModelTurn(text='{"memory_candidates": [], "next_plan": {}}')
 
         provider = CapturingProvider()
-        MemoryLoop(provider).consolidate(
+        MemoryLoop(provider, digest=False).consolidate(
             [],
             AgentRunResult(RunStatus.COMPLETED, "report"),
             "system",
@@ -625,9 +699,9 @@ class MemoryPromptTests(unittest.TestCase):
                 {"role": "user", "content": "hello"},
             ],
         )
-        roles = [message["role"] for message in cast(dict, provider.payload)["chat_history"]]
-        self.assertNotIn("system", roles)
-        self.assertEqual(roles, ["user"])
+        rows = cast(dict, provider.payload)["chat_history"]
+        self.assertTrue(all("role" not in row for row in rows), "the transcript's roles do not survive the digest")
+        self.assertNotIn("you are the react agent", json.dumps(rows))
 
     def test_the_memory_prompt_carries_identity_once(self) -> None:
         # The ReAct system prompt embeds SOUL.md and the Memory system prompt
@@ -660,4 +734,245 @@ class MemoryPromptTests(unittest.TestCase):
         assembled = json.dumps(provider.messages, ensure_ascii=False)
         self.assertEqual(assembled.count(identity), 1)
         payload = json.loads(provider.messages[1]["content"])
-        self.assertEqual([message["role"] for message in payload["chat_history"]], ["user", "assistant"])
+        # The digested history carries actions and outcomes only, so a history with no tool
+        # calls contributes nothing -- and the ReAct system turn cannot contribute at all.
+        self.assertEqual(payload["chat_history"], [])
+        self.assertNotIn("ReAct system prompt", assembled)
+
+
+class MemoryDigestTests(unittest.TestCase):
+    """The digested payload: outcomes, identifiers and errors in, bulk out.
+
+    Measured 2026-10-19: 74 memory calls, 4.69M prompt tokens, 100% fresh (a one-shot prompt
+    cannot be cached), 23.8% of the epoch's whole fresh input at 4% of its volume. The payload
+    is dominated by raw tool_result rows (4,100 chars each) and a run_started envelope of
+    ~17,000, so the consolidator was paying for bulk it never needed.
+    """
+
+    def _payload(self, episode, *, chat_history=None, **kwargs):
+        from skynet.memory import MemoryLoop
+
+        class CapturingProvider:
+            def __init__(self) -> None:
+                self.payload = None
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.payload = json.loads(messages[1]["content"])
+                return ModelTurn(text='{"memory_candidates": [], "next_plan": {}}')
+
+        provider = CapturingProvider()
+        MemoryLoop(provider, **kwargs).consolidate(
+            episode,
+            AgentRunResult(RunStatus.COMPLETED, "report"),
+            "system",
+            chat_history=chat_history or [],
+        )
+        return cast(dict, provider.payload)
+
+    def test_a_bulky_tool_result_becomes_its_outcome(self) -> None:
+        episode = [
+            {"kind": "tool_call", "payload": {"call_id": "c1", "tool_name": "bash", "arguments": {"command": "cat " + "x" * 3_000}}},
+            {
+                "kind": "tool_result",
+                "payload": {
+                    "call": {"call_id": "c1", "tool_name": "bash", "arguments": {"command": "cat x"}},
+                    "result": {"ok": True, "returncode": 0, "stdout": "line one\n" + "y" * 4_000, "stderr": ""},
+                },
+            },
+        ]
+        payload = self._payload(episode)
+        rows = payload["episode"]
+        self.assertEqual([row["kind"] for row in rows], ["tool_call", "tool_result"])
+        self.assertEqual(rows[0]["tool"], "bash", "the tool name is the identifier that matters")
+        self.assertIn("cat ", rows[0]["arguments"]["command"])
+        self.assertTrue(rows[1]["ok"])
+        self.assertEqual(rows[1]["head"], "line one")
+        self.assertLess(len(json.dumps(rows)), 1_600, "bulk must not survive the digest")
+
+    def test_an_error_line_survives_verbatim(self) -> None:
+        episode = [
+            {
+                "kind": "tool_result",
+                "payload": {
+                    "call": {"call_id": "c1", "tool_name": "bash"},
+                    "result": {"ok": False, "stderr": "No such file: /srv/skynet/state/x.sqlite3"},
+                },
+            },
+        ]
+        row = self._payload(episode)["episode"][0]
+        self.assertFalse(row["ok"])
+        self.assertIn("/srv/skynet/state/x.sqlite3", row["error"])
+
+    def test_the_envelope_keeps_its_intention_and_drops_its_bulk(self) -> None:
+        episode = [
+            {
+                "kind": "run_started",
+                "payload": {
+                    "wake_cause": "timer",
+                    "intention": {"title": "Fix the tracker", "why_now": "it stalls"},
+                    "observations": [{"huge": "z" * 20_000}],
+                },
+            },
+        ]
+        row = self._payload(episode)["episode"][0]
+        self.assertEqual(row["intention"]["title"], "Fix the tracker")
+        self.assertIn("1 observations dropped", row["obs_note"])
+        self.assertLess(len(json.dumps(row)), 600)
+
+    def test_a_fact_event_keeps_its_payload(self) -> None:
+        episode = [{"kind": "memory_event", "payload": {"memory_id": "abc123", "action": "remember"}}]
+        row = self._payload(episode)["episode"][0]
+        self.assertEqual(row["payload"]["memory_id"], "abc123")
+
+    def test_telemetry_is_not_a_fact(self) -> None:
+        episode = [{"kind": "provider_request", "payload": {"request_chars": 50_000}}]
+        row = self._payload(episode)["episode"][0]
+        self.assertEqual(row["note"], "telemetry dropped")
+
+    def test_an_over_budget_episode_is_marked(self) -> None:
+        episode = [
+            {"kind": "tool_result", "payload": {"call": {"tool_name": "bash"}, "result": {"ok": True, "stdout": "y" * 900}}}
+            for _ in range(80)
+        ]
+        payload = self._payload(episode, digest_episode_chars=4_000)
+        rows = payload["episode"]
+        self.assertEqual(rows[0]["kind"], "digest_truncated")
+        self.assertGreater(rows[0]["omitted_events"], 0)
+        self.assertLess(len(json.dumps(rows)), 5_500, "the budget is the budget")
+
+    def test_the_history_digest_carries_actions_and_outcomes(self) -> None:
+        history = [
+            {"role": "system", "content": "React system prompt"},
+            {"role": "assistant", "content": "thinking out loud", "tool_calls": [{"function": {"name": "read", "arguments": '{"path": "/etc/hosts"}'}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "localhost"},
+        ]
+        rows = self._payload([], chat_history=history)["chat_history"]
+        self.assertEqual([row["kind"] for row in rows], ["action", "result"])
+        self.assertEqual(rows[0]["tool"], "read")
+        self.assertIn("/etc/hosts", rows[0]["arguments"])
+        self.assertEqual(rows[1]["head"], "localhost")
+        self.assertNotIn("thinking out loud", json.dumps(rows))
+
+    def test_the_raw_payload_is_still_available(self) -> None:
+        episode = [{"kind": "tool_result", "payload": {"call": {"tool_name": "bash"}, "result": {"ok": True, "stdout": "y" * 400}}}]
+        payload = self._payload(episode, digest=False)
+        self.assertEqual(payload["episode"], episode)
+
+    def test_the_digested_ceiling_is_measured_from_the_digested_bound(self) -> None:
+        from skynet.memory import MemoryLoop
+
+        raw = MemoryLoop.request_ceiling_tokens(episode_char_budget=150_000)
+        digested = MemoryLoop.digested_ceiling_tokens()
+        self.assertLess(digested, raw / 2)
+        self.assertEqual(
+            digested,
+            (MemoryLoop.SHORT_MEMORY_CHARS + 8_000 + 24_000) // 3 + 8_192,
+        )
+
+
+class SpacedReplayTests(unittest.TestCase):
+    def _consolidated(self, store: StateStore, memory_id: str, *, replay_level, last_replay_at) -> None:
+        store.connection.execute(
+            """INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at,
+                                    lifecycle_stage,scope,replay_level,last_replay_at)
+               VALUES(?,?,?,?,NULL,?,?,?,?,?)""",
+            (
+                memory_id,
+                "fact",
+                f"content {memory_id}",
+                0.9,
+                "2026-01-01T00:00:00",
+                "consolidated",
+                "agent",
+                replay_level,
+                last_replay_at,
+            ),
+        )
+        store.connection.commit()
+
+    def test_epoch_utc_reads_timestamps_as_utc(self) -> None:
+        """Stored timestamps are UTC; parsing them as local time shifts the schedule.
+
+        ``time.mktime`` would read them as local time and move every replay by
+        the host offset (three hours on the MSK server), so the schedule could
+        fire a whole interval early or late.
+        """
+        stamp = "2026-01-02T03:04:05"
+        self.assertEqual(
+            SpacedReplayScheduler._epoch_utc(stamp),
+            calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S")),
+        )
+        self.assertIsNone(SpacedReplayScheduler._epoch_utc(None))
+        self.assertIsNone(SpacedReplayScheduler._epoch_utc("not a timestamp"))
+
+    def test_due_memory_is_replayed_and_advances_the_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            two_days_ago = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 2 * 86400))
+            self._consolidated(store, "due", replay_level=0, last_replay_at=two_days_ago)
+            stats = SpacedReplayScheduler(store.connection).run_replay_cycle()
+            self.assertEqual(stats["replayed"], 1)
+            row = store.connection.execute(
+                "SELECT replay_level, retrieval_count FROM memories WHERE memory_id='due'"
+            ).fetchone()
+            self.assertEqual((row["replay_level"], row["retrieval_count"]), (1, 1))
+            store.close()
+
+    def test_memory_inside_its_interval_is_not_due(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            one_hour_ago = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600))
+            self._consolidated(store, "fresh", replay_level=0, last_replay_at=one_hour_ago)
+            self.assertEqual(SpacedReplayScheduler(store.connection).run_replay_cycle()["replayed"], 0)
+            store.close()
+
+    def test_exhausted_schedule_is_never_due_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            long_ago = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 400 * 86400))
+            self._consolidated(
+                store,
+                "done",
+                replay_level=len(SpacedReplayScheduler.DEFAULT_INTERVALS),
+                last_replay_at=long_ago,
+            )
+            self.assertEqual(SpacedReplayScheduler(store.connection).run_replay_cycle()["replayed"], 0)
+            store.close()
+
+    def test_replay_cycle_is_bounded_per_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            long_ago = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 400 * 86400))
+            for index in range(5):
+                self._consolidated(store, f"m{index}", replay_level=0, last_replay_at=long_ago)
+            stats = SpacedReplayScheduler(store.connection).run_replay_cycle(max_per_cycle=2)
+            self.assertEqual(stats["replayed"], 2)
+            self.assertEqual(stats["candidates"], 5)
+            store.close()
+
+    def test_initialize_seeds_replay_level_for_consolidated_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            self._consolidated(store, "unseeded", replay_level=None, last_replay_at=None)
+            scheduler = SpacedReplayScheduler(store.connection)
+            self.assertEqual(scheduler.initialize_replay_tracking(), 1)
+            row = store.connection.execute(
+                "SELECT replay_level FROM memories WHERE memory_id='unseeded'"
+            ).fetchone()
+            self.assertEqual(row["replay_level"], 0)
+            # Idempotent: a second pass seeds nothing.
+            self.assertEqual(scheduler.initialize_replay_tracking(), 0)
+            store.close()
+
+    def test_attention_score_is_usage_evidence_not_query_relevance(self) -> None:
+        """The attention axis carries usage, not lexical similarity.
+
+        A lexical score here would only duplicate BM25 and lift exact stale
+        matches over fresh ones; the unique signal is how often a memory has
+        been retrieved, saturating at ten uses and scaled by complexity tier.
+        """
+        self.assertAlmostEqual(MemoryStore._compute_attention_score(0, 0, "Simple"), 0.0)
+        self.assertAlmostEqual(MemoryStore._compute_attention_score(5, 0, "Simple"), 0.5)
+        self.assertAlmostEqual(MemoryStore._compute_attention_score(10, 0, "Simple"), 1.0)
+        self.assertAlmostEqual(MemoryStore._compute_attention_score(50, 0, "Simple"), 1.0)  # saturated
+        self.assertAlmostEqual(MemoryStore._compute_attention_score(0, 10, "Complex"), 1.4)

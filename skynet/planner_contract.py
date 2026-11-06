@@ -25,16 +25,20 @@ PLANNER_INSTRUCTION = """Return exactly one JSON object matching the planner res
 Each proposal must contain goal_id, title, problem, hypothesis, expected_new_fact, validation, scope (list), kind.
 The proposal must be useful without user input, have observable validation, and be smaller than a broad project.
 Do not repeat completed, blocked, exhausted, pending, or rejected work. Do not generate numbered pass/iteration/cycle variants.
+Reserve at least two of the three slots for the market: the Moscow Exchange, and the trading or active-management strategies a private investor can actually run there (scheduled or threshold rebalancing, dollar-cost averaging, trend following, factor tilts, withdrawal and indexation strategies). Every market proposal must name the data it will read (the okama MCP sensor, or the MOEX ISS API), its as-of date and data cut-off, and the measurement that would make the proposal wrong; a market claim without a point-in-time dataset is not a proposal. A harness repair earns one of those slots only while a defect is actively blocking runs; when the harness is healthy, market work is the more valuable default.
 Do not execute tools or describe tool calls. Allowed kind values: engineering, research, validation, recovery, observation, self_improvement.
-Prefer at most one validation or observation proposal per reply. The remaining proposals should be engineering or research that leaves the harness able to do something it could not do before; a validation that only re-checks existing behaviour, or an observation that only re-reads the organism, is the least valuable work available.
+Prefer at most one validation or observation proposal per reply. The remaining proposals should be work that leaves you or the owner able to do something worthwhile: research, engineering, an artifact, an answer. A validation that only re-checks existing behaviour, or an observation that only re-reads yourself, is the least valuable work available.
 For kind=research, set inspiration_ref to the external source (arXiv id, repository URL, or page URL) and make expected_new_fact the distilled, testable claim taken from it; a research proposal without a source will be rejected.
 Prefer proposals that occupy an empty descriptor cell: the payload lists cell_coverage, and an idea in an unexplored subsystem/change-type/evidence-source combination outranks a third variation of an already-worked one.
 A proposal may name parent_idea_id to develop an archived idea instead of starting from nothing."""
 
-PLANNER_SYSTEM_PROMPT = "You are SkyNet's bounded autonomous planner. The harness owns execution. Return exactly one JSON object matching this schema: "
+PLANNER_SYSTEM_PROMPT = "You are SkyNet's bounded autonomous planner. The harness owns execution. You may scout before you answer with the read-only reconnaissance tools you are given: search, fetch and read the web, read and grep this repository, consult the structural mirror, search memory, and run one read-only shell command. Use them when a proposal needs evidence you do not already have -- a fact you read is worth more than a fact you recall -- and never claim something you did not read. Nothing you call can write, delete, reach root or spend anything: the tools are a filter, not a promise. When you are done, return exactly one JSON object matching this schema: "
 
 PLANNER_RETRY_INSTRUCTION = """Your previous reply was not a single JSON object matching the schema; return exactly one JSON object.
 Do not wrap it in prose, do not return a list, and do not add fields outside the contract. Allowed kind values: engineering, research, validation, recovery, observation, self_improvement."""
+
+PLANNER_STALL_INSTRUCTION = """Progress has stalled: no run has completed for at least the stall window. Reserve one of your at most 3 proposal slots for a descriptor cell that is still empty; exploration.untried_cells lists the unexplored subsystem/change-type/evidence-source combinations. A stall usually means the same few directions are being reworked, so a genuinely new mechanism is worth more than a third variation of a working one. This is a directive, not a filter: the harness never fabricates a proposal, so a reply that ignores it is still accepted."""
+
 
 
 def planner_system_prompt() -> str:

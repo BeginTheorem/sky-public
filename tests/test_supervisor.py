@@ -317,7 +317,7 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 supervisor.restart_service("../evil")
             supervisor.restart_service("skynet.service")
-            popen.assert_called_once_with(["systemctl", "restart", "skynet.service"], close_fds=True)
+            popen.assert_called_once_with(["systemctl", "--user", "restart", "skynet.service"], close_fds=True)
             supervisor.reactor.close()
 
     def test_restart_service_orders_client_before_reactor(self) -> None:
@@ -331,7 +331,7 @@ class CoreTests(unittest.TestCase):
             supervisor = Supervisor(FakeProvider(), {}, ReactorConfig(state_path=Path(directory) / "state.sqlite3"), root=directory)
             supervisor.restart_service(["skynet.service", "skynet-telegram.service"])
             popen.assert_called_once_with(
-                ["systemctl", "restart", "skynet-telegram.service", "skynet.service"],
+                ["systemctl", "--user", "restart", "skynet-telegram.service", "skynet.service"],
                 close_fds=True,
             )
             supervisor.reactor.close()
@@ -500,6 +500,53 @@ class CoreTests(unittest.TestCase):
                 self.assertTrue(result.get("rolled_back"))
                 self.assertEqual((root / "version.txt").read_text(encoding="utf-8"), "good\n")
                 self.assertEqual(calls, [1])
+            finally:
+                supervisor.stop()
+
+    def test_persisted_rollback_does_not_restart_on_every_cycle(self) -> None:
+        """A durable ``rolled_back`` window must not re-request a restart.
+
+        After the rollback, ``observe`` keeps returning ``rolled_back`` from the
+        guard file; acting on the bare flag restarted the service on every
+        startup. Measured 2026-10-13: five restarts in 22 seconds tripped
+        systemd's start limit and left both units ``failed``. Only the call that
+        actually performed the rollback may restart.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            (root / "version.txt").write_text("good\n", encoding="utf-8")
+            subprocess.run(["git", "add", "version.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "good"], cwd=root, check=True)
+            good = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            (root / "version.txt").write_text("broken\n", encoding="utf-8")
+            subprocess.run(["git", "add", "version.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "broken"], cwd=root, check=True)
+            state = root / "state"
+            state.mkdir()
+            (state / "reboot-request.json").write_text(
+                json.dumps({"commit": "abcdef1", "rollback_commit": good, "proposal_id": "proposal-x"}),
+                encoding="utf-8",
+            )
+            supervisor = Supervisor(FakeProvider(), {}, ReactorConfig(state_path=state / "state.sqlite3"), root=root)
+            supervisor.start()
+            try:
+                calls: list[int] = []
+                supervisor.set_restart_callback(lambda: calls.append(1))
+                with patch.object(supervisor, "health_check", return_value={"ok": False, "checks": {}, "details": {}}):
+                    first = supervisor.observe_reboot()
+                    second = supervisor.observe_reboot()
+                    third = supervisor.observe_reboot()
+                self.assertTrue(first.get("rolled_back"))
+                self.assertTrue(first.get("changed"))
+                self.assertFalse(second.get("changed"))
+                self.assertFalse(third.get("changed"))
+                self.assertEqual(calls, [1], "only the rollback that changed the tree may restart")
+                guard = json.loads((state / "reboot-guard.json").read_text(encoding="utf-8"))
+                self.assertTrue(guard["rolled_back"])
+                self.assertFalse(guard["active"], "a rolled-back window is terminal, not open")
             finally:
                 supervisor.stop()
 

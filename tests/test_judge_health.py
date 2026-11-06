@@ -239,5 +239,58 @@ class JudgeHealthRestartBoundaryTests(unittest.TestCase):
             store.close()
 
 
+class JudgeHealthRejectStreakTests(unittest.TestCase):
+    """A total-rejection streak is invisible to ``success_rate`` and needs its own alert."""
+
+    @staticmethod
+    def _order(store: StateStore) -> None:
+        # Make recency unambiguous: rowid follows insertion order, so the last
+        # seeded status becomes the newest and the streak is deterministic.
+        store.connection.execute(
+            "UPDATE planner_attempts SET finished_at = '2026-01-01T00:00:' || printf('%02d', rowid) || '.000000Z'"
+        )
+
+    def test_all_rejected_streak_fires_while_success_rate_is_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            _seed(store, ["completed"] * 3 + ["all_rejected"] * 5)
+            self._order(store)
+            result = check_judge_health(store)
+            self.assertEqual(result["success_rate"], 1.0, "all_rejected counts as decided")
+            self.assertFalse(result["degraded"])
+            self.assertEqual(result["reject_streak"], 5)
+            self.assertTrue(result["streak_degraded"])
+            self.assertTrue(result["streak_alerted"])
+            kinds = {str(row[0]) for row in store.connection.execute("SELECT kind FROM alerts WHERE delivered_at IS NULL")}
+            self.assertIn("planner_all_rejected_streak", kinds)
+            streak_events = int(
+                store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='judge_all_rejected_streak'").fetchone()[0]
+            )
+            self.assertEqual(streak_events, 1)
+            store.close()
+
+    def test_a_success_breaking_the_streak_does_not_fire(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            _seed(store, ["all_rejected"] * 5 + ["completed"])
+            self._order(store)
+            result = check_judge_health(store)
+            self.assertEqual(result["reject_streak"], 0)
+            self.assertFalse(result["streak_degraded"])
+            self.assertEqual(_alert_count(store), 0)
+            store.close()
+
+    def test_short_reject_streak_does_not_fire(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            _seed(store, ["completed"] * 4 + ["all_rejected"] * 2)
+            self._order(store)
+            result = check_judge_health(store)
+            self.assertEqual(result["reject_streak"], 2)
+            self.assertFalse(result["streak_degraded"])
+            self.assertEqual(_alert_count(store), 0)
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,11 @@
 [Unit]
 Description=SkyNet automatic startup rollback
+# OnFailure= starts this unit on *every* failed start, including each attempt of
+# an auto-restart loop (a five-restart start-limit burst started it five times).
+# The rollback is destructive and must not hammer: at most one start per window.
+StartLimitIntervalSec=300
+StartLimitBurst=1
 
 [Service]
 Type=oneshot
-User=root
 ExecStart=/bin/bash @ROOT@/scripts/skynet-startup-rollback.sh

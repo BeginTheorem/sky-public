@@ -9,21 +9,33 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
-from .model_contracts import FINISH_REPORT_SCHEMA, clamp_to_schema, parse_json_object, validate_shape
-from .models import AgentRunResult, ModelTurn, RunStatus, StartEnvelope
+from .finish_tool import FINISH_TOOL_NAME
+from .git_hygiene import read_only_git
+from .model_contracts import (
+    FINISH_REPORT_SCHEMA,
+    MAX_MODEL_REASKS,
+    clamp_to_schema,
+    corrective_reask_instruction,
+    parse_json_object,
+    validate_shape,
+)
+from .models import AgentRunResult, ModelTurn, RunStatus, StartEnvelope, ToolCall
 from .provider import LLMProvider, Message, Tool
 from .providers.errors import ProviderError
 from .runtime_log import verbose_enabled, verbose_write
 from .store import StateStore
+from .tool_catalog import INVOKE_TOOL_NAME, intention_text, tool_surface
 
 log = logging.getLogger("skynet.react")
 MAX_RESPONSE_LOG_PREVIEW = 2000
-WORKTREE_STATUS_TIMEOUT_SECONDS = 5.0
+# Five seconds was a race, not a bound: the timeout killed git mid index-refresh and
+# left a 0-byte .git/index.lock that blocked publication for five hours (2026-10-28).
+WORKTREE_STATUS_TIMEOUT_SECONDS = 30.0
 WORKTREE_WARNING_MAX_FILES = 20
 RUN_PROGRESS_MESSAGE_LIMIT = 300
 RUN_PROGRESS_TOOL_LIMIT = 60
@@ -94,7 +106,7 @@ def _terminate_process_groups(groups: set[int]) -> None:
 @dataclass(slots=True)
 class ReActConfig:
     max_steps: int = 100
-    max_tokens: int = 200_000  # maximum input context for one provider request
+    max_tokens: int = 100_000  # maximum input context for one provider request
     output_tokens: int = 8_192
     timeout_seconds: float = 1800.0
     context_warning_ratio: float = 0.5
@@ -112,10 +124,58 @@ class ReActConfig:
     provider_retry_backoff_seconds: float = 1.0
     read_tool_retries: int = 1
     tool_retry_backoff_seconds: float = 0.5
+    # Left at the shipped 3: every compaction re-sends a cache-cold transcript, so the
+    # cheap half of this fix is the ordering, not the count.
     max_compactions: int = 3
-    compaction_keep_messages: int = 4
+    # Compaction had never once run in production. The reserve clears at
+    # ``request_limit - reserve`` and the finish fires at ``finish_threshold_ratio`` of the
+    # same limit, which at the shipped reserve (``limit // 8``) is the *same number* --
+    # 87,500 on a 100k window, and on a 600k one 525,000 against 550,000 -- while the finish
+    # check is tested first and returns. Measured 2026-10-19: zero `context_compacted` events
+    # in the whole epoch, and 14 runs that ended as `protective context threshold` -- 26.7M
+    # tokens, no deliverable. Compacting at a ratio *below* the finish threshold is what makes
+    # a long episode's tail usable instead of fatal. 0 disables compaction.
+    compaction_threshold_ratio: float = 0.75
+    # How much of the tail a compaction keeps verbatim. `_compact_messages` keeps
+    # ``compaction_keep_messages - 3`` messages plus the durable start, so the shipped 4 left
+    # a single exchange: enough not to crash, too little to keep working from.
+    compaction_keep_messages: int = 8
     max_repeated_responses: int = 3
+    # A bash edit leaves tracked files modified, the next edit leaves them again,
+    # and propose_self_improvement refuses a dirty tree, so the model can loop
+    # edit -> warn -> edit for a whole episode. Measured on the deployed
+    # organism: 10 284 worktree_dirty_after_bash rows and 107 doom loops, while
+    # the exact-response guard above never tripped because every command
+    # differed. One countable signal survives that variation - the same tracked
+    # files staying modified across consecutive bash steps - so after this many
+    # consecutive dirty steps the episode is closed instead of re-editing.
+    # 0 disables the guard.
+    max_dirty_streak: int = 5
     tool_result_max_chars: int = 8_000
+    # Tiered tool schemas (`skynet/tool_catalog.py`): the house tools travel full, a sense
+    # family only when this episode's own intention names it, and the rest as compact stubs
+    # behind `describe_tool`. Measured: 52 schemas cost 17,956 tokens on every request, 30%
+    # of the epoch's prompt tokens, while a run called a median of seven tools. False
+    # restores the untiered request byte for byte.
+    tool_catalog: bool = True
+    # A failed tool result is re-sent on every later request of the episode, and
+    # what matters in it is its first error line, not the whole payload. On my
+    # own ledger (2026-10-16) results with ok=false were 265,116 of 3,261,267
+    # token-units (8.1%) of the long-run bill and 17.7% of one run's; in the
+    # live ledger 34 failed results hold 101,645 chars, 54,601 of them above
+    # this cap. Cutting at ingestion costs no usable information: a char never
+    # inserted is never re-read as a cache read (arXiv:2606.17016), and no later
+    # clearing is needed -- clearing is what invalidates the cached prefix
+    # (Anthropic context-editing docs, which is why clear_at_least exists).
+    failed_result_max_chars: int = 2_000
+    # Head-only character truncation drops the tail, which is exactly where a
+    # build or test verdict lands (Pydantic AI harness ToolOutputLimits: its
+    # tail strategy is "good for build and test output where errors land last",
+    # and keep_tail_lines reserves the final lines before the rest of the budget
+    # is allocated). A bounded preview therefore keeps its last
+    # `truncation_tail_lines` whole lines inside the same character budget, with
+    # an explicit elision marker between the head and the tail. 0 disables it.
+    truncation_tail_lines: int = 8
     # An owner message that arrives mid-episode is invisible to a loop that reads
     # the inbox only when the envelope is built. Measured on this repository: a
     # message posted while an episode ran never entered that run's observations
@@ -133,6 +193,45 @@ class ReActConfig:
     # billed as progress. The count is additionally capped at
     # ``run budget // interval`` and stops once the Finish phase begins.
     run_progress_seconds: float = 3600.0
+
+
+# Below this budget a JSON tail is punctuation rather than a verdict line, so
+# the preview stays a plain head clip, exactly as before.
+_MIN_TAIL_PREVIEW_CHARS = 128
+
+
+def _bounded_preview(content: str, limit: int, tail_lines: int) -> str:
+    """A head plus the last `tail_lines` lines, never longer than `limit`.
+
+    The tail is where a build or test verdict lands, so a head-only clamp can
+    hide the one line the model needed. The elision marker makes the cut visible
+    instead of silent. The length invariant is absolute -- every branch returns
+    at most `limit` characters -- because the caller's context budget depends on
+    it. `tail_lines <= 0`, or a limit below `_MIN_TAIL_PREVIEW_CHARS`, keeps the
+    previous behaviour exactly.
+    """
+    if len(content) <= limit or tail_lines <= 0 or limit < _MIN_TAIL_PREVIEW_CHARS:
+        return content[:limit]
+    newline = json.dumps("\n")[1:-1]
+    budget = max(1, limit // 4)
+    pieces = content.split(newline)
+    tail = ""
+    for piece in reversed(pieces[-tail_lines:] if len(pieces) > tail_lines else pieces):
+        candidate = piece + newline
+        if len(candidate) > budget or len(tail) + len(candidate) > budget:
+            break
+        tail = candidate + tail
+    if not tail:
+        return content[:limit]
+    marker = ""
+    for _ in range(3):
+        elided = len(content) - (limit - len(marker) - len(tail)) - len(tail)
+        marker = f"...[{max(0, elided)} chars elided]..."
+    head = limit - len(marker) - len(tail)
+    if head < 1:
+        return content[:limit]
+    preview = f"{content[:head]}{marker}{tail}"
+    return preview if len(preview) <= limit else content[:limit]
 
 
 class ReActRunner:
@@ -155,16 +254,29 @@ class ReActRunner:
         self.worktree_root = Path(worktree_root) if worktree_root else None
         self._worktree_status_step: int | None = None
         self._worktree_status: list[str] = []
+        self._dirty_streak = 0
+        self._dirty_files_prev: set[str] = set()
+        self._worktree_guard_tripped = False
         # Owner progress emission is opt-in: without a callback the runner is
         # byte-for-byte as before, and the Reactor is the only outbox writer.
         self._on_progress = on_progress
         self._progress_next_at = 0.0
         self._progress_sent = 0
         self._finish_phase = False
+        # Wall clock of the last request this runner logged, for the gap_seconds field the
+        # request telemetry carries. A long gap is what breaks a provider's prefix cache:
+        # measured on the deployed organism, steps <=60s apart hit the cache 91% of the time
+        # with 5% full misses, while gaps over five minutes missed 41-100% of the time.
+        self._last_request_at: float | None = None
 
     def run(self, start: StartEnvelope, system_prompt: str) -> AgentRunResult:
+        # The tool surface is decided once, here. The catalogue rides in the *system* prompt so a
+        # compaction cannot drop it (`_compact_messages` keeps messages[:2]), and the schemas are
+        # reused for every step below instead of being recomputed per request.
+        surface = tool_surface(self.tools, intention_text(start), enabled=self.config.tool_catalog)
+        tool_schemas = surface.schemas
         messages: list[Message] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + surface.system_suffix()},
             {"role": "user", "content": "START ENVELOPE\n" + json.dumps(start.as_dict(), ensure_ascii=False) + "\nEND START ENVELOPE"},
         ]
         self._record_history(start.run_id, messages)
@@ -181,8 +293,12 @@ class ReActRunner:
         failed_proposals: set[str] = set()
         self._worktree_status_step = None
         self._worktree_status = []
+        self._dirty_streak = 0
+        self._dirty_files_prev = set()
+        self._worktree_guard_tripped = False
         self._finish_phase = False
         self._progress_sent = 0
+        self._last_request_at = None
         progress_interval = float(self.config.run_progress_seconds)
         self._progress_next_at = progress_interval if progress_interval > 0 else 0.0
         steps_limit = max(1, min(int(start.budget.steps), self.config.max_steps))
@@ -193,7 +309,7 @@ class ReActRunner:
             reset = getattr(tool, "reset_run_scope", None)
             if callable(reset):
                 reset()
-        tool_schemas = [tool.schema for tool in self.tools.values()]
+        # tool_schemas was built at the top of run(), together with the catalogue it complements.
         self.store.append_event("react_phase", {"phase": phase}, start.run_id)
         self.store.touch_run(start.run_id, phase)
 
@@ -215,12 +331,13 @@ class ReActRunner:
                 return AgentRunResult(status, report, step, used_tokens + finish_usage, "time budget")
             request_tokens = self._request_tokens(messages, tool_schemas)
             reserve = min(self.config.context_finish_reserve, max(0, request_limit // 8))
-            if request_tokens >= request_limit * self.config.finish_threshold_ratio:
-                status, report, finish_usage = self._finish(messages, start.run_id, reason="protective context threshold")
-                return AgentRunResult(status, report, step, used_tokens + finish_usage, "protective context threshold")
-            if request_tokens + reserve >= request_limit:
-                if len(messages) > 3 and compactions < self.config.max_compactions:
-                    messages = self._compact_messages(messages)
+            # Compaction is tested BEFORE the finish threshold: the two used to share one
+            # number and the finish returned first, so a full window could only ever end the
+            # episode. See `compaction_threshold_ratio`.
+            if self._compaction_due(request_tokens, request_limit, compactions):
+                compacted = self._compact_messages(messages)
+                if compacted != messages:
+                    messages = compacted
                     compactions += 1
                     self.store.append_event(
                         "context_compacted",
@@ -228,6 +345,10 @@ class ReActRunner:
                         start.run_id,
                     )
                     continue
+            if request_tokens >= request_limit * self.config.finish_threshold_ratio:
+                status, report, finish_usage = self._finish(messages, start.run_id, reason="protective context threshold")
+                return AgentRunResult(status, report, step, used_tokens + finish_usage, "protective context threshold")
+            if request_tokens + reserve >= request_limit:
                 self.store.append_transcript(
                     "context_limit",
                     {"estimated_tokens": request_tokens, "limit": request_limit},
@@ -273,21 +394,22 @@ class ReActRunner:
                 })
                 time_warning_sent = True
             request_tokens = self._request_tokens(messages, tool_schemas)
+            if self._compaction_due(request_tokens, request_limit, compactions):
+                compacted = self._compact_messages(messages)
+                if compacted != messages:
+                    messages = compacted
+                    compactions += 1
+                    self.store.append_event(
+                        "context_compacted",
+                        {"estimated_tokens_before": request_tokens, "messages_after": len(messages), "attempt": compactions},
+                        start.run_id,
+                    )
+                    continue
             if request_tokens >= request_limit * self.config.finish_threshold_ratio:
                 status, report, finish_usage = self._finish(messages, start.run_id, reason="protective context threshold")
                 return AgentRunResult(status, report, step, used_tokens + finish_usage, "protective context threshold")
             if request_tokens + reserve >= request_limit:
-                compacted = self._compact_messages(messages)
-                if compacted == messages or compactions >= self.config.max_compactions:
-                    return self._context_budget_result(messages, start.run_id, step, used_tokens)
-                messages = compacted
-                compactions += 1
-                self.store.append_event(
-                    "context_compacted",
-                    {"estimated_tokens_before": request_tokens, "messages_after": len(messages), "attempt": compactions},
-                    start.run_id,
-                )
-                continue
+                return self._context_budget_result(messages, start.run_id, step, used_tokens)
             # Emitted after every finish-triggering guard above, so a run that is
             # about to close never sends a "still running" note, and never after
             # the Finish phase has begun.
@@ -375,14 +497,15 @@ class ReActRunner:
                 self._record_history(start.run_id, messages)
                 self.store.append_event("finish_report", {"step": step + 1, "text": turn.text, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens}, start.run_id)
                 report = turn.text.strip()
-                parsed_report = self._read_finish_report(report, start.run_id)
-                if parsed_report is not None:
-                    status, report = parsed_report
-                    return AgentRunResult(status, report, step + 1, used_tokens)
+                status, parsed_or_error = self._parse_finish_report_with_error(report, start.run_id)
+                if status is not None:
+                    return AgentRunResult(status, parsed_or_error, step + 1, used_tokens)
                 # The reply is unreadable, but this episode already executed tools.
                 # Ask once more before discarding that work: a zero-length or prose
-                # closing turn must not be the only chance to report it.
-                repaired = self._repair_finish_report(report, start.run_id, messages, step=step)
+                # closing turn must not be the only chance to report it. The parser
+                # error is handed to the repair turn so the retry is specific, not a
+                # blind resample.
+                repaired = self._repair_finish_report(report, start.run_id, messages, step=step, parser_error=parsed_or_error)
                 if repaired is not None:
                     status, report, repair_usage = repaired
                     self.store.append_event("finish_report", {"step": step + 1, "text": report, "usage_tokens": repair_usage, "repaired": True}, start.run_id)
@@ -415,6 +538,7 @@ class ReActRunner:
             messages.append(assistant_message)
 
             for call in turn.tool_calls:
+                call = self._resolve_meta_call(call, start.run_id)
                 # Record every attempted invocation, including unknown tools, so
                 # recovery can reconcile the same observable event that produced
                 # the result.
@@ -438,7 +562,37 @@ class ReActRunner:
                     )
                     return AgentRunResult(status, report, step + 1, used_tokens, "time budget")
                 tool = self.tools.get(call.tool_name)
-                if tool is None:
+                if call.tool_name == FINISH_TOOL_NAME:
+                    # The closing call carries the Finish Report as its arguments -- the shape the
+                    # model already reaches for: 39 calls to a `finish` tool died at "unknown tool"
+                    # while 15 of 69 prose closings were unreadable. A usable report ends the
+                    # episode here; an unusable one returns the parser's own error, which the model
+                    # can fix in this same episode instead of spending the repair turn.
+                    closed = self._close_from_finish_arguments(call.arguments, start.run_id)
+                    if closed is not None:
+                        status, report = closed
+                        self.store.append_event(
+                            "finish_report",
+                            {"text": report, "via": FINISH_TOOL_NAME, "forced": False, "reason": "finish tool"},
+                            start.run_id,
+                        )
+                        self._record_history(start.run_id, messages)
+                        return AgentRunResult(status, report, step + 1, used_tokens, "finish tool")
+                    _unused, refusal = self._parse_finish_report_with_error(
+                        json.dumps({str(key): value for key, value in call.arguments.items()}, ensure_ascii=False, default=str),
+                        start.run_id,
+                    )
+                    result = {
+                        "ok": False,
+                        "error": f"invalid Finish Report: {refusal}",
+                        "failure_class": "invalid_finish_report",
+                        "hint": (
+                            "call finish again with the report's required fields: COMPLETED needs non-empty "
+                            "evidence, BLOCKED needs a blocker"
+                        ),
+                    }
+                    result_address = f"{start.run_id}:{step}:{call.call_id}"
+                elif tool is None:
                     result = {"ok": False, "error": f"unknown tool: {call.tool_name}"}
                     result_address = ""
                 else:
@@ -568,6 +722,25 @@ class ReActRunner:
                         {"tool": call.tool_name, "arguments": call.arguments},
                         start.run_id,
                     )
+                # The dirty-worktree guard: after the streak threshold the model
+                # kept re-editing tracked files it never captured. A pending
+                # control action (a deferred restart) is handled below, so the
+                # guard must not shadow it.
+                if self._worktree_guard_tripped and result.get("control_action") is None:
+                    self.store.append_event(
+                        "worktree_dirty_guard",
+                        {
+                            "step": step + 1,
+                            "streak": self._dirty_streak,
+                            "threshold": self.config.max_dirty_streak,
+                            "files": sorted(self._dirty_files_prev)[:WORKTREE_WARNING_MAX_FILES],
+                        },
+                        start.run_id,
+                    )
+                    status, report, finish_usage = self._finish(messages, start.run_id, reason="dirty worktree loop")
+                    if status == RunStatus.NEEDS_RECOVERY:
+                        report = report or "Dirty worktree loop detected"
+                    return AgentRunResult(status, report, step + 1, used_tokens + finish_usage, "dirty worktree loop")
                 control_action = result.get("control_action")
                 if isinstance(control_action, dict) and control_action.get("type") == "restart_after_checkpoint":
                     deferred_control = dict(control_action)
@@ -604,42 +777,94 @@ class ReActRunner:
         status, report, finish_usage = self._emergency_finish(messages, run_id)
         return AgentRunResult(status, report, step, used_tokens + finish_usage, "context budget")
 
+    def _finish_tools(self) -> list[dict[str, Any]]:
+        """The one tool the closing turn may call: the Finish Report's own contract.
+
+        The closing turn used to travel with no tools at all, and 15 of 69 of them came back as
+        prose the parser could not read. Offering the report's schema instead of an empty list
+        keeps the Finish phase free of execution tools -- which is what that emptiness was for --
+        while giving the model a structured channel to close on.
+        """
+        tool = self.tools.get(FINISH_TOOL_NAME)
+        schema = getattr(tool, "schema", None)
+        return [schema] if isinstance(schema, dict) else []
+
+    def _closing_reply_text(self, turn: ModelTurn) -> str:
+        """The report a closing turn carried: its finish call if it made one, else its prose."""
+        for call in turn.tool_calls:
+            if call.tool_name == FINISH_TOOL_NAME:
+                return json.dumps(dict(call.arguments), ensure_ascii=False, default=str)
+        return turn.text.strip()
+
+    def _close_from_finish_arguments(self, arguments: Any, run_id: str) -> tuple[RunStatus, str] | None:
+        """Close the episode from the finish tool's arguments, or return ``None``.
+
+        ``None`` means the arguments are not a usable report, so the caller hands the parser's own
+        refusal back to the model, which can correct it in this same episode: the error is specific
+        and the whole transcript does not have to be re-sent for it.
+        """
+        if not isinstance(arguments, dict):
+            return None
+        payload = json.dumps({str(key): value for key, value in arguments.items()}, ensure_ascii=False, default=str)
+        status, parsed_or_error = self._parse_finish_report_with_error(payload, run_id)
+        if status is None:
+            return None
+        return status, parsed_or_error
+
     def _finish(self, messages: list[Message], run_id: str, *, reason: str = "normal") -> tuple[RunStatus, str, int]:
         """Force a Finish turn and return the parsed status, report, and usage."""
         self._finish_phase = True
         self._record_history(run_id, messages)
         self.store.append_event("react_phase", {"phase": "finish", "reason": reason}, run_id)
         finish_messages = self._finish_messages(messages)
-        finish_messages.append({"role": "system", "content": "Finish phase. Do not call tools. Return only one JSON object matching the Finish Report contract in the ReAct system prompt."})
+        finish_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Finish phase. Call the finish tool with the Finish Report's fields; the arguments "
+                    "are the report. A report written as prose is not accepted."
+                ),
+            }
+        )
         reserve = min(self.config.context_finish_reserve, max(0, self.config.max_tokens // 8))
         if self._request_tokens(finish_messages, []) + reserve >= self.config.max_tokens:
-            return self._local_finish(messages, run_id, reason, "Finish context exceeded the per-request limit")
+            return self._local_finish(messages, run_id, reason, "Finish context exceeded the per-request limit", situation="harness_stop")
         try:
-            turn, _turn_seconds = self._complete_with_retry(finish_messages, max_tokens=self.config.output_tokens, tools=[], run_id=run_id, step=-1)
+            # Forced: the closing turn answers with the report's fields, not with a paragraph the
+            # parser has to reconstruct. `tool_choice` is an optional capability, so a provider
+            # without it keeps the offered-tool behaviour.
+            turn, _turn_seconds = self._complete_with_retry(
+                finish_messages,
+                max_tokens=self.config.output_tokens,
+                tools=self._finish_tools(),
+                run_id=run_id,
+                step=-1,
+                tool_choice={"type": "function", "function": {"name": FINISH_TOOL_NAME}},
+            )
         except Exception as exc:
             self.store.append_event("finish_failure", {"error": str(exc)[:1000]}, run_id)
-            return self._local_finish(messages, run_id, reason, f"Provider Finish failed: {str(exc)[:300]}")
-        report = turn.text.strip()
+            return self._local_finish(messages, run_id, reason, f"Provider Finish failed: {str(exc)[:300]}", situation="provider_unavailable")
+        report = self._closing_reply_text(turn)
         self._record_history(run_id, [*messages, {"role": "assistant", "content": report}])
-        parsed_report = self._read_finish_report(report, run_id)
-        if parsed_report is None:
+        status, parsed_or_error = self._parse_finish_report_with_error(report, run_id)
+        if status is None:
             # The context was just reserved for a Finish request, so the one
-            # bounded repair turn is affordable by construction.
-            repaired = self._repair_finish_report(report, run_id, finish_messages, step=-1, force=True)
+            # bounded repair turn is affordable by construction. The parser error
+            # makes the retry specific instead of a blind resample.
+            repaired = self._repair_finish_report(report, run_id, finish_messages, step=-1, force=True, parser_error=parsed_or_error, attempted_tool_calls=turn.tool_calls)
             if repaired is not None:
-                status, report, repair_usage = repaired
+                repaired_status, report, repair_usage = repaired
                 self.store.append_event("finish_report", {"text": report, "usage_tokens": repair_usage, "forced": reason != "normal", "reason": reason, "repaired": True}, run_id)
-                return status, report, turn.total_tokens + repair_usage
+                return repaired_status, report, turn.total_tokens + repair_usage
             if not report:
-                status, carried = self._carry_evidence_forward(f"Finish Report missing ({reason})", run_id, messages)
-                return status, carried, turn.total_tokens
+                carried_status, carried = self._carry_evidence_forward(f"Finish Report missing ({reason})", run_id, messages)
+                return carried_status, carried, turn.total_tokens
             status, report = self._parse_finish_report(report, run_id)
             if status == RunStatus.NEEDS_RECOVERY:
                 status, report = self._carry_evidence_forward(report, run_id, messages)
             return status, report, turn.total_tokens
-        status, report = parsed_report
-        self.store.append_event("finish_report", {"text": report, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens, "forced": reason != "normal", "reason": reason}, run_id)
-        return status, report, turn.total_tokens
+        self.store.append_event("finish_report", {"text": parsed_or_error, "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens, "forced": reason != "normal", "reason": reason}, run_id)
+        return status, parsed_or_error, turn.total_tokens
 
     def _parse_finish_report(self, report: str, run_id: str, *, record_failure: bool = True) -> tuple[RunStatus, str]:
         try:
@@ -686,9 +911,23 @@ class ReActRunner:
         The caller must tell "unreadable, ask once more" from "unreadable, give
         up", so the failure event is written by the caller, not the parser.
         """
+        status, parsed_or_error = self._parse_finish_report_with_error(report, run_id)
+        if status is None:
+            return None
+        return status, parsed_or_error
+
+    def _parse_finish_report_with_error(self, report: str, run_id: str) -> tuple[RunStatus | None, str]:
+        """Parse a closing reply and return ``(status, parsed_or_error)``.
+
+        On success: ``(RunStatus, normalized_json)``. On failure:
+        ``(None, parser_error_string)``. Does not record a failure event. The
+        caller needs the error text to make the bounded repair turn specific:
+        Huang et al. (2023) arXiv:2310.01798v2 showed that a generic retry
+        without the concrete error is self-correction that degrades reasoning.
+        """
         status, parsed = self._parse_finish_report(report, run_id, record_failure=False)
         if status == RunStatus.NEEDS_RECOVERY:
-            return None
+            return None, parsed  # parsed is the error string
         return status, parsed
 
     @staticmethod
@@ -891,8 +1130,10 @@ class ReActRunner:
         *,
         step: int = -1,
         force: bool = False,
+        parser_error: str | None = None,
+        attempted_tool_calls: Sequence[Any] = (),
     ) -> tuple[RunStatus, str, int] | None:
-        """One bounded repair turn when the closing reply is not a report.
+        """Bounded re-asks when the closing reply is not a report.
 
         Live evidence: 4 of the 7 recorded ``finish_invalid`` events are replies
         the parser could not read - one zero-length turn and three prose turns -
@@ -902,10 +1143,20 @@ class ReActRunner:
         a re-run recovered 45% of flagged failures against a 16% resampling
         control, for about one extra model call per run (arXiv:2608.02464).
 
-        Returns None when the episode has no work at risk, when the turn is
-        unaffordable, when the provider fails, or when the retry is unreadable
-        too. The caller then reports the original failure, so this can only
-        recover a run, never close one without a valid report.
+        The warning is specific rather than generic, because the dominant live
+        failure is not silence but a tool call where the phase has no tools:
+        measured 2026-09-28, 29 of 149 Finish turns came back
+        ``finish_reason=tool_calls`` with empty text even though the request
+        carried no tool definitions at all, and 11 ``finish_repair_failed``
+        events recorded ``report_chars=0``. Huang et al. (2023)
+        arXiv:2310.01798v2 showed that intrinsic self-correction (a generic retry
+        without executed feedback) degrades reasoning; every re-ask therefore
+        names the attempted tool calls, quotes the failing reply, and lists the
+        tools the episode actually ran.
+
+        Up to ``MAX_MODEL_REASKS`` re-asks, then this returns None so the caller
+        reports the original failure. It can only recover a run, never close one
+        without a valid report.
         """
         if not self._episode_has_durable_work(messages):
             self.store.append_event("finish_repair_skipped", {"reason": "no tool calls in the episode"}, run_id)
@@ -915,51 +1166,105 @@ class ReActRunner:
             if self._request_tokens(messages, []) + reserve >= self.config.max_tokens:
                 self.store.append_event("finish_repair_skipped", {"reason": "context budget"}, run_id)
                 return None
-        unreadable = "the reply was empty" if not report.strip() else "the reply was not one JSON object"
-        repair_messages = [
-            *messages,
-            {
-                "role": "system",
-                "content": (
-                    f"Your previous closing reply was not a readable Finish Report ({unreadable}). "
-                    "Do not call tools. Return only one JSON object matching the Finish Report "
-                    "contract in the system prompt."
-                ),
-            },
-        ]
-        try:
-            turn, _turn_seconds = self._complete_with_retry(
-                repair_messages, max_tokens=self.config.output_tokens, tools=[], run_id=run_id, step=step
-            )
-        except Exception as exc:
-            self.store.append_event("finish_repair_failed", {"error": str(exc)[:500]}, run_id)
-            return None
-        retry_report = turn.text.strip()
-        parsed = self._read_finish_report(retry_report, run_id)
-        if parsed is None:
+        executed_tools = self._succeeded_tool_names(messages)
+        tool_summary = f" Executed tools: {', '.join(executed_tools)}." if executed_tools else ""
+        failing_reply = report.strip()
+        pending = list(attempted_tool_calls)
+        usage = 0
+        for attempt in range(1, MAX_MODEL_REASKS + 1):
+            instruction = corrective_reask_instruction(
+                phase="finish",
+                tool_calls=pending,
+                parser_error=(parser_error or "") if attempt == 1 else "",
+            ) + tool_summary
+            if attempt == 1 and failing_reply:
+                # The forced-finish path never appended the failing reply to the
+                # conversation, so the model was asked to correct a message it
+                # could not see. Quote it back, bounded, so a long prose turn
+                # cannot flood the context.
+                instruction = f"Your previous reply was: {failing_reply[:400]}\n{instruction}"
+            repair_messages = [*messages, {"role": "system", "content": instruction}]
+            try:
+                turn, _turn_seconds = self._complete_with_retry(
+                    repair_messages, max_tokens=self.config.output_tokens, tools=[], run_id=run_id, step=step
+                )
+            except Exception as exc:
+                self.store.append_event("finish_repair_failed", {"attempt": attempt, "error": str(exc)[:500]}, run_id)
+                return None
+            usage += turn.total_tokens
+            retry_report = turn.text.strip()
+            parsed = self._read_finish_report(retry_report, run_id)
+            if parsed is not None:
+                status, parsed_report = parsed
+                self.store.append_event(
+                    "finish_repair",
+                    {"usage_tokens": usage, "report_chars": len(retry_report), "attempts": attempt},
+                    run_id,
+                )
+                return status, parsed_report, usage
+            pending = list(turn.tool_calls)
             self.store.append_event(
                 "finish_repair_failed",
-                {"error": "retry reply was not a Finish Report", "report_chars": len(retry_report)},
+                {
+                    "attempt": attempt,
+                    "error": "retry reply was not a Finish Report",
+                    "report_chars": len(retry_report),
+                    "attempted_tools": [str(call.tool_name) for call in turn.tool_calls],
+                },
                 run_id,
             )
-            return None
-        status, parsed_report = parsed
-        self.store.append_event(
-            "finish_repair",
-            {"usage_tokens": turn.total_tokens, "report_chars": len(retry_report)},
-            run_id,
-        )
-        return status, parsed_report, turn.total_tokens
+        return None
 
-    def _local_finish(self, messages: list[Message], run_id: str, reason: str, detail: str) -> tuple[RunStatus, str, int]:
+    def _local_finish(self, messages: list[Message], run_id: str, reason: str, detail: str, *, situation: str = "harness_stop") -> tuple[RunStatus, str, int]:
         report = f"Finish Report (harness): cycle stopped safely. Reason: {reason}. {detail}. Full evidence remains in the durable event log."
         self.store.append_event("finish_report", {"text": report, "usage_tokens": 0, "forced": True, "local": True, "reason": reason}, run_id)
         # A harness stop is not the episode's fault, but it is still a stop after
         # work: measured in the sweep test, this exit discarded six successful
         # tool results and returned the harness sentence alone. An episode with
         # no executed tool call keeps that sentence verbatim.
-        _status, carried = self._carry_evidence_forward(report, run_id, messages, situation="harness_stop")
-        report = carried
+        # For harness_stop, the in-memory message history is lost (process interrupted),
+        # so we must read executed tool names from the durable event log.
+        # For other situations (finish_unreadable, provider_unavailable, time_budget_before_tool,
+        # step_budget, deferred_restart), the process is still alive and messages are valid.
+        if situation == "harness_stop":
+            executed = self.store.run_executed_tool_names(run_id)
+            if not executed:
+                return RunStatus.NEEDS_RECOVERY, report, 0
+            why, blocker = self.EVIDENCE_CARRY_SITUATIONS.get(
+                situation, self.EVIDENCE_CARRY_SITUATIONS["finish_unreadable"]
+            )
+            evidence = [f"executed tool: {name}" for name in executed]
+            carried = json.dumps(
+                {
+                    "status": "NEEDS_RECOVERY",
+                    "summary": (
+                        f"{why}; "
+                        f"{len(executed)} tool call(s) did execute, so their evidence is carried forward "
+                        f"instead of being discarded. Reported error: {report[:300]}"
+                    ),
+                    "evidence": evidence or ["no evidence recorded"],
+                    "actions": [f"tool call: {name}" for name in executed],
+                    "changes": [],
+                    "tests": [],
+                    "blocker": blocker,
+                    "next_hypothesis": "retry the finish turn with the episode's tool results; the work itself already ran",
+                },
+                ensure_ascii=False,
+            )
+            self.store.append_event(
+                "finish_evidence_carried",
+                {
+                    "tool_calls": len(executed),
+                    "tools": executed[:20],
+                    "reason": situation,
+                    "parser_error": report[:300],
+                },
+                run_id,
+            )
+            report = carried
+        else:
+            _status, carried = self._carry_evidence_forward(report, run_id, messages, situation=situation)
+            report = carried
         # A harness-generated stop is not verified work; keep the run
         # recoverable so the task is retried instead of silently completed.
         # The deferred-restart path upgrades this to COMPLETED only when a
@@ -978,17 +1283,38 @@ class ReActRunner:
         tools: list[dict[str, Any]],
         run_id: str,
         step: int,
+        tool_choice: dict[str, Any] | None = None,
     ) -> tuple[ModelTurn, float]:
         attempt = 0
+        first_exc: str | None = None
         while True:
             try:
                 request_chars, request_sha256 = self._request_fingerprint(messages)
+                logged_at = time.monotonic()
+                gap_seconds = (
+                    None if self._last_request_at is None else round(logged_at - self._last_request_at, 3)
+                )
+                self._last_request_at = logged_at
                 request_meta = {
                     "step": step + 1,
                     "attempt": attempt + 1,
                     "message_count": len(messages),
                     "tool_count": len(tools),
+                    # `request_chars` is the message list alone; the tool block and the system
+                    # prompt were invisible in the ledger, so the biggest part of a prompt had to
+                    # be recovered by regressing prompt_tokens on request_chars per run. Split
+                    # them at the source instead.
                     "request_chars": request_chars,
+                    "tools_chars": len(json.dumps(tools, ensure_ascii=False, separators=(",", ":"))),
+                    # A forced closing call is invisible in a reply that carries it and in one that
+                    # does not, so the ledger names what was asked for.
+                    "forced_tool": (tool_choice or {}).get("function", {}).get("name") if isinstance(tool_choice, dict) else None,
+                    "system_chars": sum(
+                        len(str(message.get("content") or ""))
+                        for message in messages
+                        if message.get("role") == "system"
+                    ),
+                    "gap_seconds": gap_seconds,
                     "request_sha256": request_sha256,
                     "model": self._provider_model(),
                     "max_output_tokens": max_tokens,
@@ -1006,7 +1332,20 @@ class ReActRunner:
                 # quadratically with the number of steps.
                 self.store.append_transcript("provider_request", request_meta, run_id)
                 call_started = time.monotonic()
-                turn = self.provider.complete(messages, max_tokens=max_tokens, tools=tools)
+                # ReAct is the one caller that opts into the patient chain: it
+                # may wait out provider cooldowns in place, because its budget is
+                # model time (waits are excluded) and the heartbeat is pulsed
+                # during the sleep. The memory loop and planner keep their own
+                # short timeouts and their single-strike behaviour. The chain
+                # advertises the capability so a test's fake provider keeps its
+                # own signature.
+                complete: Any = self.provider.complete
+                kwargs: dict[str, Any] = {"max_tokens": max_tokens, "tools": tools}
+                if getattr(self.provider, "supports_patient_wait", False):
+                    kwargs["patient"] = True
+                if tool_choice is not None and getattr(self.provider, "accepts_tool_choice", False):
+                    kwargs["tool_choice"] = tool_choice
+                turn = complete(messages, **kwargs)
                 # A fallback chain reports model-only time; wall clock would also
                 # charge its backoff sleeps to the run's model budget.
                 reported_seconds = float(getattr(turn, "model_seconds", 0.0) or 0.0)
@@ -1023,6 +1362,11 @@ class ReActRunner:
                         "usage_tokens": turn.total_tokens,
                         "prompt_tokens": turn.prompt_tokens,
                         "completion_tokens": turn.completion_tokens,
+                        # The provider's own cache-hit count for this request: the
+                        # only durable evidence that a prompt prefix is being reused,
+                        # which is what every caching argument needs to be checked
+                        # against instead of asserted.
+                        "cached_tokens": turn.cached_tokens,
                         "finish_reason": turn.finish_reason,
                         # An empty text with a non-zero completion count is
                         # otherwise unreadable: reasoning_chars>0 means the
@@ -1047,7 +1391,7 @@ class ReActRunner:
                     {"step": step, "attempt": attempt + 1, "text": turn.text, "tool_calls": [
                         {"call_id": call.call_id, "tool_name": call.tool_name, "arguments": call.arguments}
                         for call in turn.tool_calls
-                    ], "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens},
+                    ], "usage_tokens": turn.total_tokens, "prompt_tokens": turn.prompt_tokens, "completion_tokens": turn.completion_tokens, "cached_tokens": turn.cached_tokens},
                     run_id,
                 )
                 return turn, turn_seconds
@@ -1056,12 +1400,14 @@ class ReActRunner:
                 # high-frequency attempt trace: keep it durable so a failed run
                 # can be post-mortem'd after retention. append_event mirrors it
                 # into the runtime projection under kind "event".
+                if first_exc is None:
+                    first_exc = str(exc)[:1000]
                 self.store.append_event(
                     "provider_error",
-                    {"step": step + 1, "attempt": attempt + 1, "error": str(exc)[:1000]},
+                    {"step": step + 1, "attempt": attempt + 1, "error": str(exc)[:1000], "first_exc": first_exc},
                     run_id,
                 )
-                self.store.append_transcript("provider_error", {"step": step, "attempt": attempt + 1, "error": str(exc)[:1000]}, run_id)
+                self.store.append_transcript("provider_error", {"step": step, "attempt": attempt + 1, "error": str(exc)[:1000], "first_exc": first_exc}, run_id)
                 retryable = not isinstance(exc, ProviderError) or exc.retryable
                 if isinstance(exc, ProviderError):
                     self.store.append_event("provider_error_classified", {"step": step + 1, "category": exc.category, "retryable": exc.retryable, "cooldown_seconds": exc.cooldown_seconds}, run_id)
@@ -1069,7 +1415,7 @@ class ReActRunner:
                     raise
                 self.store.append_event(
                     "provider_retry",
-                    {"step": step + 1, "attempt": attempt + 1, "error": str(exc)[:1000]},
+                    {"step": step + 1, "attempt": attempt + 1, "error": str(exc)[:1000], "first_exc": first_exc},
                     run_id,
                 )
                 self._backoff(self.config.provider_retry_backoff_seconds, attempt)
@@ -1130,13 +1476,10 @@ class ReActRunner:
     def _read_worktree_status(self) -> list[str]:
         """Run a bounded ``git status``; any failure is silent and means clean."""
         try:
-            completed = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=no"],
-                cwd=str(self.worktree_root),
-                capture_output=True,
-                text=True,
+            completed = read_only_git(
+                ["status", "--porcelain", "--untracked-files=no"],
+                str(self.worktree_root),
                 timeout=WORKTREE_STATUS_TIMEOUT_SECONDS,
-                check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return []
@@ -1156,11 +1499,21 @@ class ReActRunner:
             return result
         files = self._worktree_dirty_files(step)
         if not files:
+            # A clean step breaks the streak: the model either reverted the files
+            # or a proposal quarantined them.
+            self._dirty_streak = 0
+            self._dirty_files_prev = set()
             return result
+        current = set(files)
+        # A file that stayed modified since the previous bash step is the loop
+        # signature; an entirely new dirty set is ordinary new work and starts
+        # the count over at 1.
+        self._dirty_streak = self._dirty_streak + 1 if current & self._dirty_files_prev else 1
+        self._dirty_files_prev = current
         listed = files[:WORKTREE_WARNING_MAX_FILES]
         self.store.append_event(
             "worktree_dirty_after_bash",
-            {"step": step + 1, "files": listed, "count": len(files)},
+            {"step": step + 1, "files": listed, "count": len(files), "streak": self._dirty_streak},
             run_id,
         )
         warning = (
@@ -1169,6 +1522,16 @@ class ReActRunner:
             + "). Code changes are durable only through propose_self_improvement; "
             "revert unintended edits before proposing."
         )
+        threshold = self.config.max_dirty_streak
+        if threshold > 0 and self._dirty_streak >= threshold:
+            # Trip the guard: the loop is not converging, so the episode will be
+            # closed at the next step boundary instead of editing the tree again.
+            self._worktree_guard_tripped = True
+            warning += (
+                f" The same tracked files have stayed modified across {self._dirty_streak} consecutive "
+                "bash steps. Stop editing the tree directly: revert the files or capture the change "
+                "through propose_self_improvement, then finish this episode."
+            )
         updated = dict(result)
         updated["worktree_warning"] = warning
         return updated
@@ -1354,6 +1717,52 @@ class ReActRunner:
             # a broken callback must never kill a running episode.
             log.exception("run progress callback failed; continuing")
 
+    def _resolve_meta_call(self, call: ToolCall, run_id: str) -> ToolCall:
+        """Translate an ``invoke_tool(name=..., arguments=...)`` call into the call it names.
+
+        The provider only lets the model call functions the request declared, and most senses
+        travel as catalogue text instead of a schema (``tool_catalog``). Rebinding the call here is
+        the entire hop: everything downstream -- the recorded ``tool_call``, effect memoisation,
+        policy, retries, telemetry -- then sees the real tool with the real arguments, exactly as
+        for a direct call. The hop itself is recorded once so the ledger can tell the two apart
+        without the analysis having to.
+        """
+        if call.tool_name != INVOKE_TOOL_NAME or not isinstance(call.arguments, dict):
+            return call
+        target = str(call.arguments.get("name") or "").strip()
+        if not target:
+            return call
+        inner = call.arguments.get("arguments")
+        arguments = inner if isinstance(inner, dict) else {}
+        self.store.append_event(
+            "meta_call_resolved",
+            {"call_id": call.call_id, "via": INVOKE_TOOL_NAME, "tool_name": target},
+            run_id,
+        )
+        return ToolCall(tool_name=target, arguments=arguments, call_id=call.call_id)
+
+    def _compaction_due(self, request_tokens: int, request_limit: int, compactions: int) -> bool:
+        """Whether the transcript should be compacted while the episode can still continue.
+
+        This path existed, was documented, and was exercised by a test whose fixture set
+        ``finish_threshold_ratio=2.0`` -- a value production never uses. In production the
+        reserve clears at ``request_limit - reserve``, the finish fires at
+        ``finish_threshold_ratio`` of the same limit, the shipped reserve is ``limit // 8``, and
+        the two thresholds are the same number (87,500 on a 100k window; 525,000 against
+        550,000 on a 600k one) with the finish tested first and returning. Measured on the live
+        ledger 2026-10-19: zero ``context_compacted`` events in the epoch, and 14 runs closed
+        as ``protective context threshold`` -- 26.7M tokens, no deliverable.
+
+        A ratio below the finish threshold is the whole fix: the transcript shrinks, the
+        episode keeps its place in the window, and the run can still reach a Finish Report of
+        its own. When the budget is spent or compaction cannot shrink anything, the callers
+        fall through to the finish path as before.
+        """
+        ratio = self.config.compaction_threshold_ratio
+        if ratio <= 0 or compactions >= self.config.max_compactions:
+            return False
+        return request_tokens >= request_limit * ratio
+
     def _compact_messages(self, messages: list[Message]) -> list[Message]:
         """Keep the durable Start and a bounded tail; never invent a model summary."""
         keep = max(2, self.config.compaction_keep_messages)
@@ -1396,9 +1805,16 @@ class ReActRunner:
         `record_effect`, so they pass an empty key and keep the old shape.
         """
         content = json.dumps(result, ensure_ascii=False)
-        if len(content) <= self.config.tool_result_max_chars:
+        limit = self.config.tool_result_max_chars
+        if result.get("ok") is False:
+            limit = min(limit, self.config.failed_result_max_chars)
+        if len(content) <= limit:
             return result
-        bounded: dict[str, Any] = {"ok": bool(result.get("ok")), "truncated": True, "preview": content[: self.config.tool_result_max_chars]}
+        bounded: dict[str, Any] = {
+            "ok": bool(result.get("ok")),
+            "truncated": True,
+            "preview": _bounded_preview(content, limit, self.config.truncation_tail_lines),
+        }
         if effect_key:
             bounded["effect_key"] = effect_key
             bounded["full_result_in"] = "capability_effects.idempotency_key"

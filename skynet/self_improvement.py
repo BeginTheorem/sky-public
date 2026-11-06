@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .change_review import FileChange, review_change
 from .checkpoints import CheckpointError, CheckpointManager
+from .git_hygiene import git_env
+from .sudo_gate import answer_is_approval
 from .time import parse_timestamp, utc_datetime_now, utc_now
 
 log = logging.getLogger("skynet.self_improvement")
@@ -108,6 +111,76 @@ DEFAULT_TEST_COMMAND: tuple[str, ...] = (sys.executable, "-m", "pytest", "-q")
 # belongs in the retryable family beside the other environment conditions:
 # the same intended change must be submittable again once it arrives intact.
 PATCH_PAYLOAD_CORRUPT = "patch_payload_corrupt"
+# A file whose whole content is one of these tokens is a swallowed write: the
+# template reached disk instead of the text, and the file reads as a delivered
+# artifact while holding nothing. Measured 2026-10-31 (see
+# ``swallowed_write_reason``); the tokens are the ones that actually landed.
+SWALLOWED_WRITE_TOKENS = frozenset(
+    {
+        "{{ARTIFACT_MD}}",
+        "__PLACEHOLDER_MD__",
+        "BASE64_PLACEHOLDER_NOT_USED",
+        "<CONTENT>",
+        "@@READ_FROM_DRAFT@@",
+    }
+)
+SWALLOWED_WRITE_PATTERNS = (
+    re.compile(r"^\{\{READ_FILE:.*\}\}$", re.IGNORECASE),
+    re.compile(r"^\$\(cat\s+.*\)$", re.IGNORECASE),
+    re.compile(r"^@@[A-Z_]+@@$"),
+    re.compile(r"^__[A-Z_]*PLACEHOLDER[A-Z_]*__$"),
+)
+
+# Paths that carry the organism's own authority over itself: the scripts that judge, deploy
+# and roll back it, the unit files that give it a process, the request file that restarts it,
+# the checkpoint machinery that is its way back, and the gate that asks the owner for root.
+# A proposal touching one of them is written and tested like any other, but only the owner's
+# word promotes it -- the boundary Chrysalis calls dual-custody human approval, kept in the
+# house shape: a durable question in Telegram, and silence is a refusal.
+#
+# Deliberately NOT here: ``GATE_PROTECTED_PATHS`` (``skynet/self_improvement.py``,
+# ``planner.py``, ``metrics.py``, ``idea_archive.py``, ``autonomous_planner.py``). The owner
+# decided those are warned, not held, so the organism can repair its own judge after an
+# identical resubmission; putting them under custody here would reverse that decision without
+# his word. This list holds authority over the *owner's* levers, not over the meta-loop.
+OWNER_SIGNOFF_PATHS = (
+    "scripts/alert.sh",
+    "scripts/deploy.sh",
+    "scripts/install_mcp_runtime.sh",
+    "scripts/rollback.sh",
+    "scripts/skynet-startup-rollback.sh",
+    "scripts/test.sh",
+    "skynet/checkpoints.py",
+    "skynet/sudo_gate.py",
+    "state/reboot-request.json",
+)
+OWNER_SIGNOFF_PREFIXES = ("deploy/",)
+OWNER_SIGNOFF_SUFFIXES = (".service", ".service.in", ".socket", ".timer", ".timer.in")
+OWNER_SIGNOFF_STATUS = "awaiting_owner"
+# A structural approval is not a 15-minute sudo prompt: the owner decides on his own clock,
+# so the question lives a week. Silence is still a refusal -- it just leaves the proposal
+# parked, never promoted.
+OWNER_SIGNOFF_TTL_SECONDS = 7 * 24 * 3600.0
+
+
+def owner_signoff_paths(paths: Sequence[str]) -> list[str]:
+    """The authority-bearing paths in a change set; empty when it may promote itself.
+
+    Measured 2026-10-31 on the live registry: every promotion this pipeline has made was
+    decided entirely inside the organism -- propose, test, merge, request its own reboot --
+    including the changes that set what it may propose and which gate judges the next one.
+    Nothing in the path required an act from outside the process.
+    """
+    hits: set[str] = set()
+    for raw in paths:
+        path = str(raw).strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        if not path:
+            continue
+        if path in OWNER_SIGNOFF_PATHS or path.startswith(OWNER_SIGNOFF_PREFIXES) or path.endswith(OWNER_SIGNOFF_SUFFIXES):
+            hits.add(path)
+    return sorted(hits)
 BLOCKED_FAILURE_CLASSES = frozenset({PATCH_PAYLOAD_CORRUPT, "administrative_test_failure", "environment_failure", "timeout", "worktree_quota"})
 # An environment failure does not burn the fingerprint, so the identical change
 # is retryable once the environment is repaired. Without a ceiling that turns
@@ -143,10 +216,6 @@ GATE_PROTECTED_PATHS = frozenset({
     "skynet/planner.py",
     "skynet/autonomous_planner.py",
     "skynet/metrics.py",
-    # The public-release sanitizer decides what leaves the repository and what
-    # the leak scanner forbids; a proposal must not weaken it silently.
-    "release/rules.toml",
-    "release/publish.py",
 })
 VENV_PYTHON_NAMES = frozenset({"python", "python3", ".venv/bin/python", "./.venv/bin/python", ".venv/bin/python3", "./.venv/bin/python3"})
 # The service exports provider-enable flags (OpenRouter-only deploy) and the money
@@ -215,6 +284,11 @@ def check_registry_integrity(path: str | Path) -> list[tuple[str, str]]:
     """
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # No registry yet is an empty registry, not a violation: ``_read_proposals``
+        # treats an absent file the same way. Flagging it would warn on every start
+        # of a freshly deployed organism whose ``state/`` was just created.
+        return []
     except (OSError, ValueError) as exc:
         return [("registry", f"unreadable registry: {exc}")]
     if not isinstance(data, dict):
@@ -299,6 +373,36 @@ def patch_structure_error(patch: str) -> str | None:
                 f"-{old} +{new}; the payload was truncated or rewritten in tool-call transport"
             )
     return None
+
+
+def swallowed_write_reason(content: str) -> str:
+    """Why this content is a swallowed write rather than text, or ``""`` when it is text.
+
+    A proposal that carries a template token instead of the text commits a file
+    that reads as a delivered artifact while holding nothing, and every count of
+    "artifacts delivered" then counts it. Measured 2026-10-31: four artifacts of
+    0 bytes and seven single-token files reached ``main`` through this pipeline
+    (``<content>``, ``{{ARTIFACT_MD}}``, ``__PLACEHOLDER_MD__``,
+    ``@@READ_FROM_DRAFT@@``, ``BASE64_PLACEHOLDER_NOT_USED``,
+    ``{{READ_FILE:/tmp/skynet-scratch/artifact_draft.md}}``,
+    ``$(cat /tmp/skynet-scratch/moex_sberp_preferred_buyhold_vs_deposit.md)``),
+    while the run report declared the artifact published and its markers
+    "confirmed" -- the check reads the draft in scratch, never the applied file.
+    The write never landed, so it is refused at the point it would be written
+    rather than audited in the corpus afterwards.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return "content is empty"
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    if len(lines) == 1 and len(stripped) <= 240:
+        line = lines[0].strip()
+        if line.upper() in SWALLOWED_WRITE_TOKENS:
+            return f"content is the placeholder token {line!r}"
+        for pattern in SWALLOWED_WRITE_PATTERNS:
+            if pattern.match(line):
+                return f"content is an unresolved template: {line[:80]}"
+    return ""
 
 
 def classify_failure(error: BaseException | str) -> str:
@@ -424,20 +528,32 @@ class SelfImprovementManager:
         elif self.runtime_log is not None:
             self.runtime_log.write(kind, payload)
 
-    def _alert_owner(self, kind: str, payload: dict[str, object]) -> None:
-        """Escalate through the existing alert/outbox machinery, if wired."""
+    def _alert_owner(self, kind: str, payload: dict[str, object], protected_paths: Sequence[str] | None = None) -> None:
+        """Escalate through the existing alert/outbox machinery, if wired.
+
+        For gate-protected warnings, deduplicate by the sorted protected paths
+        rather than the change_fingerprint, since each iteration of the same
+        protected-path change produces a new fingerprint but should not spam the
+        owner.
+        """
         if self.store is None:
             return
-        fingerprint = str(payload.get("change_fingerprint", ""))
+        if protected_paths:
+            dedup_key = f"{kind}:{','.join(sorted(str(p) for p in protected_paths))}"
+        else:
+            fingerprint = str(payload.get("change_fingerprint", ""))
+            dedup_key = f"{kind}:{fingerprint}"
         self.store.raise_alert(
             kind,
             payload,
             severity="warning",
-            dedup_key=f"{kind}:{fingerprint}",
+            dedup_key=dedup_key,
         )
 
     def _git(self, args: Sequence[str], cwd: Path | None = None) -> str:
-        result = subprocess.run(["git", *args], cwd=cwd or self.root, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            ["git", *args], cwd=cwd or self.root, capture_output=True, text=True, check=False, env=git_env(),
+        )
         if result.returncode:
             raise SelfImprovementError(result.stderr.strip() or f"git {' '.join(args)} failed")
         return result.stdout.strip()
@@ -1082,6 +1198,80 @@ class SelfImprovementManager:
             self.runtime_log.write("worktree_quarantined", {"files": quarantined, "quarantine": str(quarantine_dir)})
         return quarantined
 
+    def _untracked_paths(self, exclude: Sequence[str] = ()) -> list[str]:
+        """Untracked files under the tree, excluding the organism's own state.
+
+        ``--untracked-files=all`` lists the entries git would not commit;
+        ignored paths (``.venv``) are not among them. ``state/`` is excluded
+        explicitly, because it holds the quarantine directory this sweep writes
+        into; ``exclude`` carries the configured state directory when it is not
+        ``state/``, so an operational file next to a relocated database is not
+        mistaken for scratch.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if result.returncode:
+            return []
+        protected = ["state", *(entry.replace("\\", "/").removeprefix("./") for entry in exclude)]
+        paths: list[str] = []
+        for line in result.stdout.splitlines():
+            if not line.startswith("?? "):
+                continue
+            relative = line[3:].strip().strip('"')
+            normalized = relative.replace("\\", "/").removeprefix("./")
+            if not normalized or normalized == ".git" or normalized.startswith(".git/"):
+                continue
+            if any(normalized == entry or normalized.startswith(entry + "/") for entry in protected if entry):
+                continue
+            paths.append(relative)
+        return paths
+
+    def _quarantine_untracked_paths(self, exclude: Sequence[str] = ()) -> list[str]:
+        """Preserve untracked files, then leave the tree free of them."""
+        entries = self._untracked_paths(exclude)
+        if not entries:
+            return []
+        stamp = utc_now().replace("-", "").replace(":", "").replace(".", "")
+        quarantine_dir = self.root / "state" / "quarantine" / f"worktree-{stamp}-untracked"
+        moved: list[str] = []
+        for relative in entries:
+            source = self.root / relative
+            if not source.exists():
+                continue
+            destination = quarantine_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append(relative)
+        if moved and self.runtime_log is not None:
+            self.runtime_log.write("worktree_untracked_quarantined", {"files": moved, "quarantine": str(quarantine_dir)})
+        return moved
+
+    def quarantine_dirty_worktree(self, *, include_untracked: bool = False, exclude: Sequence[str] = ()) -> list[str]:
+        """Preserve a dirty main worktree and restore it to a clean state.
+
+        The public entry the Reactor calls at wake: a tree left dirty by a prior
+        episode blocks ``propose_self_improvement`` and used to be cleaned only
+        as a side effect of a proposal, so an episode that never proposed left it
+        dirty across wakes (10 284 ``worktree_dirty_after_bash`` rows on the
+        deployed organism). Healing at wake makes the terminal state clean while
+        preserving the edits under ``state/quarantine``. Tracked files are always
+        restored; untracked files are swept only when asked (``exclude`` protects
+        a relocated state directory), because a stray file under the tree may
+        still be operational.
+        """
+        moved = self._quarantine_dirty_worktree()
+        if include_untracked:
+            moved += self._quarantine_untracked_paths(exclude)
+        return moved
+
     def _enforce_worktree_quota(self) -> None:
         """Keep the registered worktree collection below a hard cap.
 
@@ -1160,6 +1350,12 @@ class SelfImprovementManager:
             target = (proposal.worktree / path).resolve()
             if proposal.worktree not in target.parents:
                 raise SelfImprovementError(f"proposal escapes worktree: {relative}")
+            reason = swallowed_write_reason(content)
+            if reason:
+                raise SelfImprovementError(
+                    f"proposal writes a swallowed file (no text): {relative}: {reason}",
+                    reason_code="swallowed_write",
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
             normalized.append(path.as_posix())
@@ -1198,6 +1394,12 @@ class SelfImprovementManager:
                 content = change.get("content")
                 if not isinstance(content, str):
                     raise SelfImprovementError("create patch requires content")
+                reason = swallowed_write_reason(content)
+                if reason:
+                    raise SelfImprovementError(
+                        f"proposal writes a swallowed file (no text): {relative}: {reason}",
+                        reason_code="swallowed_write",
+                    )
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
             elif operation in {"replace", "insert_before", "insert_after", "delete"}:
@@ -1311,7 +1513,7 @@ class SelfImprovementManager:
             self.runtime_log.write("proposal_patch_applied", {"proposal_id": proposal.proposal_id, "files": sorted(set(changed)), "change_digest": digest})
         return sorted(set(changed))
 
-    def _run_ruff_stage(self, worktree: Path, package: Path) -> None:
+    def _run_ruff_stage(self, worktree: Path) -> None:
         """The project's ruff config, run from the proposal worktree.
 
         Ruff discovers ``pyproject.toml`` from the worktree, so the ruleset is
@@ -1395,6 +1597,51 @@ class SelfImprovementManager:
             output = completed.stderr[-1000:] or completed.stdout[-1000:]
             raise SelfImprovementError(f"gate stage {stage} failed: {output}")
 
+    def _review_change(self, proposal: ImprovementProposal, applied_paths: Sequence[str], fingerprint: str) -> None:
+        """Refuse a change that is degenerate before the gate spends time on it.
+
+        A deterministic critic in the sense of RRSI (arXiv:2609.24972): a
+        comment-only edit claiming a mechanism, or a new private module-level
+        symbol nothing references, cannot be a mechanism and must not reach the
+        expensive stages. The pre-image is read from the proposal's base commit,
+        the post-image from the worktree, and the reference scan is text-only --
+        no model call, no benchmark. A public new symbol that appears unused is
+        only warned about, so an intentional API addition is never blocked.
+        """
+        changes: list[FileChange] = []
+        for relative in dict.fromkeys(applied_paths):
+            candidate = proposal.worktree / relative
+            try:
+                after: str | None = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                after = None
+            completed = subprocess.run(
+                ["git", "show", f"{proposal.base_commit}:{relative}"],
+                cwd=proposal.worktree,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            before: str | None = completed.stdout if completed.returncode == 0 else None
+            changes.append(FileChange(path=relative, before=before, after=after))
+        findings = review_change(changes, worktree=proposal.worktree)
+        detail: dict[str, object] = {"proposal_id": proposal.proposal_id, "change_fingerprint": fingerprint}
+        rejected = [finding for finding in findings if finding.severity == "reject"]
+        for finding in findings:
+            if finding.severity == "reject":
+                continue
+            self._emit("proposal_review_warning", {**detail, "path": finding.path, "code": finding.code, "detail": finding.detail})
+        if rejected:
+            first = rejected[0]
+            self._emit(
+                "proposal_review_rejected",
+                {**detail, "path": first.path, "code": first.code, "detail": first.detail, "findings": [item.detail for item in rejected]},
+            )
+            raise SelfImprovementError(
+                f"change review rejected a degenerate change in {first.path}: {first.detail}",
+                reason_code="degenerate_change",
+            )
+
     def validate_and_commit(
         self,
         proposal: ImprovementProposal,
@@ -1435,6 +1682,12 @@ class SelfImprovementManager:
                     "reason": "identical resubmission acknowledged; proceeding through the normal verification stages",
                 },
             )
+        # A change that is degenerate rather than merely unproven must not spend
+        # the gate's time. RRSI screens candidates before evaluation
+        # (arXiv:2609.24972); this is its deterministic core. It runs after the
+        # gate-protected warning so a warned first submission is unaffected.
+        if applied_paths:
+            self._review_change(proposal, applied_paths, fingerprint)
         # Both stages only make sense when the worktree actually carries the
         # package under test; a minimal fixture without it has nothing to prove.
         package = proposal.worktree / "skynet"
@@ -1455,7 +1708,7 @@ class SelfImprovementManager:
                 [sys.executable, "-c", GATE_IMPORT_SMOKE_SNIPPET],
                 proposal.worktree,
             )
-            self._run_ruff_stage(proposal.worktree, package)
+            self._run_ruff_stage(proposal.worktree)
             self._run_pyright_stage(proposal.worktree, package)
             # The registry showed six proposals declaring `grep -q`, a `python3
             # -c` mock or an import as their "test". A model-chosen command can
@@ -1607,6 +1860,19 @@ class SelfImprovementManager:
             str(record["base_commit"]),
         )
         commit = str(record["commit"])
+        if not health.get("ok"):
+            # The same precondition ``promote`` enforces, checked before anything touches the
+            # worktree: a promotion without a passing gate must not even read the change set.
+            raise SelfImprovementError("promotion requires a passing health gate")
+        # Tier-2: a proposal that changes what the organism may do, or how it is judged, is
+        # not promoted on the organism's own word. Measured 2026-10-31 on the live registry:
+        # nothing in this path asked anyone -- the run proposed, tested, merged and requested
+        # its own restart, including for the files that decide what it may propose next.
+        authority_paths = owner_signoff_paths(self._changed_paths(proposal, commit))
+        if authority_paths:
+            refusal = self._owner_signoff_state(proposal_id, record, authority_paths, commit, health)
+            if refusal:
+                raise SelfImprovementError(refusal, reason_code="owner_signoff_required")
         try:
             proposals = self._read_proposals()
             proposals[proposal_id]["status"] = "promoting"
@@ -1659,6 +1925,158 @@ class SelfImprovementManager:
         self._write_proposals(proposals)
         if self.runtime_log is not None:
             self.runtime_log.write("proposal_rejected", {"proposal_id": proposal_id, "failure_class": "stale_base_commit"})
+
+    def _changed_paths(self, proposal: ImprovementProposal, commit: str) -> list[str]:
+        """Every path the proposal changes, measured across the range its commit sits on."""
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", f"{proposal.base_commit}..{commit}"],
+                cwd=proposal.worktree,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            # A worktree that is gone cannot be diffed, and a change set that cannot be read
+            # must not be treated as empty: that would promote an unknown change unread.
+            raise SelfImprovementError(
+                f"proposal change set could not be read for {proposal.proposal_id}: {exc}"
+            ) from exc
+        if result.returncode:
+            raise SelfImprovementError(
+                f"proposal diff could not be read for {proposal.proposal_id}: {(result.stderr or '').strip()[:200]}"
+            )
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def _owner_signoff_state(
+        self,
+        proposal_id: str,
+        record: dict[str, object],
+        authority_paths: list[str],
+        commit: str,
+        health: dict[str, object],
+    ) -> str:
+        """Hold a Tier-2 proposal at the owner's boundary; return "" once his word is on file.
+
+        The question is durable and keyed by the proposal (``promote:{proposal_id}``), so a
+        crash between asking and parking cannot ask him twice, and the owner answers it in
+        Telegram with the same ``/answer Разрешить`` the sudo gate uses. Silence is a
+        refusal, exactly as there: an unanswered or refused question leaves the proposal
+        parked, and ``reconcile_awaiting_owner`` is what resumes an approved one.
+        """
+        question_id = str(record.get("owner_question_id") or "")
+        answer = self.store.answer_for(question_id) if (self.store is not None and question_id) else None
+        text = str(answer.get("answer", "")) if answer else ""
+        if answer is not None and answer_is_approval(text):
+            self._emit(
+                "proposal_owner_approved",
+                {"proposal_id": proposal_id, "paths": authority_paths, "question_id": question_id, "answer": text[:200]},
+            )
+            return ""
+        proposals = self._read_proposals()
+        entry = proposals.get(proposal_id)
+        if entry is None:
+            return f"validated proposal not found: {proposal_id}"
+        entry["status"] = OWNER_SIGNOFF_STATUS
+        entry["owner_signoff_paths"] = list(authority_paths)
+        entry["owner_signoff_health"] = health
+        if answer is not None:
+            entry["failure_class"] = "owner_refused"
+            entry["failure"] = f"the owner refused promotion: {text[:200]}"
+            refusal = f"the owner refused promotion of this proposal: {text[:200]}"
+        else:
+            entry["failure_class"] = "owner_signoff_required"
+            entry["failure"] = f"proposal touches the organism's own authority: {', '.join(authority_paths)}"
+            refusal = (
+                "proposal touches the organism's own authority and needs the owner's word before promotion: "
+                + ", ".join(authority_paths)
+                + "; it is parked, the question is in Telegram, and silence is a refusal"
+            )
+        if not question_id and self.store is not None:
+            question_id = str(self.store.ask_question(self._owner_question(record, authority_paths, commit, proposal_id), run_id=None, ttl_seconds=OWNER_SIGNOFF_TTL_SECONDS, question_key=f"promote:{proposal_id}"))
+            entry["owner_question_id"] = question_id
+        self._write_proposals(proposals)
+        self._emit(
+            "proposal_awaiting_owner",
+            {
+                "proposal_id": proposal_id,
+                "paths": authority_paths,
+                "commit": commit,
+                "question_id": question_id,
+                "refused": answer is not None,
+            },
+        )
+        return refusal
+
+    @staticmethod
+    def _owner_question(record: dict[str, object], authority_paths: list[str], commit: str, proposal_id: str) -> str:
+        """The question the owner reads: which authority-bearing paths, and why.
+
+        The hypothesis is stored on the record itself (``propose_files`` spreads ``metadata``
+        into it), not under a nested ``metadata`` key -- measured on the first live probe,
+        where reading the nested key left the owner staring at an empty "why".
+        """
+        hypothesis = record.get("hypothesis")
+        problem = str(hypothesis.get("problem", "")).strip() if isinstance(hypothesis, dict) else ""
+        expected = str(hypothesis.get("expected_behavior", "")).strip() if isinstance(hypothesis, dict) else ""
+        listed = "\n".join(f"• {path}" for path in authority_paths)
+        why = f"Зачем: {problem[:400]}" if problem else "Зачем: (предложение не записало причину)"
+        if expected:
+            why += f"\nОжидаемо: {expected[:300]}"
+        return (
+            "🔐 Структурная правка ждёт твоего слова\n\n"
+            "Прогон предлагает изменить то, что определяет полномочия самого организма:\n"
+            f"{listed}\n\n"
+            f"Коммит {commit[:12]} · предложение {proposal_id}\n"
+            f"{why}\n\n"
+            "Тест-гейт она уже прошла. Без твоего «да» правка не встанет, и прогон не продолжится.\n"
+            "Ответ: /answer Разрешить  или  /answer Запретить"
+        )
+
+    def reconcile_awaiting_owner(self) -> list[dict[str, object]]:
+        """Resume or reject the proposals parked at the owner's boundary.
+
+        A Tier-2 proposal waits for an answer that arrives long after the run that asked is
+        gone, so the resume has to be somebody else's step. The supervisor calls this beside
+        ``reconcile_awaiting_reboot``; the run that proposed never gets to decide.
+        """
+        proposals = self._read_proposals()
+        if not proposals:
+            return []
+        resolved: list[dict[str, object]] = []
+        for proposal_id, record in proposals.items():
+            if str(record.get("status", "")) != OWNER_SIGNOFF_STATUS:
+                continue
+            question_id = str(record.get("owner_question_id") or "")
+            answer = self.store.answer_for(question_id) if (self.store is not None and question_id) else None
+            text = str(answer.get("answer", "")) if answer else ""
+            if answer is not None and not answer_is_approval(text):
+                record["status"] = "rejected"
+                record["failure_class"] = "owner_refused"
+                record["failure"] = f"the owner refused promotion: {text[:200]}"
+                proposals[proposal_id] = record
+                self._write_proposals(proposals)
+                self._cleanup_worktree(str(record.get("worktree", "")))
+                resolved.append({"proposal_id": proposal_id, "status": "rejected", "reason": "owner refused"})
+                continue
+            if answer is None:
+                continue
+            health = record.get("owner_signoff_health")
+            if not isinstance(health, dict) or not health.get("ok"):
+                log.warning("cannot resume %s: no passing health recorded at its validation", proposal_id)
+                continue
+            record["status"] = "validated"
+            self._write_proposals(proposals)
+            try:
+                promoted = self.promote_pending(proposal_id, health)
+            except SelfImprovementError as exc:
+                current = self._read_proposals().get(proposal_id, record)
+                resolved.append(
+                    {"proposal_id": proposal_id, "status": str(current.get("status", "")), "reason": str(exc)[:200]}
+                )
+                continue
+            resolved.append({"proposal_id": proposal_id, "status": "awaiting_reboot", "commit": promoted, "owner_approved": True})
+        return resolved
 
     def request_reboot(self, proposal: ImprovementProposal, commit: str, health: dict[str, object]) -> None:
         if not health.get("ok"):
@@ -1798,6 +2216,13 @@ class SelfImprovementManager:
                 "reason": payload["reason"],
                 "effect": "no change applied to the main worktree; an identical resubmission runs the full gate",
             },
+            # Deduplicate by the protected paths, not by the change fingerprint:
+            # every iteration of the same protected-path change carries a new
+            # fingerprint, so keying on it paged the owner once per iteration
+            # instead of once per change (measured 2026-10-12: four iteration
+            # warnings for one change). The parameter existed but this call site
+            # never passed it, so the dedup branch was inert.
+            protected_paths=offenders,
         )
         if self.runtime_log is not None:
             self.runtime_log.write("proposal_warned", {"proposal_id": proposal.proposal_id, "paths": record["protected_paths"], "change_fingerprint": fingerprint})
@@ -1915,7 +2340,10 @@ class SelfImprovementManager:
                     "promotion_required": True,
                     "resumed_validation": True,
                 }
-            if status in {"rejected", "awaiting_reboot", "accepted"} or exhausted:
+            # ``awaiting_owner`` belongs in this set too: a change parked at the owner's
+            # boundary must not be re-proposed by the next run while he decides, because the
+            # fingerprint is spoken for and a second identical proposal would only park again.
+            if status in {"rejected", "awaiting_reboot", "accepted", OWNER_SIGNOFF_STATUS} or exhausted:
                 previous_class = str(record.get("failure_class") or "unknown")
                 raise SelfImprovementError(
                     f"identical proposal was already attempted as {previous_id} "
@@ -2077,8 +2505,21 @@ class SelfImprovementTool:
             return self._failure_result(error_msg, "invalid_payload")
         hypothesis = arguments.get("hypothesis")
         required_hypothesis = ("problem", "expected_behavior", "evidence", "validation", "rollback_condition")
-        if not isinstance(hypothesis, dict) or any(not isinstance(hypothesis.get(key), str) or not hypothesis[key].strip() for key in required_hypothesis):
-            error_msg = "proposal requires a complete evidence-backed hypothesis"
+        # Name the fields the contract is missing. The bare "requires a complete
+        # evidence-backed hypothesis" cost two whole runs: measured 2026-10-31,
+        # eight consecutive calls carried a hypothesis whose only key was
+        # `problem`; the refusal never said WHICH field was empty, so each retry
+        # guessed a different channel (`files`, `changes`, an empty payload)
+        # instead of completing the hypothesis, and after two identical refusals
+        # the repeat guard closed the runs `blocked`. The sibling guard below has
+        # always named its paths; this one names its fields.
+        missing_hypothesis = [
+            key
+            for key in required_hypothesis
+            if not isinstance(hypothesis, dict) or not isinstance(hypothesis.get(key), str) or not hypothesis[key].strip()
+        ]
+        if missing_hypothesis:
+            error_msg = f"proposal requires a complete evidence-backed hypothesis; missing or empty fields: {', '.join(missing_hypothesis)}"
             if self.manager.runtime_log is not None:
                 self.manager.runtime_log.write("proposal_rejected", {"error": error_msg, "failure_class": "invalid_payload", "hypothesis": hypothesis})
             return self._failure_result(error_msg, "invalid_payload", do_not_retry_unchanged=True)

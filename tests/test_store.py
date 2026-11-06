@@ -15,6 +15,7 @@ from skynet import metrics
 from skynet.models import RunStatus
 from skynet.outbox import deliver_to_http
 from skynet.planner import PlannerCandidate
+from skynet.source_attribution_verifier import SourceAttributionVerifier
 from skynet.store import StateStore
 
 
@@ -214,7 +215,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             row = store.connection.execute("SELECT version, name FROM schema_migrations ORDER BY version DESC").fetchone()
-            self.assertEqual((row[0], row[1]), (13, "affect-valence"))
+            self.assertEqual((row[0], row[1]), (17, "run-kinds"))
             store.close()
 
     def test_schema_v4_upgrade_adds_alerts_area_and_pinned(self) -> None:
@@ -244,11 +245,48 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(upgraded.connection.execute("SELECT area FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0], "general")
             self.assertEqual(upgraded.connection.execute("SELECT content FROM memories").fetchone()[0], "legacy memory")
             versions = [row[0] for row in upgraded.connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
-            self.assertEqual(versions[-1], 13)
+            self.assertEqual(versions[-1], 17)
+            self.assertIn("kind", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(runs)")})
             self.assertIn("valence", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(affect_state)")})
             # v11 names the decay clock: the column must exist after an upgrade
             # even though an older database already had every earlier column.
             self.assertIn("decayed_at", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(memories)")})
+            # v15 adds lifecycle_stage and scope columns for Oracle Agent Memory
+            self.assertIn("lifecycle_stage", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(memories)")})
+            self.assertIn("scope", {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(memories)")})
+            upgraded.close()
+
+    def test_schema_v16_upgrade_adds_attention_and_replay_columns(self) -> None:
+        """An existing database must gain the v16 columns the attention axis reads.
+
+        The live database had them added out-of-band while the migration loop did
+        not, so a database that never saw the manual ALTER (a restore, a second
+        instance) silently lost the attention axis: ``_attention_pool`` swallows
+        the ``no such column`` error and returns no candidates.
+        """
+        attention_columns = (
+            "retrieval_count",
+            "positive_outcome_count",
+            "complexity_tier",
+            "last_session_id",
+            "replay_level",
+            "last_replay_at",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = StateStore(path)
+            store.consolidate("run-legacy", [{"kind": "fact", "content": "legacy memory", "confidence": 0.7}])
+            for column in attention_columns:
+                store.connection.execute(f"ALTER TABLE memories DROP COLUMN {column}")
+            store.close()
+
+            upgraded = StateStore(path)
+            columns = {row["name"] for row in upgraded.connection.execute("PRAGMA table_info(memories)")}
+            for column in attention_columns:
+                self.assertIn(column, columns)
+            row = upgraded.connection.execute("SELECT retrieval_count, complexity_tier FROM memories").fetchone()
+            self.assertEqual((row["retrieval_count"], row["complexity_tier"]), (0, "Simple"))
+            self.assertEqual(upgraded.connection.execute("SELECT content FROM memories").fetchone()[0], "legacy memory")
             upgraded.close()
 
     def test_connection_sets_busy_timeout_and_wal_synchronous(self) -> None:
@@ -257,6 +295,10 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(store.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
             self.assertEqual(str(store.connection.execute("PRAGMA synchronous").fetchone()[0]).lower(), "1")
             self.assertEqual(str(store.connection.execute("PRAGMA journal_mode").fetchone()[0]).lower(), "wal")
+            # A database created from scratch must reclaim pages on delete: the
+            # live ledger reached 979 MB with auto_vacuum=0 and retention can now
+            # drop a large share of the event log every cycle.
+            self.assertEqual(store.connection.execute("PRAGMA auto_vacuum").fetchone()[0], 1)
             store.close()
 
     def test_confidence_decay_fades_stale_memories_and_keeps_pinned(self) -> None:
@@ -270,16 +312,16 @@ class CoreTests(unittest.TestCase):
             pinned = store.connection.execute("SELECT memory_id FROM memories WHERE content='pinned truth'").fetchone()[0]
             store.set_memory_pinned(str(pinned))
             store.connection.execute("UPDATE memories SET updated_at='2020-01-01T00:00:00Z'")
-            result = store.decay_memory_confidence(factor=0.5, stale_days=7.0, drop_below=0.1)
+            result = store.decay_memory_confidence(step=0.05, stale_days=1.0, drop_below=0.1)
             self.assertEqual(result["faded"], 2, "pinned memories are not faded")
             self.assertEqual(result["dropped"], 1, "the weakest unpinned memory is removed")
             rows = {row["content"]: row["confidence"] for row in store.connection.execute("SELECT content, confidence FROM memories")}
-            self.assertAlmostEqual(rows["stale guess"], 0.855, places=3)
+            self.assertAlmostEqual(rows["stale guess"], 0.85, places=3)
             self.assertEqual(rows["pinned truth"], 0.5)
             self.assertNotIn("almost gone", rows)
             store.close()
 
-    def test_importance_weighted_decay_slows_high_confidence_and_is_idempotent(self) -> None:
+    def test_linear_decay_is_flat_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             store.consolidate("run-1", [
@@ -287,16 +329,38 @@ class CoreTests(unittest.TestCase):
                 {"kind": "fact", "content": "weak guess", "confidence": 0.3},
             ])
             store.connection.execute("UPDATE memories SET updated_at='2020-01-01T00:00:00Z'")
-            store.decay_memory_confidence(factor=0.5, stale_days=7.0, drop_below=0.0)
+            store.decay_memory_confidence(step=0.05, stale_days=1.0, drop_below=0.0)
             rows = {row["content"]: row["confidence"] for row in store.connection.execute("SELECT content, confidence FROM memories")}
-            self.assertAlmostEqual(rows["well evidenced"], 0.855, places=3)
-            self.assertAlmostEqual(rows["weak guess"], 0.195, places=3)
-            self.assertGreater(rows["well evidenced"], rows["weak guess"], "high confidence must decay slower")
+            self.assertAlmostEqual(rows["well evidenced"], 0.85, places=3)
+            self.assertAlmostEqual(rows["weak guess"], 0.25, places=3)
+            self.assertAlmostEqual(
+                rows["well evidenced"] - rows["weak guess"], 0.6, places=3,
+                msg="fading is a flat step, not importance-weighted",
+            )
             # A second pass inside the same stale window must be a no-op.
-            store.decay_memory_confidence(factor=0.5, stale_days=7.0, drop_below=0.0)
+            store.decay_memory_confidence(step=0.05, stale_days=1.0, drop_below=0.0)
             rows_after = {row["content"]: row["confidence"] for row in store.connection.execute("SELECT content, confidence FROM memories")}
-            self.assertAlmostEqual(rows_after["well evidenced"], 0.855, places=3)
-            self.assertAlmostEqual(rows_after["weak guess"], 0.195, places=3)
+            self.assertAlmostEqual(rows_after["well evidenced"], 0.85, places=3)
+            self.assertAlmostEqual(rows_after["weak guess"], 0.25, places=3)
+            store.close()
+
+    def test_decay_spares_protected_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.consolidate("run-1", [
+                {"kind": "procedure", "content": "canonical truth", "confidence": 0.05},
+                {"kind": "fact", "content": "ordinary guess", "confidence": 0.5},
+            ])
+            store.connection.execute("UPDATE memories SET updated_at='2020-01-01T00:00:00Z'")
+            result = store.decay_memory_confidence(
+                step=0.2, stale_days=1.0, drop_below=0.1,
+                protected_contents=("canonical truth",),
+            )
+            self.assertEqual(result["faded"], 1, "the protected row is never faded")
+            self.assertEqual(result["dropped"], 0, "the protected row survives below the drop threshold")
+            rows = {row["content"]: row["confidence"] for row in store.connection.execute("SELECT content, confidence FROM memories")}
+            self.assertAlmostEqual(rows["canonical truth"], 0.05, places=3)
+            self.assertAlmostEqual(rows["ordinary guess"], 0.3, places=3)
             store.close()
 
     def test_memory_validity_api_round_trip(self) -> None:
@@ -520,6 +584,8 @@ class CoreTests(unittest.TestCase):
                 "idx_tasks_area",
                 "idx_memories_pinned",
                 "idx_alerts_pending",
+                "idx_event_log_created",
+                "idx_capability_effects_created",
             ):
                 self.assertIn(expected, names)
             store.close()
@@ -600,6 +666,22 @@ class CoreTests(unittest.TestCase):
             self.assertFalse(store.set_memory_pinned("missing-id"))
             pinned = store.pinned_memories()
             self.assertEqual([item["content"] for item in pinned], ["the test runner is .venv/bin/python -m pytest -q"])
+            store.close()
+
+    def test_unpin_memories_releases_a_whole_set_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            store.consolidate("run-pin", [
+                {"kind": "fact", "content": "one", "confidence": 0.5},
+                {"kind": "fact", "content": "two", "confidence": 0.5},
+            ])
+            ids = [str(row["memory_id"]) for row in store.connection.execute("SELECT memory_id FROM memories ORDER BY content")]
+            for memory_id in ids:
+                self.assertTrue(store.set_memory_pinned(memory_id))
+            self.assertEqual(store.unpin_memories(ids), 2, "the delivered set is released in one statement")
+            self.assertEqual(store.pinned_memories(), [])
+            self.assertEqual(store.unpin_memories(ids), 0, "a second release changes nothing")
+            self.assertEqual(store.unpin_memories([]), 0)
             store.close()
 
     def test_runtime_log_rotates_and_survives_write_errors(self) -> None:
@@ -1127,6 +1209,34 @@ class MemoryCandidateEvidenceTests(unittest.TestCase):
             self.assertEqual(row["evidence"], "commit abc1234")
             store.close()
 
+
+class SourceAttributionVerifierTests(unittest.TestCase):
+    def test_fabricated_new_candidate_is_dropped_when_source_contradicts(self) -> None:
+        verifier = SourceAttributionVerifier()
+        src = "Meeting with ACME Corp scheduled for 2025-11-20 at 14:00 in Conference Room B."
+        verdict, breakdown = verifier.verify(
+            {"kind": "fact", "content": "Meeting with ACME Corp rescheduled to 2025-11-25 at 15:30.", "evidence": [f"memory:{src}"]},
+            {f"memory:{src}": {"accessible": True, "content": src}},
+        )
+        self.assertEqual(verdict, "Hallucination")
+        self.assertIn(f"memory:{src}", breakdown["evals"])
+
+    def test_consistent_new_candidate_passes(self) -> None:
+        verifier = SourceAttributionVerifier()
+        src = "Meeting with ACME Corp scheduled for 2025-11-20 at 14:00 in Conference Room B."
+        verdict, _breakdown = verifier.verify(
+            {"kind": "fact", "content": "Meeting with ACME Corp confirmed for 2025-11-20 at 14:00 in Conference Room B.", "evidence": [f"memory:{src}"]},
+            {f"memory:{src}": {"accessible": True, "content": src}},
+        )
+        self.assertEqual(verdict, "Correct")
+
+    def test_new_candidate_without_retrievable_source_is_unverifiable(self) -> None:
+        verifier = SourceAttributionVerifier()
+        verdict, _breakdown = verifier.verify(
+            {"kind": "fact", "content": "Meeting with ACME Corp rescheduled to 2025-11-25.", "evidence": []},
+            {},
+        )
+        self.assertEqual(verdict, "unverifiable_link")
 
 class ResilienceDiagnosticsTests(unittest.TestCase):
     """The incident was invisible in the durable record; pin the fix."""

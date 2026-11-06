@@ -60,10 +60,79 @@ class CoreTests(unittest.TestCase):
         with patch.object(mcp_module, "MCPStdioClient", FakeClient), patch.object(
             mcp_module, "discover_mcp_tools", side_effect=MCPError("discovery failed")
         ), self.assertRaises(MCPError):
-            start_mcp_servers({"fixture": ["fixture"]})
+            start_mcp_servers({"fixture": ["fixture"]}, retry_backoff_seconds=0.0)
 
-        self.assertEqual(len(FakeClient.instances), 1)
-        self.assertTrue(FakeClient.instances[0].closed)
+        # Every attempt's client is closed, not just the last one: a retried start
+        # must not leak the process it abandoned.
+        self.assertEqual(len(FakeClient.instances), 2)
+        self.assertTrue(all(client.closed for client in FakeClient.instances))
+
+    def test_mcp_start_retries_a_failed_handshake_before_skipping(self) -> None:
+        import skynet.mcp as mcp_module
+
+        class FakeClient:
+            attempts: ClassVar[int] = 0
+
+            def __init__(self, command, *, timeout_seconds: float = 30.0) -> None:
+                self.server_name = ""
+
+            def start(self) -> None:
+                type(self).attempts += 1
+                if type(self).attempts == 1:
+                    raise MCPError("MCP response timed out")
+
+            def close(self) -> None:
+                pass
+
+        class FakeTool:
+            name = "sensor_probe"
+
+        with patch.object(mcp_module, "MCPStdioClient", FakeClient), patch.object(
+            mcp_module, "discover_mcp_tools", return_value={"probe": FakeTool()}
+        ):
+            tools, clients = start_mcp_servers(
+                {"arxiv": ["arxiv"]}, skip_failures=True, retry_backoff_seconds=0.0
+            )
+
+        # A cold-boot handshake overrun must not cost the sensor for the whole run.
+        self.assertEqual(FakeClient.attempts, 2)
+        self.assertIn("probe", tools)
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients.skipped_servers, [])
+
+    def test_mcp_start_recovers_from_a_real_first_handshake_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "mcp_slow_fixture.py"
+            marker = Path(directory) / "first_attempt.marker"
+            helper.write_text(
+                "import json, pathlib, sys, time\n"
+                f"marker = pathlib.Path({str(marker)!r})\n"
+                "if not marker.exists():\n"
+                "    marker.write_text('x')\n"
+                "    time.sleep(10)\n"
+                "def read(): return json.loads(sys.stdin.buffer.readline())\n"
+                "def send(value): sys.stdout.buffer.write((json.dumps(value)+'\\n').encode()); sys.stdout.buffer.flush()\n"
+                "while True:\n"
+                " msg = read()\n"
+                " if msg.get('method') == 'initialize': send({'jsonrpc':'2.0','id':msg['id'],'result':{}})\n"
+                " elif msg.get('method') == 'tools/list': send({'jsonrpc':'2.0','id':msg['id'],'result':{'tools':"
+                "[{'name':'slow_probe','description':'p','inputSchema':{'type':'object','properties':{}}}]}})\n",
+                encoding="utf-8",
+            )
+            tools, clients = start_mcp_servers(
+                {"slow": ["python", str(helper)]},
+                timeout_seconds=2.0,
+                skip_failures=True,
+                retry_backoff_seconds=0.1,
+            )
+            try:
+                # The first handshake really overran its deadline; the retry is live.
+                self.assertIn("slow_probe", tools)
+                self.assertEqual(clients.skipped_servers, [])
+                self.assertEqual(len(clients), 1)
+            finally:
+                for client in clients:
+                    client.close()
     def test_mcp_rejects_oversized_frame(self) -> None:
         client = MCPStdioClient(["python", "-c", ""], max_frame_bytes=4)
         client._stdout_buffer.extend(b"12345")
@@ -231,7 +300,9 @@ class CoreTests(unittest.TestCase):
         with patch.object(mcp_module, "MCPStdioClient", FakeClient), patch.object(
             mcp_module, "discover_mcp_tools", return_value={"probe": FakeTool()}
         ):
-            tools, clients = start_mcp_servers({"broken": ["broken"], "healthy": ["healthy"]}, skip_failures=True)
+            tools, clients = start_mcp_servers(
+                {"broken": ["broken"], "healthy": ["healthy"]}, skip_failures=True, retry_backoff_seconds=0.0
+            )
 
         self.assertIn("probe", tools)
         self.assertEqual(len(clients), 1)

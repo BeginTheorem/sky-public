@@ -12,6 +12,7 @@ class ProviderError(RuntimeError):
         provider: str = "unknown",
         model: str = "",
         http_status: int | None = None,
+        cooldown_explicit: bool = False,
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -20,6 +21,11 @@ class ProviderError(RuntimeError):
         self.provider = provider
         self.model = model
         self.http_status = http_status
+        # True when ``cooldown_seconds`` is what the PROVIDER stated (a
+        # ``Retry-After`` header or an exhausted-quota body), not a local
+        # category default. The patient cycle honours a stated cooldown even when
+        # it is shorter than its own 5-minute block; a category default does not.
+        self.cooldown_explicit = cooldown_explicit
 
 def tool_arguments(value: object) -> dict[str, object]:
     """Return a tool call's arguments as a mapping, or raise invalid_response.

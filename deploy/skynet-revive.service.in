@@ -1,0 +1,21 @@
+# Rendered by scripts/deploy.sh from deploy/skynet-revive.service.in.
+#
+# Slow resurrection of the carrier unit (owner decision 2026-10-15). SkyNet is
+# allowed to stop her own unit - a bash step that stops skynet.service kills its
+# own cgroup, so the trailing start on the same line never runs, and
+# Restart=always does not cover an explicit stop. Instead of forbidding the
+# stop, this oneshot starts the carrier again whenever it is down; it is a no-op
+# while the carrier is active or still coming up.
+[Unit]
+Description=SkyNet revive check (start the carrier unit when it is down)
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ROOT@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TZ=UTC
+ExecStart=@ROOT@/.venv/bin/python -m skynet.revive
+TimeoutStartSec=120
+# Same reasoning as skynet.service: an unprivileged user service needs nothing
+# from the ambient privilege set to talk to its own user manager.
+NoNewPrivileges=yes

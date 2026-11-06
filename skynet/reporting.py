@@ -1,11 +1,11 @@
 """Deterministic owner-facing rendering of finished runs.
 
 The model already writes a long English report; the owner needs a compact
-summary built from the structured rows the harness owns. Two blocks per run:
-SCHEDULER (what the planner chose) and REPORT (what the run produced). Nothing
-here reasons about the text: every field is read from `runs`, `run_results`,
-`evaluations`, `tasks` or the `event_log` (`run_started`, `planner_decision`,
-`decision_record`, `finish_report`, `tool_call`).
+Russian summary built from the structured rows the harness owns. One dense block
+per run — what the planner chose, what the episode produced, what comes next.
+Nothing here reasons about the text: every field is read from `runs`,
+`run_results`, `evaluations`, `tasks` or the `event_log` (`run_started`,
+`planner_decision`, `decision_record`, `finish_report`, `tool_call`).
 """
 
 from __future__ import annotations
@@ -66,22 +66,86 @@ def _truncate(text: str, limit: int = BLOCK_LIMIT) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def _format_utc(value: Any) -> str:
+def stamp(value: Any) -> str:
+    """``18.09 15:05 UTC`` — the run clock, dense but still explicit about the zone."""
     if not value:
-        return "unknown"
+        return "—"
     try:
         parsed = parse_timestamp(str(value))
     except (TypeError, ValueError):
-        return str(value)[:19]
-    return parsed.strftime("%Y-%m-%d %H:%M UTC")
+        return str(value)[:16]
+    return parsed.strftime("%d.%m %H:%M UTC")
+
+
+def plural(count: int, one: str, few: str, many: str) -> str:
+    """Russian counting agreement: 1 / 2-4 / 5+ take different word forms, 11-14 the many-form."""
+    if 11 <= count % 100 <= 14:
+        return many
+    if count % 10 == 1:
+        return one
+    if count % 10 in (2, 3, 4):
+        return few
+    return many
+
+
+def human_tokens(value: Any) -> str:
+    """``2796634`` → ``2.80M``: the owner reads magnitudes, not digits."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "—"
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.2f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.0f}k"
+    return str(number)
+
+
+def human_span(seconds: float) -> str:
+    """A span as one short token: minutes+seconds under an hour, hours+minutes above."""
+    total = int(seconds)
+    if total < 0:
+        return ""
+    if total >= 3600:
+        return f"{total // 3600}ч{(total % 3600) // 60:02d}м"
+    return f"{total // 60}м{total % 60:02d}с"
+
+
+def human_duration(started_at: Any, finished_at: Any) -> str:
+    """The span between two stamps, or empty when either is unusable."""
+    if not started_at or not finished_at:
+        return ""
+    try:
+        seconds = (parse_timestamp(str(finished_at)) - parse_timestamp(str(started_at))).total_seconds()
+    except (TypeError, ValueError):
+        return ""
+    return human_span(seconds)
+
+
+STATUS_WORDS = {
+    "COMPLETED": "завершён",
+    "BLOCKED": "заблокирован",
+    "FAILED": "сбой",
+    "NEEDS_RECOVERY": "нужно восстановление",
+    "INTERRUPTED": "прерван",
+    "RUNNING": "идёт",
+}
+
+
+def status_word(status: str) -> str:
+    """Russian word for a status; a status the harness adds later keeps its machine token."""
+    return STATUS_WORDS.get(status.upper(), status)
 
 
 def _finished_runs(store: Any, limit: int) -> list[Any]:
     # A finished run is any non-running row; `finished_at` can still be null on
-    # legacy rows, so status is the reliable discriminator.
+    # legacy rows, so status is the reliable discriminator. Consolidation passes
+    # are excluded on purpose: this stream is the owner-facing record of work on
+    # tasks, and a memory pass is reported by `/status` and `/metrics` instead of
+    # as an episode with no subject to name.
     return store.connection.execute(
         "SELECT run_id, attempt, status, started_at, finished_at, budget FROM runs "
-        "WHERE status != 'running' ORDER BY started_at DESC, rowid DESC LIMIT ?",
+        "WHERE status != 'running' AND kind = 'build' ORDER BY started_at DESC, rowid DESC LIMIT ?",
         (max(0, int(limit)),),
     ).fetchall()
 
@@ -217,9 +281,10 @@ def _finish_report_fields(text: Any) -> dict[str, Any]:
             "changes": data.get("changes") if isinstance(data.get("changes"), list) else [],
             "tests": data.get("tests") if isinstance(data.get("tests"), list) else [],
             "blocker": str(data.get("blocker") or ""),
+            "next_hypothesis": str(data.get("next_hypothesis") or ""),
         }
     prose = str(text or "").strip()
-    return {"summary": prose, "evidence": [], "changes": [], "tests": [], "blocker": ""}
+    return {"summary": prose, "evidence": [], "changes": [], "tests": [], "blocker": "", "next_hypothesis": ""}
 
 
 def _report_block(store: Any, run_row: Any) -> dict[str, Any]:
@@ -290,6 +355,7 @@ def _report_block(store: Any, run_row: Any) -> dict[str, Any]:
         "blocker": parsed["blocker"]
         or (str(result["failure"]) if status != "COMPLETED" and result is not None and result["failure"] else ""),
         "summary": summary,
+        "next_hypothesis": parsed["next_hypothesis"],
     }
 
 
@@ -301,58 +367,80 @@ def recent_run_pairs(store: Any, limit: int = DEFAULT_LIMIT) -> list[dict[str, A
     ]
 
 
-def _render_scheduler(block: dict[str, Any]) -> str:
-    head = f"SCHEDULER  {_format_utc(block.get('started_at'))}"
-    generation = block.get("generation")
-    if generation is not None:
-        head += f"  gen {generation}"
-    if not block.get("found"):
-        return _truncate(head + "\nno planner decision")
-    title = _oneline(block.get("task_title") or block.get("workstream_id") or "(unselected)")
-    reason = _oneline(block.get("reason") or "(none)")
-    exploration = "yes" if block.get("exploration") else "no"
-    return _truncate(
-        f"{head}\n"
-        f"task: {title}\n"
-        f"reason: {reason}\n"
-        f"candidates: {int(block.get('candidate_count') or 0)}   exploration: {exploration}"
-    )
+def _render_run(pair: dict[str, Any]) -> str:
+    """One dense Russian block per run: what was chosen, what came out, what is next.
 
+    The old shape spent two messages on the same run and printed mostly machine
+    labels (``candidates: 2   exploration: no``); the owner asked for Russian and for
+    substance, so the schedule and the report are merged and every number arrives
+    readable — millions abbreviated, and a duration as one token instead of two stamps.
+    """
+    schedule = _as_dict(pair.get("scheduler"))
+    report = _as_dict(pair.get("report"))
+    run_id = str(report.get("run_id") or schedule.get("run_id") or "")[:8] or "—"
+    status = str(report.get("status") or "UNKNOWN").upper()
 
-def _render_report(block: dict[str, Any]) -> str:
-    head = f"REPORT  {_format_utc(block.get('finished_at'))}  status: {block.get('status') or 'UNKNOWN'}"
-    lines = [head]
-    facts: list[str] = []
-    if block.get("steps") is not None:
-        facts.append(f"steps: {block['steps']}")
-    if block.get("tokens") is not None:
-        facts.append(f"tokens: {block['tokens']}")
-    tools = block.get("tools") if isinstance(block.get("tools"), dict) else {}
+    header = [f"🧭 {run_id}", stamp(report.get("finished_at")), status_word(status)]
+    duration = human_duration(report.get("started_at"), report.get("finished_at"))
+    if duration:
+        header.append(duration)
+    if report.get("steps") is not None:
+        steps = int(report["steps"])
+        header.append(f"{steps} {plural(steps, 'шаг', 'шага', 'шагов')}")
+    if report.get("tokens") is not None:
+        header.append(f"{human_tokens(report['tokens'])} токенов")
+    lines = [" · ".join(header)]
+
+    lines.append("Задача: " + _oneline(schedule.get("task_title") or schedule.get("workstream_id") or "(задача не выбрана)"))
+    if not schedule.get("found"):
+        lines.append("Планировщик: решения нет — прогон восстановления")
+    else:
+        candidates = int(schedule.get("candidate_count") or 0)
+        exploration = "включена" if schedule.get("exploration") else "выключена"
+        lines.append(f"Выбор: {candidates} {plural(candidates, 'кандидат', 'кандидата', 'кандидатов')} · разведка {exploration}")
+        reason = _oneline(str(schedule.get("reason") or "").replace("_", " "))
+        if reason:
+            lines.append(f"Почему: {reason}")
+
+    lines.append("Итог: " + (_oneline(report.get("summary"), SUMMARY_LIMIT) or "модель отчёта не оставила"))
+
+    work: list[str] = []
+    tools = report.get("tools") if isinstance(report.get("tools"), dict) else {}
     if tools:
-        facts.append("tools: " + ", ".join(f"{name} x{count}" for name, count in tools.items()))
-    if facts:
-        lines.append("   ".join(facts))
-    tally = [
-        f"criteria: {int(block.get('criteria_passed') or 0)}/{int(block.get('criteria_total') or 0)}",
-        f"evidence: {int(block.get('evidence') or 0)}",
-        f"changes: {int(block.get('changes') or 0)}",
-    ]
-    if block.get("tests"):
-        tally.append(f"tests: {int(block['tests'])}")
-    lines.append("   ".join(tally))
-    lines.append("summary: " + (_oneline(block.get("summary"), SUMMARY_LIMIT) or "(no summary)"))
-    if block.get("blocker"):
-        lines.append("blocker: " + _oneline(block["blocker"]))
+        work.append("тулы: " + ", ".join(f"{name}×{count}" for name, count in tools.items()))
+    work.append(f"правок {int(report.get('changes') or 0)}")
+    work.append(f"доказательств {int(report.get('evidence') or 0)}")
+    total = int(report.get("criteria_total") or 0)
+    if total:
+        work.append(f"критериев {int(report.get('criteria_passed') or 0)}/{total}")
+    if report.get("tests"):
+        work.append(f"тестов {int(report['tests'])}")
+    lines.append("Работа: " + " · ".join(work))
+
+    next_step = _oneline(report.get("next_hypothesis") or "")
+    if next_step:
+        lines.append(f"Дальше: {next_step}")
+    if report.get("blocker"):
+        lines.append("❗ Блокер: " + _oneline(report.get("blocker")))
     return _truncate("\n".join(lines))
 
 
 def render_pairs(pairs: Sequence[dict[str, Any]]) -> list[str]:
-    """Flatten pairs to `[scheduler, report, scheduler, report, ...]`."""
-    rendered: list[str] = []
-    for pair in pairs:
-        rendered.append(_render_scheduler(_as_dict(pair.get("scheduler"))))
-        rendered.append(_render_report(_as_dict(pair.get("report"))))
-    return rendered
+    """One dense Russian block per run, in the order the pairs arrive (newest first)."""
+    return [_render_run(_as_dict(pair)) for pair in pairs]
+
+
+def run_subject(store: Any, run_id: str) -> str:
+    """The task a run is working on, resolved exactly as the log block resolves it.
+
+    Shared so the status card cannot name a different task than the log block for the
+    same run. A run with no planner decision falls back to its decision record, which is
+    the only place an inbox or recovery task gets a name.
+    """
+    row = store.connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None:
+        return ""
+    return str(_scheduler_block(store, row).get("task_title") or "") or _decision_record_title(store, run_id)
 
 
 def render_recent(store: Any, limit: int = DEFAULT_LIMIT) -> list[str]:

@@ -29,7 +29,7 @@ _SUBSYSTEM_RULES = (
     (("tools.py", "mcp.py", "policy.py"), "tools"),
     (("provider", "providers/"), "providers"),
 )
-_PROMPT_FILES = ("model_contracts.py", "SOUL.md", "react.py")
+_PROMPT_FILES = ("model_contracts.py", "SOUL.md", "react.py", "reactor.py", "planner_contract.py")
 _EVAL_FILES = ("metrics.py", "evaluation", "reporting.py")
 
 _ARXIV_RE = re.compile(r"arxiv\.org|\b\d{4}\.\d{4,5}\b", re.IGNORECASE)
@@ -101,6 +101,32 @@ def learnability_defect(proposal: Mapping[str, object]) -> str | None:
     if kind == "research" and not ref:
         return "research proposal cites no external source"
     return None
+
+
+def descriptor_text(idea: Mapping[str, object]) -> str:
+    """The comparable content of an idea: what it claims and how it is checked."""
+    return " ".join(
+        str(idea.get(key, "") or "") for key in ("title", "hypothesis", "expected_new_fact", "validation")
+    )
+
+
+def novelty_against_archive(candidate: Mapping[str, object], others: Sequence[Mapping[str, object]]) -> float:
+    """How new a candidate is relative to the ideas already in the archive.
+
+    Novelty is a *relation*, not a property: a proposal is new while nothing like
+    it is archived and stale once the archive has caught up with it. The archived
+    column used to be written as a constant ``1.0`` at the call site, which killed
+    one of the two MAP-Elites axes: every cell comparison collapsed onto quality,
+    so the epsilon-dominance rule that admits a slightly worse but strictly more
+    novel candidate (``store._admits_over_incumbent``, arXiv:1708.09251 sec.
+    3.1.2) could never fire.
+
+    The measure is deterministic and needs no model call, so the descriptor stays
+    un-gameable - the organism cannot choose its own novelty. Cost is bounded by
+    the archive itself: at most one live idea per cell, ``CELLS_TOTAL`` cells.
+    """
+    texts = [descriptor_text(candidate), *(descriptor_text(other) for other in others)]
+    return lexical_uniqueness(texts)
 
 
 def parent_weight(quality: float, children: int, *, lam: float = 10.0, alpha0: float = 0.5) -> float:

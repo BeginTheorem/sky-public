@@ -637,12 +637,14 @@ class CoreTests(unittest.TestCase):
     def test_multi_pass_compaction_stays_bounded_and_keeps_system(self) -> None:
         # With max_compactions=3 the runner may compact repeatedly; every pass
         # must keep the transcript bounded and never drop the system prompt or
-        # split the newest tool exchange from its assistant call.
+        # split the newest tool exchange from its assistant call. The tail is 8
+        # messages since 2026-10-19: at 4 the compaction kept a single exchange, which
+        # is enough not to crash and too little to keep working from.
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
             runner = ReActRunner(MagicMock(), store, {}, ReActConfig())
             self.assertEqual(runner.config.max_compactions, 3)
-            self.assertEqual(runner.config.compaction_keep_messages, 4)
+            self.assertEqual(runner.config.compaction_keep_messages, 8)
             self.assertEqual(runner.config.tool_result_max_chars, 8_000)
             messages: list[dict[str, object]] = [{"role": "system", "content": "identity"}, {"role": "user", "content": "start"}]
             for index in range(10):
@@ -680,6 +682,228 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(meta["tool_count"], 1)
             self.assertEqual(meta["model"], "test-model-v1")
             self.assertGreater(meta["request_chars"], 0)
+            store.close()
+
+    def test_react_request_metadata_splits_the_prompt_into_its_parts(self) -> None:
+        class ModelProvider:
+            def complete(self, messages, *, max_tokens, tools=()):
+                return ModelTurn(text=FINISH_OK, usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            runner = ReActRunner(ModelProvider(), store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0))
+            runner.run(StartEnvelope("test"), "system")
+            row = store.connection.execute(
+                "SELECT payload FROM transcript WHERE kind='provider_request' ORDER BY sequence LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            meta = json.loads(row[0])
+            # The tool block and the system prompt used to be invisible here, so the biggest
+            # part of a prompt had to be regressed out of prompt_tokens after the fact.
+            self.assertEqual(
+                meta["tools_chars"],
+                len(json.dumps([FixtureTool().schema], ensure_ascii=False, separators=(",", ":"))),
+            )
+            self.assertEqual(meta["system_chars"], len("system"))
+            self.assertIsNone(meta["gap_seconds"], "the first request of a run has no previous step")
+            store.close()
+
+    def test_react_stubs_the_sense_tape_families_a_run_did_not_ask_for(self) -> None:
+        class SenseTool:
+            name = "search_papers"
+
+            def __init__(self) -> None:
+                self.client = type("_Client", (), {"server_name": "arxiv"})()
+
+            @property
+            def schema(self):
+                return {
+                    "type": "function",
+                    "function": {
+                        "name": self.name,
+                        "description": "Search arXiv for papers",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string", "description": "x" * 400}},
+                            "required": ["query"],
+                        },
+                    },
+                }
+
+            def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
+                return {"ok": True}
+
+        class NamedTool:
+            """A house tool that declares its own name: the escape hatch has to be *declared*."""
+
+            def __init__(self, tool_name: str) -> None:
+                self.name = tool_name
+
+            @property
+            def schema(self):
+                return {
+                    "type": "function",
+                    "function": {"name": self.name, "description": self.name, "parameters": {"type": "object", "additionalProperties": False}},
+                }
+
+            def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
+                return {"ok": True}
+
+        class CaptureProvider:
+            def __init__(self) -> None:
+                self.tools: list[dict] = []
+                self.messages: list[list[dict]] = []
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.tools = list(tools)
+                self.messages = [list(messages)]
+                return ModelTurn(text=FINISH_OK, usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = CaptureProvider()
+            store = StateStore(Path(directory) / "state.sqlite3")
+            runner = ReActRunner(
+                provider,
+                store,
+                {"search_papers": SenseTool(), "describe_tool": NamedTool("describe_tool"), "invoke_tool": NamedTool("invoke_tool")},
+                ReActConfig(provider_retries=0),
+            )
+            runner.run(StartEnvelope("test", intention={"title": "Fix the tracker"}), "system")
+            names = [schema["function"]["name"] for schema in provider.tools]
+            self.assertNotIn("search_papers", names, "an unarmed sense costs no schema entry")
+            self.assertIn("describe_tool", names)
+            self.assertIn("invoke_tool", names)
+            system = str(provider.messages[0][0]["content"])
+            self.assertIn("SENSE CATALOGUE", system)
+            self.assertIn("- search_papers (query): Search arXiv for papers", system)
+
+            record = store.connection.execute(
+                "SELECT payload FROM transcript WHERE kind='provider_request' ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            self.assertLess(json.loads(record[0])["tools_chars"], 900)
+            store.close()
+
+    def test_react_resolves_a_meta_call_into_the_tool_it_names(self) -> None:
+        """A catalogued sense is called through `invoke_tool`, and travels the ordinary path.
+
+        The provider only lets the model call functions the request declared, so the call is
+        made against the meta-tool and rebound here -- after which the ledger, the effect
+        memoisation and the retry ladder all see the real tool, exactly as for a direct call.
+        """
+        executed: list[dict] = []
+
+        class RecordedTool:
+            name = "search_papers"
+
+            def __init__(self) -> None:
+                self.client = type("_Client", (), {"server_name": "arxiv"})()
+
+            @property
+            def schema(self):
+                return {
+                    "type": "function",
+                    "function": {
+                        "name": self.name,
+                        "description": "Search arXiv for papers",
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+                    },
+                }
+
+            def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
+                executed.append(dict(arguments))
+                return {"ok": True, "result": "two papers"}
+
+        class MetaCallingProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(
+                        tool_calls=[ToolCall("invoke_tool", {"name": "search_papers", "arguments": {"query": "prompt injection"}})],
+                        completion_tokens=1,
+                        usage_tokens=1,
+                    )
+                return ModelTurn(text=FINISH_OK, completion_tokens=1, usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            runner = ReActRunner(
+                MetaCallingProvider(),
+                store,
+                {
+                    "search_papers": RecordedTool(),
+                    "describe_tool": FixtureTool(),
+                    "invoke_tool": FixtureTool(),
+                },
+                ReActConfig(provider_retries=0),
+            )
+            runner.run(StartEnvelope("test", intention={"title": "Fix the tracker"}), "system")
+            self.assertEqual(executed, [{"query": "prompt injection"}], "the named tool really ran")
+            kinds = [str(row[0]) for row in store.connection.execute("SELECT kind FROM event_log ORDER BY sequence")]
+            self.assertIn("meta_call_resolved", kinds)
+            calls = [
+                json.loads(row[0])
+                for row in store.connection.execute("SELECT payload FROM event_log WHERE kind='tool_call'")
+            ]
+            self.assertEqual([call["tool_name"] for call in calls], ["search_papers"], "the ledger records the real tool")
+            self.assertEqual(calls[0]["arguments"], {"query": "prompt injection"})
+            store.close()
+
+    def test_react_keeps_a_named_sense_family_at_full_schema(self) -> None:
+        class SenseTool:
+            name = "search_papers"
+
+            def __init__(self) -> None:
+                self.client = type("_Client", (), {"server_name": "arxiv"})()
+
+            @property
+            def schema(self):
+                return {
+                    "type": "function",
+                    "function": {
+                        "name": self.name,
+                        "description": "Search arXiv for papers",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string", "description": "x" * 400}},
+                            "required": ["query"],
+                        },
+                    },
+                }
+
+            def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
+                return {"ok": True}
+
+        class CaptureProvider:
+            def __init__(self) -> None:
+                self.tools: list[dict] = []
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.tools = list(tools)
+                return ModelTurn(text=FINISH_OK, usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = CaptureProvider()
+            store = StateStore(Path(directory) / "state.sqlite3")
+            runner = ReActRunner(
+                provider,
+                store,
+                {"search_papers": SenseTool(), "describe_tool": FixtureTool(), "invoke_tool": FixtureTool()},
+                ReActConfig(provider_retries=0),
+            )
+            runner.run(
+                StartEnvelope("test", intention={"title": "Read a paper beyond its abstract"}),
+                "system",
+            )
+            full = next(
+                schema for schema in provider.tools if schema["function"]["name"] == "search_papers"
+            )
+            self.assertEqual(
+                full["function"]["parameters"]["properties"]["query"]["description"],
+                "x" * 400,
+            )
             store.close()
 
     def test_react_compacts_context_and_continues(self) -> None:
@@ -832,6 +1056,32 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertLessEqual(len(cast(str, result["preview"])), 50)
             self.assertEqual(runner._bounded_result({"ok": True}), {"ok": True})
+
+            # A failed result is capped tighter than a successful one, because
+            # its value is the first error line rather than the whole payload.
+            failure = {"ok": False, "error": "boom " + "x" * 400, "stdout": "noise\n" * 40 + "2 failed, 1 passed\n"}
+            tight = ReActRunner(MagicMock(), store, {}, ReActConfig(failed_result_max_chars=300, truncation_tail_lines=3))
+            failed = tight._bounded_result(failure)
+            self.assertTrue(failed["truncated"])
+            self.assertFalse(failed["ok"])
+            self.assertLessEqual(len(cast(str, failed["preview"])), 300)
+            self.assertIn("boom", cast(str, failed["preview"]))
+            # Tail preservation: the verdict line at the end survives the cut,
+            # and a head-only clip of the same payload provably loses it.
+            self.assertIn("2 failed, 1 passed", cast(str, failed["preview"]))
+            self.assertIn("elided", cast(str, failed["preview"]))
+            self.assertNotIn("2 failed, 1 passed", json.dumps(failure, ensure_ascii=False)[:300])
+            # A successful payload under the wide cap is untouched.
+            big_ok = {"ok": True, "output": "y" * 5_000}
+            self.assertEqual(tight._bounded_result(big_ok), big_ok)
+            # A successful payload over the cap keeps its tail inside the budget.
+            wide = ReActRunner(MagicMock(), store, {}, ReActConfig(truncation_tail_lines=8))
+            long_ok = {"ok": True, "output": "y" * 20_000 + "\nDONE ok\n"}
+            bounded_ok = wide._bounded_result(long_ok)
+            self.assertTrue(bounded_ok["truncated"])
+            self.assertLessEqual(len(cast(str, bounded_ok["preview"])), 8_000)
+            self.assertIn("DONE ok", cast(str, bounded_ok["preview"]))
+            self.assertNotIn("DONE ok", json.dumps(long_ok, ensure_ascii=False)[:8_000])
             store.close()
 
     def test_tail_start_never_begins_with_a_tool_result(self) -> None:
@@ -1067,6 +1317,38 @@ class FinishCitationClampTests(unittest.TestCase):
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_invalid'").fetchone()[0], 0)
             store.close()
 
+    def test_finish_repair_prompt_embeds_the_parser_error(self) -> None:
+        """The repair turn must name the parse failure, not resample blindly.
+
+        Huang et al. (2023) arXiv:2310.01798v2: a generic retry without the
+        concrete error degrades reasoning. The repair prompt therefore carries
+        the parser error and the tools the episode actually ran, so the retry is
+        actionable feedback rather than a second roll of the dice.
+        """
+
+        class CapturingProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.repair_prompt = ""
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {})], usage_tokens=1)
+                if self.calls == 2:
+                    return ModelTurn(text="I have finished thinking about it.", usage_tokens=1)
+                self.repair_prompt = str(messages[-1].get("content", ""))
+                return ModelTurn(text=FINISH_OK, usage_tokens=2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            provider = CapturingProvider()
+            result = ReActRunner(provider, store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            self.assertIn("Executed tools: fixture_tool", provider.repair_prompt)
+            self.assertIn("Parser error: Finish Report invalid:", provider.repair_prompt)
+            store.close()
+
     def test_unreadable_finish_carries_the_executed_evidence_instead_of_discarding_it(self) -> None:
         """A degraded provider must not erase an episode's executed work.
 
@@ -1152,6 +1434,65 @@ class FinishCitationClampTests(unittest.TestCase):
             self.assertEqual(result.status, RunStatus.COMPLETED)
             self.assertEqual(json.loads(result.report)["summary"], "done")
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+            store.close()
+
+    def test_a_tool_call_at_finish_is_named_in_the_re_ask(self) -> None:
+        """The finish phase has no tools; a tool call must be answered, not parsed.
+
+        Measured on the live ledger 2026-09-28: 29 of 149 Finish turns returned
+        ``finish_reason=tool_calls`` with empty text although the request carried
+        no tool definitions, and the old generic warning let the model answer
+        with another tool call (11 ``finish_repair_failed`` with
+        ``report_chars=0``).
+        """
+
+        class ToolCallingFinish:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.finish_prompt = ""
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                # The identical call trips the doom-loop guard, which forces the
+                # Finish phase; the finish turn is a tool call too, and the first
+                # re-ask answers.
+                if self.calls <= 5:
+                    return ModelTurn(tool_calls=[ToolCall("fixture_tool", {"step": 1})], usage_tokens=1)
+                self.finish_prompt = str(messages[-1].get("content", ""))
+                return ModelTurn(text=FINISH_OK, usage_tokens=2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            provider = ToolCallingFinish()
+            result = ReActRunner(provider, store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.status, RunStatus.COMPLETED)
+            self.assertIn("called tools that do not exist in this phase", provider.finish_prompt)
+            self.assertIn("fixture_tool", provider.finish_prompt)
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_evidence_carried'").fetchone()[0], 0)
+            store.close()
+
+    def test_an_unreadable_finish_is_re_asked_three_times_then_carried(self) -> None:
+        class AlwaysToolCall:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                return ModelTurn(tool_calls=[ToolCall("fixture_tool", {"step": 1})], usage_tokens=1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            provider = AlwaysToolCall()
+            result = ReActRunner(provider, store, {"fixture_tool": FixtureTool()}, ReActConfig(provider_retries=0)).run(StartEnvelope("test"), "system")
+            self.assertEqual(result.status, RunStatus.NEEDS_RECOVERY)
+            # Three re-asks, each durably recorded, then the evidence is carried.
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='finish_repair_failed'").fetchone()[0], 3)
+            carried = json.loads(result.report)
+            self.assertEqual(carried["status"], "NEEDS_RECOVERY")
+            self.assertIn("executed tool: fixture_tool", carried["evidence"])
+            # 4 pre-finish steps that trip the doom loop, 1 forced finish turn,
+            # and 3 re-asks: the cap is visible in the call count.
+            self.assertEqual(provider.calls, 8)
             store.close()
 
     def test_a_deferred_restart_keeps_the_evidence_this_branch_used_to_drop(self) -> None:
@@ -1590,6 +1931,42 @@ class ProcessGroupTests(unittest.TestCase):
             self.assertEqual(groups, {4242})
 
 
+class _ScriptedBashTool:
+    name = "bash"
+    capability_kind = "write"
+    timeout_seconds = 1.0
+
+    def __init__(self, cwd: Path, commands: list[str]) -> None:
+        self.cwd = cwd
+        self.commands = commands
+        self.calls = 0
+
+    @property
+    def schema(self) -> dict[str, object]:
+        return {"type": "function", "function": {"name": self.name, "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}
+
+    def execute(self, arguments: dict[str, object], *, idempotency_key: str) -> dict[str, object]:
+        self.calls += 1
+        command = self.commands[min(self.calls - 1, len(self.commands) - 1)]
+        completed = subprocess.run(["/bin/bash", "-lc", command], cwd=str(self.cwd), capture_output=True, text=True, check=False)
+        return {"ok": completed.returncode == 0, "stdout": completed.stdout, "stderr": completed.stderr}
+
+
+class _SteppedBashProvider:
+    """Requests one bash step per call, with a distinct argument so the
+    exact-response guard cannot fire; finishes after ``finish_after`` steps."""
+
+    def __init__(self, finish_after: int) -> None:
+        self.calls = 0
+        self.finish_after = finish_after
+
+    def complete(self, messages, *, max_tokens, tools=()):
+        self.calls += 1
+        if self.calls <= self.finish_after:
+            return ModelTurn(tool_calls=[ToolCall("bash", {"n": self.calls})], usage_tokens=1)
+        return ModelTurn(text=FINISH_OK, usage_tokens=1)
+
+
 class WorktreeWarningTests(unittest.TestCase):
     def _run_bash(self, root: Path, command: str) -> tuple[StateStore, ReActRunner]:
         store = StateStore(root / "state" / "state.sqlite3")
@@ -1643,5 +2020,63 @@ class WorktreeWarningTests(unittest.TestCase):
             try:
                 self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='worktree_dirty_after_bash'").fetchone()[0], 0)
                 self.assertNotIn("worktree_warning", self._tool_result(store))
+            finally:
+                store.close()
+
+    def test_repeated_dirty_streak_trips_the_guard_and_closes_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "tracked.txt").write_text("clean\n", encoding="utf-8")
+            commit_all(root, "seed")
+            store = StateStore(root / "state" / "state.sqlite3")
+            provider = _SteppedBashProvider(finish_after=2)
+            runner = ReActRunner(
+                provider,
+                store,
+                {"bash": _ScriptedBashTool(root, ["printf 'a\\n' > tracked.txt"])},
+                ReActConfig(max_dirty_streak=2, max_repeated_responses=99, max_steps=20),
+                worktree_root=root,
+            )
+            try:
+                runner.run(StartEnvelope("test"), "system")
+                guard = store.connection.execute("SELECT payload FROM event_log WHERE kind='worktree_dirty_guard'").fetchone()
+                self.assertIsNotNone(guard, "the streak guard must close a tree it cannot clean")
+                self.assertGreaterEqual(json.loads(guard[0])["streak"], 2)
+                dirty = store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='worktree_dirty_after_bash'").fetchone()[0]
+                self.assertEqual(dirty, 2, "the episode must stop at the threshold, not keep editing")
+                self.assertLessEqual(provider.calls, 4)
+            finally:
+                store.close()
+
+    def test_a_clean_step_resets_the_dirty_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "tracked.txt").write_text("clean\n", encoding="utf-8")
+            commit_all(root, "seed")
+            store = StateStore(root / "state" / "state.sqlite3")
+            # dirty, dirty, clean, dirty, dirty: the clean step resets the count,
+            # so a threshold of 3 is never reached and the run finishes normally.
+            commands = [
+                "printf 'a\\n' > tracked.txt",
+                "printf 'b\\n' > tracked.txt",
+                "git checkout -- tracked.txt",
+                "printf 'c\\n' > tracked.txt",
+                "printf 'd\\n' > tracked.txt",
+            ]
+            provider = _SteppedBashProvider(finish_after=len(commands))
+            runner = ReActRunner(
+                provider,
+                store,
+                {"bash": _ScriptedBashTool(root, commands)},
+                ReActConfig(max_dirty_streak=3, max_repeated_responses=99, max_steps=20),
+                worktree_root=root,
+            )
+            try:
+                runner.run(StartEnvelope("test"), "system")
+                guard = store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='worktree_dirty_guard'").fetchone()[0]
+                self.assertEqual(guard, 0, "a clean step must reset the streak")
+                self.assertEqual(provider.calls, len(commands) + 1)
             finally:
                 store.close()

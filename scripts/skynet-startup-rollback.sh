@@ -6,7 +6,15 @@ ROOT="${SKYNET_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 REQUEST="$ROOT/state/reboot-request.json"
 GUARD="$ROOT/state/reboot-guard.json"
 SERVICE="${SKYNET_SERVICE:-skynet.service}"
-SYSTEMCTL="${SKYNET_SYSTEMCTL:-systemctl}"
+# The rollout runs either as a root system service or as an unprivileged user
+# service; pick the matching bus (a raw SKYNET_SYSTEMCTL override wins for ops).
+if [[ -n "${SKYNET_SYSTEMCTL:-}" ]]; then
+    read -r -a SYSTEMCTL <<<"$SKYNET_SYSTEMCTL"
+elif [[ "$(id -u)" -eq 0 ]]; then
+    SYSTEMCTL=(systemctl)
+else
+    SYSTEMCTL=(systemctl --user)
+fi
 
 ROLLBACK_REQUEST="$ROOT/state/rollback-request.json"
 
@@ -83,5 +91,5 @@ fi
 rm -f "$REQUEST"
 rm -f "$GUARD"
 rm -f "$ROLLBACK_REQUEST"
-"$SYSTEMCTL" reset-failed "$SERVICE" || true
-"$SYSTEMCTL" restart "$SERVICE"
+"${SYSTEMCTL[@]}" reset-failed "$SERVICE" || true
+"${SYSTEMCTL[@]}" restart "$SERVICE"

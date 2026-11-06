@@ -1,0 +1,23 @@
+# Rendered by scripts/deploy.sh from deploy/skynet-revive.timer.in.
+#
+# Owner decision 2026-10-15: the carrier unit may be stopped by the organism
+# itself, so the fix is not a ban on stopping but a slow resurrection. Every 30
+# minutes the revive oneshot checks the carrier and starts it when it is down,
+# which means a death costs at most one tick: she is back within 30 minutes of
+# it, and a unit that never came up at boot is picked up by the OnBootSec tick.
+#
+# The brake for a deliberate maintenance stop is this timer:
+#   systemctl --user stop skynet-revive.timer     (or: disable it)
+# While the timer is stopped nothing is revived, and that is the only switch
+# needed - restarting the timer re-arms the check without touching the carrier.
+[Unit]
+Description=Trigger the SkyNet revive check every 30 minutes
+
+[Timer]
+Unit=skynet-revive.service
+OnBootSec=30min
+OnUnitActiveSec=30min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

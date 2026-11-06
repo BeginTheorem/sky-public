@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import queue
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .idea_archive import CELLS_TOTAL, CHANGE_TYPES, EVIDENCE_SOURCES, SUBSYSTEMS, learnability_defect
-from .model_contracts import PLANNER_RESPONSE_SCHEMA, validate_shape
+from .model_contracts import MAX_MODEL_REASKS, PLANNER_RESPONSE_SCHEMA, corrective_reask_instruction, validate_shape
 from .models import ModelTurn
+from .plan_tools import plan_tool_schemas
 from .planner import (
     hypothesis_fingerprint,
     normalize_hypothesis_text,
@@ -18,8 +20,40 @@ from .planner import (
     title_prefix,
     title_similarity,
 )
-from .planner_contract import PLANNER_INSTRUCTION, PLANNER_RETRY_INSTRUCTION, parse_planner_reply, planner_system_prompt
+from .planner_contract import PLANNER_INSTRUCTION, PLANNER_RETRY_INSTRUCTION, PLANNER_STALL_INSTRUCTION, parse_planner_reply, planner_system_prompt
 from .provider import LLMProvider, Message
+
+# How much reconnaissance one planning pass may do. Rounds bound the model calls,
+# calls-per-round bound one burst, and the result cap keeps a `git log` from filling the
+# planner's window. All three are budgets, not limits the model is told about.
+MAX_TOOL_ROUNDS = 4
+MAX_TOOL_CALLS_PER_ROUND = 3
+TOOL_RESULT_MAX_CHARS = 8_000
+
+
+def plan_pass_token_ceiling(max_input_chars: int, output_tokens: int) -> int:
+    """The token allowance ONE planning pass books -- and the ceiling its own
+    mid-pass guard enforces. One formula, one number: the run row and the guard
+    read it from here, so a heartbeat that re-sizes the planner's window moves
+    both together and they cannot drift apart.
+
+    It is the pass's worst case, not a prediction: the input ceiling converted
+    with the ReAct runner's own ``//3`` estimator plus output room, with 10%
+    headroom on top -- the same shape as the memory pass's figure.
+
+    Why the guard is this number and not a smaller per-step share (measured
+    2026-10-21): the old frozen constant was ``floor(274_688 / 8) * 0.95`` --
+    the booking divided by the eight calls a pass may make. Every call re-sends
+    its whole prompt, so a real per-call cost is roughly constant (~33-38k on
+    the live ledger) while that share was 32.6k: the guard fired at step 2 with
+    66-77k spent of a 238k allowance, 29 of 32 passes that day and 103 of 111
+    the day before, each retried minutes later and killed again. A guard that
+    trips with three quarters of the allowance unspent costs work instead of
+    protecting it; sized at the booking, only a pass that outspends what it
+    booked stops.
+    """
+    return int((max_input_chars // 3 + output_tokens) * 1.1)
+
 
 
 class AutonomousPlanner:
@@ -40,6 +74,10 @@ class AutonomousPlanner:
         self.store = store
         self.output_tokens = output_tokens
         self.max_input_chars = max_input_chars
+        # The pass's token allowance: derived here from the window it was built
+        # with, and moved by ``resize_window`` when the heartbeat re-sizes the
+        # planner. The reactor books the plan run row off this same number.
+        self.max_pass_tokens = plan_pass_token_ceiling(self.max_input_chars, self.output_tokens)
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.max_active_goals = max(1, int(max_active_goals))
         self.hypothesis_ttl_days = max(0.0, float(hypothesis_ttl_days))
@@ -52,19 +90,41 @@ class AutonomousPlanner:
         # which the empty list return value cannot express on its own.
         self.last_status: str = ""
 
-    def _complete_bounded(self, messages: Sequence[Message]) -> ModelTurn:
-        """Bound the planner provider call; a stuck request must not freeze PLAN."""
+    def resize_window(self, max_input_chars: int) -> None:
+        """Re-size the context window AND the pass's token allowance with it.
+
+        The reactor calls this on every heartbeat that moves the active rung. A
+        window that moves has to move the booking with it, or the pass is
+        measured against the class of the previous heartbeat -- and a caller that
+        assigns ``max_input_chars`` directly would move the window while leaving
+        the allowance behind, which is exactly the drift this method removes.
+        """
+        self.max_input_chars = int(max_input_chars)
+        self.max_pass_tokens = plan_pass_token_ceiling(self.max_input_chars, self.output_tokens)
+
+    def _complete_bounded(self, messages: Sequence[Message], deadline: float, tools: Sequence[Any] = ()) -> ModelTurn:
+        """Bound the planner provider call by the shared planning deadline.
+
+        A stuck request must not freeze PLAN, and the deadline is shared across
+        the reply, its re-asks and its reconnaissance rounds, so three re-asks and four
+        tool rounds cannot multiply the wait. ``tools`` are the request-side schemas of
+        the pass's read-only set; empty means the pass scouts with nothing and a tool
+        call in its reply stays a parse failure.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"planner provider timeout after {self.timeout_seconds:.1f}s")
         result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
 
         def complete() -> None:
             try:
-                result_queue.put(("ok", self.provider.complete(messages, max_tokens=self.output_tokens, tools=())))
+                result_queue.put(("ok", self.provider.complete(messages, max_tokens=self.output_tokens, tools=tools)))
             except BaseException as exc:
                 result_queue.put(("error", exc))
 
         worker = threading.Thread(target=complete, name="skynet-planner-provider", daemon=True)
         worker.start()
-        worker.join(self.timeout_seconds)
+        worker.join(remaining)
         if worker.is_alive():
             raise TimeoutError(f"planner provider timeout after {self.timeout_seconds:.1f}s")
         kind, value = result_queue.get()
@@ -74,60 +134,132 @@ class AutonomousPlanner:
             raise TypeError("planner provider returned invalid turn")
         return value
 
-    def generate(self, *, generation: int, goals: list[dict[str, Any]], tasks: list[dict[str, Any]], memories: list[dict[str, Any]], previous: dict[str, Any], trigger: str) -> list[dict[str, Any]]:
+    def generate(
+        self,
+        *,
+        generation: int,
+        goals: list[dict[str, Any]],
+        tasks: list[dict[str, Any]],
+        memories: list[dict[str, Any]],
+        previous: dict[str, Any],
+        trigger: str,
+        exploration: Mapping[str, Any] | None = None,
+        tools: Mapping[str, Any] | None = None,
+        max_tool_rounds: int = MAX_TOOL_ROUNDS,
+        run_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """One bounded planning pass, with reconnaissance when tools are supplied.
+
+        With ``tools`` the pass scouts before it proposes: a reply that asks for a
+        read-only tool is executed, its result is fed back, and the pass continues while
+        its round budget and the shared deadline allow. Without ``tools`` the shipped
+        contract stands unchanged -- a tool call in the reply is a parse failure.
+        """
         attempt = self.store.start_planner_attempt(generation, trigger, "explore-alternatives")
         self.last_status = ""
-        payload = self._bounded_payload(goals, tasks, memories, previous)
+        tool_schemas: Sequence[Any] = plan_tool_schemas(tools) if tools else ()
+        payload = self._bounded_payload(goals, tasks, memories, previous, exploration=exploration)
         messages = [{"role": "system", "content": planner_system_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+        deadline = time.monotonic() + self.timeout_seconds
         try:
-            turn: ModelTurn = self._complete_bounded(messages)
+            turn: ModelTurn = self._complete_bounded(messages, deadline, tools=tool_schemas)
         except Exception as exc:
             self._fail_attempt(attempt, trigger, "provider_error", str(exc))
             return []
+        cumulative_usage = turn.total_tokens
         retried = False
-        try:
-            parsed = self._parse(turn.text)
-        except Exception as first_exc:
-            # One bounded repair attempt: the model is told exactly what was
-            # wrong and asked for one object. It never loops, so a model that
-            # keeps emitting the same shape cannot burn the run budget. The
-            # turn's own stop reason rides along, so a first attempt cut off at
-            # the output ceiling stays diagnosable even when the retry repairs it.
-            retried = True
-            # Remember whether the FIRST reply was cut off: if the retry also
-            # fails, the truncation must stay diagnosable even when the retry
-            # ended for an unrelated reason (a non-truncated garbage reply).
-            first_truncated = self._truncated(turn)
-            self.store.append_event("planner_retry", {
-                "attempt_id": attempt,
-                "trigger": trigger,
-                "reason": str(first_exc)[:500],
-                "finish_reason": turn.finish_reason,
-                "text_chars": len(turn.text),
-            })
-            correction = [*messages, {"role": "assistant", "content": turn.text}, {"role": "user", "content": PLANNER_RETRY_INSTRUCTION}]
-            try:
-                turn = self._complete_bounded(correction)
-            except Exception as exc:
-                self._fail_attempt(attempt, trigger, "provider_error", f"retry provider error: {exc}")
-                return []
+        first_truncated = self._truncated(turn)
+        last_error: Exception | None = None
+        parsed: Any = None
+        reask = 0
+        tool_rounds = 0
+        while True:
+            # Reconnaissance: the pass reads before it proposes. Bounded by rounds and by
+            # the shared deadline, executed on this thread (the store connection is not
+            # thread-shared), and a tool fault comes back as a result, never as a raise.
+            if tools and turn.tool_calls and tool_rounds < max_tool_rounds and time.monotonic() < deadline:
+                tool_rounds += 1
+                messages = [*messages, self._assistant_message(turn), *self._tool_messages(turn, tools, attempt, trigger, tool_rounds, run_id)]
+                try:
+                    turn = self._complete_bounded(messages, deadline, tools=tool_schemas)
+                except Exception as provider_exc:
+                    self._fail_attempt(attempt, trigger, "provider_error", f"tool round provider error: {provider_exc}")
+                    return []
+                cumulative_usage += turn.total_tokens
+                step = 1 + tool_rounds
+                if cumulative_usage > self.max_pass_tokens:
+                    self._fail_attempt(attempt, trigger, "plan_budget_mid_pass_exceeded", f"mid-pass abort at step {step}: {cumulative_usage} > {self.max_pass_tokens} (the pass's booked token allowance)")
+                    return []
+                continue
+            # One bounded re-ask per parse failure, up to MAX_MODEL_REASKS: the
+            # model is told exactly what was wrong -- including the tool calls it
+            # emitted in a phase that has none -- and asked for one object. It
+            # never loops, so a model that keeps emitting the same shape cannot
+            # burn the run budget. The reply's own stop reason rides along, so a
+            # first attempt cut off at the output ceiling stays diagnosable even
+            # when a later re-ask repairs it.
             try:
                 parsed = self._parse(turn.text)
-            except Exception as retry_exc:
-                # A completion stopped by the output ceiling is a distinct event
-                # from a model that answered garbage: the first is a budget knob
-                # (SKYNET_PLANNER_OUTPUT_TOKENS), the second is a contract break.
-                # Either attempt hitting the ceiling names the budget problem.
-                if first_truncated or self._truncated(turn):
-                    self._fail_attempt(
-                        attempt,
-                        trigger,
-                        "output_truncated",
-                        f"reply stopped at the output ceiling (first={first_truncated}, retry=finish_reason={turn.finish_reason}); retried once; still no decodable content",
-                    )
+                break
+            except Exception as exc:
+                last_error = exc
+                # Classify failure for discriminative retry
+                failure_kind = self._failure_type(turn, str(exc))
+                if reask >= MAX_MODEL_REASKS:
+                    break
+                reask += 1
+                retried = True
+                self.store.append_event("planner_retry", {
+                    "attempt_id": attempt,
+                    "trigger": trigger,
+                    "reason": str(exc)[:500],
+                    "finish_reason": turn.finish_reason,
+                    "text_chars": len(turn.text),
+                    "reask": reask,
+                    "attempted_tools": [str(call.tool_name) for call in turn.tool_calls],
+                    "failure_kind": failure_kind,
+                })
+                # Provide failure-specific retry hint
+                if failure_kind == "truncation":
+                    retry_hint = "Output was truncated at the token ceiling. Continue from the cutoff point and emit only the JSON object."
+                elif failure_kind == "prose":
+                    retry_hint = "Prose detected. Emit only the JSON object matching the schema — no explanatory text, no formatting, no extra fields."
                 else:
-                    self._fail_attempt(attempt, trigger, "invalid_response", f"retried once; still invalid: {retry_exc}")
-                return []
+                    retry_hint = ""
+                # The forcing re-ask below carries no tool schemas, so its instruction must not
+                # invite a call the request cannot execute.
+                retry_instruction = PLANNER_RETRY_INSTRUCTION + "\n\n" + corrective_reask_instruction(
+                    phase="planner", tool_calls=turn.tool_calls, parser_error=str(exc)[:1500], tools_available=False
+                )
+                if retry_hint:
+                    retry_instruction += "\n\n" + retry_hint
+                correction = [*messages, {"role": "assistant", "content": turn.text}, {"role": "user", "content": retry_instruction}]
+                step = 1 + tool_rounds + reask
+                if cumulative_usage > self.max_pass_tokens:
+                    self._fail_attempt(attempt, trigger, "plan_budget_mid_pass_exceeded", f"mid-pass abort before re-ask at step {step}: {cumulative_usage} > {self.max_pass_tokens} (the pass's booked token allowance)")
+                    return []
+                try:
+                    turn = self._complete_bounded(correction, deadline)
+                    cumulative_usage += turn.total_tokens
+                except Exception as provider_exc:
+                    self._fail_attempt(attempt, trigger, "provider_error", f"retry provider error: {provider_exc}")
+                    return []
+        if parsed is None:
+            # A completion stopped by the output ceiling is a distinct event from
+            # a model that answered garbage: the first is a budget knob
+            # (SKYNET_PLANNER_OUTPUT_TOKENS), the second is a contract break.
+            # Either the first or the last attempt hitting the ceiling names the
+            # budget problem.
+            if first_truncated or self._truncated(turn):
+                self._fail_attempt(
+                    attempt,
+                    trigger,
+                    "output_truncated",
+                    f"reply stopped at the output ceiling (first={first_truncated}, last={turn.finish_reason}); retried {MAX_MODEL_REASKS} times; still no decodable content",
+                )
+            else:
+                self._fail_attempt(attempt, trigger, "invalid_response", f"retried {MAX_MODEL_REASKS} times; still invalid: {last_error}")
+            return []
         data = [item for item in parsed.get("proposals", []) if isinstance(item, dict)]
         self._apply_goal_proposals(parsed.get("goal_proposals"), goals, attempt)
         accepted = 0
@@ -135,10 +267,10 @@ class AutonomousPlanner:
         deduplicated = 0
         result: list[dict[str, Any]] = []
         for raw in data[:3]:
-            proposal = self._validate(raw, goals)
+            proposal, rejection_reason = self._validate(raw, goals)
             if proposal is None:
                 rejected += 1
-                self.store.record_planner_proposal(self._safe_rejected(raw), attempt, "rejected", reason="invalid proposal")
+                self.store.record_planner_proposal(self._safe_rejected(raw), attempt, "rejected", reason=rejection_reason)
                 continue
             if self._fingerprints_occupied(proposal["hypothesis_fingerprint"], proposal["structural_fingerprint"]):
                 deduplicated += 1
@@ -196,6 +328,22 @@ class AutonomousPlanner:
         than a malformed model answer.
         """
         return turn.finish_reason == "length"
+    @staticmethod
+    def _failure_type(turn: ModelTurn, parser_error: str) -> str:
+        """Classify the failure kind for discriminative retry.
+
+        - 'truncation': finish_reason == 'length' (output ceiling hit)
+        - 'prose': finish_reason == 'stop' with parse/JSON error (model emitted prose instead of JSON)
+        - 'other': any other failure mode
+
+        This classification enables targeted retry feedback and measurement.
+        """
+        if turn.finish_reason == "length":
+            return "truncation"
+        if turn.finish_reason == "stop" and parser_error:
+            # Prose or malformed JSON when the model chose to stop
+            return "prose"
+        return "other"
 
     def _fail_attempt(self, attempt: str, trigger: str, status: str, failure: str) -> None:
         """Close a failed attempt and make the failure kind a distinct event.
@@ -296,7 +444,76 @@ class AutonomousPlanner:
     PAYLOAD_TASK_WINDOW = 40
     PAYLOAD_MEMORY_WINDOW = 20
 
-    def _bounded_payload(self, goals: list[dict[str, Any]], tasks: list[dict[str, Any]], memories: list[dict[str, Any]], previous: dict[str, Any]) -> dict[str, Any]:
+    MAX_TOOL_ROUNDS = 4
+    MAX_TOOL_CALLS_PER_ROUND = 3
+    TOOL_RESULT_MAX_CHARS = 8_000
+
+    @staticmethod
+    def _assistant_message(turn: ModelTurn) -> Message:
+        """The assistant turn as the provider expects it back, calls included."""
+        return {
+            "role": "assistant",
+            "content": turn.text,
+            "tool_calls": [
+                {
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {"name": call.tool_name, "arguments": json.dumps(call.arguments, separators=(",", ":"))},
+                }
+                for call in turn.tool_calls
+            ],
+        }
+
+    def _tool_messages(
+        self,
+        turn: ModelTurn,
+        tools: Mapping[str, Any],
+        attempt: str,
+        trigger: str,
+        round_index: int,
+        run_id: str,
+    ) -> list[Message]:
+        """Run the calls this turn asked for and return one result message per call.
+
+        Bounded twice: ``MAX_TOOL_CALLS_PER_ROUND`` calls per turn, and each result is
+        capped so one `git log` cannot fill the planner's window. A tool fault -- an
+        unknown name, a refusal from the read-only shell, an exception inside the tool --
+        comes back as an ``ok: false`` payload the model can read and react to, and is
+        recorded as a durable ``planner_tool_call`` event so the pass's reconnaissance is
+        auditable after the fact.
+        """
+        messages: list[Message] = []
+        for call in list(turn.tool_calls)[: self.MAX_TOOL_CALLS_PER_ROUND]:
+            tool = tools.get(call.tool_name)
+            started = time.monotonic()
+            if tool is None:
+                payload: dict[str, Any] = {"ok": False, "error": f"unknown tool {call.tool_name}"}
+            else:
+                try:
+                    payload = dict(tool.execute(dict(call.arguments), idempotency_key=f"{attempt}:r{round_index}:{call.call_id}"))
+                except Exception as exc:  # a tool fault must not kill the pass
+                    payload = {"ok": False, "error": f"tool raised: {exc}"[:500]}
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded) > self.TOOL_RESULT_MAX_CHARS:
+                payload = {"ok": bool(payload.get("ok")), "truncated": True, "preview": encoded[: self.TOOL_RESULT_MAX_CHARS]}
+                encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            self.store.append_event(
+                "planner_tool_call",
+                {
+                    "attempt_id": attempt,
+                    "trigger": trigger,
+                    "round": round_index,
+                    "tool_name": call.tool_name,
+                    "ok": bool(payload.get("ok")),
+                    "result_chars": len(encoded),
+                    "seconds": round(time.monotonic() - started, 3),
+                },
+                run_id or None,
+            )
+            messages.append({"role": "tool", "tool_call_id": call.call_id, "content": encoded})
+        return messages
+
+    def _bounded_payload(self, goals: list[dict[str, Any]], tasks: list[dict[str, Any]], memories: list[dict[str, Any]], previous: dict[str, Any], exploration: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Trim complete JSON records, never cut a serialized document mid-value.
 
         Every collection arrives best-first, so both the window and the
@@ -311,6 +528,15 @@ class AutonomousPlanner:
             "cell_coverage": self._cell_coverage(),
             "instruction": PLANNER_INSTRUCTION,
         }
+        if exploration:
+            # Under a stall the empty-cell preference is strengthened with the
+            # explicit untried list and its own instruction. This is a directive
+            # to the one planner, never a second selection contour.
+            payload["exploration"] = {
+                **dict(exploration),
+                "untried_cells": self._empty_cells(24),
+                "instruction": PLANNER_STALL_INSTRUCTION,
+            }
         while len(json.dumps(payload, ensure_ascii=False)) > self.max_input_chars and (payload["memories"] or payload["tasks"] or payload["goals"]):
             collection = payload["memories"] or payload["tasks"] or payload["goals"]
             collection.pop()
@@ -326,6 +552,22 @@ class AutonomousPlanner:
             payload = {"instruction": PLANNER_INSTRUCTION[:budget], "truncated": True}
         return payload
 
+    def _empty_cells(self, limit: int) -> list[str]:
+        """Descriptor cells with no active occupant, in a stable order."""
+        filled: set[str] = set()
+        if hasattr(self.store, "idea_cells"):
+            try:
+                filled = set(self.store.idea_cells())
+            except Exception:
+                filled = set()
+        return sorted(
+            f"{subsystem}|{change_type}|{source}"
+            for subsystem in SUBSYSTEMS
+            for change_type in CHANGE_TYPES
+            for source in EVIDENCE_SOURCES
+            if f"{subsystem}|{change_type}|{source}" not in filled
+        )[:limit]
+
     def _cell_coverage(self) -> dict[str, Any]:
         """Cheap structural hint: which behavioural cells are still empty."""
         cells: dict[str, int] = {}
@@ -334,7 +576,6 @@ class AutonomousPlanner:
                 cells = self.store.idea_cells()
             except Exception:
                 cells = {}
-        filled = set(cells)
         return {
             "axes": {
                 "subsystem": list(SUBSYSTEMS),
@@ -342,14 +583,8 @@ class AutonomousPlanner:
                 "evidence_source": list(EVIDENCE_SOURCES),
             },
             "cells_total": CELLS_TOTAL,
-            "cells_filled": len(filled),
-            "empty_examples": sorted(
-                f"{subsystem}|{change_type}|{source}"
-                for subsystem in SUBSYSTEMS
-                for change_type in CHANGE_TYPES
-                for source in EVIDENCE_SOURCES
-                if f"{subsystem}|{change_type}|{source}" not in filled
-            )[:12],
+            "cells_filled": len(cells),
+            "empty_examples": self._empty_cells(12),
         }
 
     @staticmethod
@@ -436,31 +671,41 @@ class AutonomousPlanner:
         }
 
     @staticmethod
-    def _validate(raw: dict[str, Any], goals: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def _validate(raw: dict[str, Any], goals: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str | None]:
+        """Validate a proposal and return (candidate, rejection_reason).
+
+        Returns (candidate, None) on success, (None, reason) on failure.
+        Specific rejection reasons identify which validation check failed,
+        enabling diagnostic coverage tracking (DCR@3-style).
+        """
         required = ("goal_id", "title", "problem", "hypothesis", "expected_new_fact", "validation", "scope", "kind")
         # Ensure all required keys are present and non-empty (except for collections)
         for key in required:
             val = raw.get(key)
             if val is None:
-                return None
+                return None, f"missing_{key}"
             if not isinstance(val, (list, dict)) and not val:
-                return None
+                return None, f"empty_{key}"
         if not isinstance(raw.get("scope"), list):
-            return None
+            return None, "scope_not_list"
         if str(raw["kind"]) not in {"engineering", "research", "validation", "recovery", "observation", "self_improvement"}:
-            return None
+            return None, f"invalid_kind:{raw.get('kind')}"
         if not any(str(goal.get("goal_id")) == str(raw["goal_id"]) and goal.get("status") == "active" for goal in goals):
-            return None
+            return None, "goal_inactive_or_missing"
+
         candidate = {key: raw[key] for key in required}
-        if len(str(candidate["title"])) > 300 or len(candidate["scope"]) > 12:
-            return None
+        if len(str(candidate["title"])) > 300:
+            return None, "title_too_long"
+        if len(candidate["scope"]) > 12:
+            return None, "scope_too_large"
+
         candidate["goal_id"] = str(candidate["goal_id"])
         candidate["title"] = str(candidate["title"]).strip()
         candidate["inspiration_ref"] = str(raw.get("inspiration_ref", "") or "").strip()[:400]
         candidate["parent_idea_id"] = str(raw.get("parent_idea_id", "") or "").strip()[:64] or None
         candidate["hypothesis_fingerprint"] = hypothesis_fingerprint(area=candidate["kind"], problem=candidate["problem"], expected_behavior=candidate["expected_new_fact"], files=candidate["scope"])
         candidate["structural_fingerprint"] = structural_fingerprint(area=candidate["kind"], target=candidate["problem"], behavior_kind=candidate["kind"])
-        return candidate
+        return candidate, None
 
     @staticmethod
     def _safe_rejected(raw: dict[str, Any]) -> dict[str, Any]:

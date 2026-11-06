@@ -46,6 +46,12 @@ DEVIATION_KINDS = (
     # actually tried (measured 2026-09-25: 5 zero-strike runs vs 12 that struck).
     "provider_unreachable",
     "worktree_dirty_after_bash",
+    # The episode the dirty-worktree guard closed: the same tracked files stayed
+    # modified across the streak threshold and no proposal could accept them.
+    "worktree_dirty_guard",
+    # A dirty main worktree healed at wake: the edits were preserved under
+    # state/quarantine and the tree restored before work was chosen.
+    "worktree_auto_quarantined",
     "livelock_suspected",
     "memory_loop_failed",
     "memory_degraded",
@@ -79,11 +85,19 @@ def _one(connection: sqlite3.Connection, sql: str, params: tuple[Any, ...] = (),
 
 
 def outcome_mix(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
-    """Run outcomes, steps and token spend inside the window."""
+    """Episode outcomes, steps and token spend inside the window.
+
+    Only ``kind='build'`` rows count as episodes: a memory pass has its own row,
+    its own budget and its own verdict now, and folding it in would have reported
+    one more run per cycle and charged the pass's tokens to work that had already
+    finished. The pass is measured beside the episodes instead, in ``memory``.
+    """
     rows = _rows(
         connection,
-        "SELECT status, COUNT(*) AS n, COALESCE(SUM(steps), 0) AS steps, "
-        "COALESCE(SUM(usage_tokens), 0) AS tokens FROM run_results WHERE created_at >= ? GROUP BY status",
+        "SELECT rr.status, COUNT(*) AS n, COALESCE(SUM(rr.steps), 0) AS steps, "
+        "COALESCE(SUM(rr.usage_tokens), 0) AS tokens FROM run_results rr "
+        "LEFT JOIN runs r ON r.run_id = rr.run_id WHERE rr.created_at >= ? "
+        "AND COALESCE(r.kind, 'build') = 'build' GROUP BY rr.status",
         (since,),
     )
     by_status = {str(row["status"]): int(row["n"]) for row in rows}
@@ -106,6 +120,60 @@ def outcome_mix(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
         "steps_by_status": steps,
         "tokens_per_completed_run": int(completed_tokens / completed) if completed else None,
         "tokens_wasted": wasted_tokens,
+        "memory": memory_pass_mix(connection, since),
+        "plan": plan_pass_mix(connection, since),
+    }
+
+
+def memory_pass_mix(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
+    """The consolidation passes of the window, counted apart from the episodes.
+
+    A pass that degraded is recorded ``needs_recovery`` -- never retried on its
+    own, with its evidence preserved -- so ``by_status`` here is where a memory
+    problem is visible without inflating the episode failure rate. A skipped pass
+    (an episode status that is not consolidatable) is counted separately, because
+    "nothing to consolidate" is not a memory fault.
+    """
+    mix = pass_mix(connection, since, "memory")
+    mix["skipped"] = int(
+        _one(
+            connection,
+            "SELECT COUNT(*) FROM event_log WHERE kind = 'memory_run_finished' AND created_at >= ? "
+            "AND json_extract(payload, '$.skipped') = 1",
+            (since,),
+        )
+        or 0
+    )
+    return mix
+
+
+def plan_pass_mix(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
+    """The planning passes of the window, counted apart from the episodes.
+
+    A pass that reached no decision -- a parse failure, a truncated reply, a provider
+    error -- is ``needs_recovery``; one that legitimately found nothing selectable is
+    ``completed`` and named by its own status word in the run's report. Both are here
+    rather than in the episode mix, so a bad planning day cannot look like a bad
+    working day.
+    """
+    return pass_mix(connection, since, "plan")
+
+
+def pass_mix(connection: sqlite3.Connection, since: str, kind: str) -> dict[str, Any]:
+    """Runs of one pass kind: how many, how they ended, what they cost."""
+    rows = _rows(
+        connection,
+        "SELECT rr.status, COUNT(*) AS n, COALESCE(SUM(rr.steps), 0) AS steps, "
+        "COALESCE(SUM(rr.usage_tokens), 0) AS tokens FROM run_results rr "
+        "JOIN runs r ON r.run_id = rr.run_id WHERE r.kind = ? AND rr.created_at >= ? GROUP BY rr.status",
+        (kind, since),
+    )
+    by_status = {str(row["status"]): int(row["n"]) for row in rows}
+    return {
+        "runs": sum(by_status.values()),
+        "by_status": by_status,
+        "tokens_total": sum(int(row["tokens"]) for row in rows),
+        "steps_total": sum(int(row["steps"]) for row in rows),
     }
 
 
@@ -122,7 +190,7 @@ def deviations(connection: sqlite3.Connection, since: str) -> dict[str, int]:
 
 
 def work_mix(connection: sqlite3.Connection, since: str) -> dict[str, Any]:
-    """Accepted-proposal mix by kind, so metabolic drift becomes a number.
+    """Accepted-proposal mix by kind: what the organism chose to spend its cycles on, as a number.
 
     ``tasks.area`` carries the proposal kind (``record_planner_proposal`` passes
     it through), so the distribution of tasks created over the window is the

@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import os
-import shlex
 import signal
 import sqlite3
 import subprocess
@@ -18,6 +17,7 @@ from typing import cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from .git_hygiene import install_git_read_only_environment
 from .models import Budget
 from .time import DISPLAY_TIMEZONE, display_timestamp, utc_now
 
@@ -36,15 +36,18 @@ def _log_format(timezone_name: str) -> str:
     """Build the log line format with the configured timezone label."""
     return f"%(asctime)s [{timezone_name}] [%(levelname)s] %(name)s: %(message)s"
 from .checkpoints import CheckpointError, CheckpointManager
+from .finish_tool import FINISH_TOOL_NAME, FinishTool
 from .heartbeat import wake as heartbeat_wake
 from .lock import ProcessLock
-from .mcp import MCPStdioClient, start_mcp_servers
+from .mcp import MCPStdioClient, configured_servers, start_mcp_servers
 from .provider import Tool
 from .providers import build_provider
 from .reactor import ReactorConfig, WatchdogTimeout
 from .recovery import RecoveryError
 from .store import StateStore
 from .supervisor import Supervisor
+from .systemctl import systemctl_command
+from .tool_catalog import INVOKE_TOOL_NAME, DescribeTool, InvokeTool
 from .tools import default_tools
 from .watchdog import StaleRunWatchdog
 
@@ -68,12 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _systemctl_action(action: str, services: list[str]) -> subprocess.CompletedProcess[str]:
-    # SKYNET_SYSTEMCTL is the same test/ops override the startup rollback script
-    # uses; when set it is invoked directly (no sudo) so a fake binary works.
-    executable = os.getenv("SKYNET_SYSTEMCTL") or "systemctl"
-    command = [executable, action, *services]
-    if os.geteuid() != 0 and not os.getenv("SKYNET_SYSTEMCTL"):
-        command = ["sudo", "-n", *command]
+    # The helper picks the bus: ``--user`` for the unprivileged production
+    # service, the system bus for a root process, and a raw ``SKYNET_SYSTEMCTL``
+    # override for ops/tests. No sudo is ever emitted.
+    command = systemctl_command(action, *services)
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
@@ -308,24 +309,11 @@ def _stop_event() -> threading.Event:
 def _mcp_config() -> dict[str, list[str]]:
     """Build the MCP server map from SKYNET_MCP_<NAME>_COMMAND.
 
-    The four sensors used to be hardcoded keys, so adding one required editing
-    this file. Any SKYNET_MCP_<NAME>_COMMAND now registers a server, and
-    SKYNET_MCP_<NAME>_DISABLED=1 removes one without touching the command.
+    The scan lives in ``skynet.mcp.configured_servers`` so the status card can ask the same
+    question without importing this entry point: a sensor the config parked (``_DISABLED=1``)
+    must not be reported as a missing sense.
     """
-    prefix, suffix = "SKYNET_MCP_", "_COMMAND"
-    config: dict[str, list[str]] = {}
-    for key in sorted(os.environ):
-        if not key.startswith(prefix) or not key.endswith(suffix):
-            continue
-        name = key[len(prefix): -len(suffix)].lower()
-        if not name:
-            continue
-        if os.getenv(f"{prefix}{name.upper()}_DISABLED", "").strip().casefold() in {"1", "true", "yes", "on"}:
-            continue
-        command = shlex.split(os.environ.get(key, "") or "")
-        if command:
-            config[name] = command
-    return config
+    return configured_servers()
 
 
 def _jsonl_drain_enabled() -> bool:
@@ -392,7 +380,7 @@ def _reset_command(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         if not args.force:
             print(
-                f"{exc}. Stop the service first: sudo systemctl stop {args.service} "
+                f"{exc}. Stop the service first: systemctl --user stop {args.service} "
                 f"(or re-run with --force to stop, reset, and restart it).",
                 file=sys.stderr,
             )
@@ -446,6 +434,9 @@ def main() -> int:
     )
     for handler in logging.getLogger().handlers:
         handler.setFormatter(UTCLogFormatter(log_format, "%Y-%m-%dT%H:%M:%S", timezone_name))
+    # Every CLI verb may run git (checkpoint, rollback, reconcile, clean-start), so the
+    # read-only default is installed here too, not only in the service's supervisor.start.
+    install_git_read_only_environment()
     if args.command == "money-boost":
         return _money_boost_command(args.value, args.root, args.state)
     if args.command == "verbose":
@@ -473,7 +464,7 @@ def main() -> int:
                 try:
                     state = state_store.state()
                     tables = {row["name"] for row in state_store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                    required = {"agent_state", "runs", "run_results", "event_log", "checkpoints", "inbox", "outbox", "capability_effects", "episode_snapshots", "memory_consolidations", "recovery_reconciliations", "schema_migrations"}
+                    required = {"agent_state", "runs", "run_results", "event_log", "inbox", "outbox", "capability_effects", "episode_snapshots", "memory_consolidations", "recovery_reconciliations", "schema_migrations"}
                     health = {"ok": required <= tables, "checks": {"schema": required <= tables, "state": state.lifecycle.value}}
                 finally:
                     state_store.close()
@@ -520,7 +511,7 @@ def main() -> int:
             elif args.command == "health":
                 state = store.state()
                 tables = {row["name"] for row in store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                required = {"agent_state", "runs", "run_results", "event_log", "checkpoints", "inbox", "outbox", "capability_effects", "episode_snapshots", "memory_consolidations", "recovery_reconciliations", "schema_migrations"}
+                required = {"agent_state", "runs", "run_results", "event_log", "inbox", "outbox", "capability_effects", "episode_snapshots", "memory_consolidations", "recovery_reconciliations", "schema_migrations"}
                 result = {"ok": required <= tables, "checks": {"schema": required <= tables, "state": state.lifecycle.value}}
                 print(json.dumps(result, default=str))
                 return 0 if result["ok"] else 1
@@ -590,7 +581,7 @@ def main() -> int:
         return 1
     config = ReactorConfig(state_path=args.state, self_improvement_root=args.root, wake_interval_seconds=args.interval, budget=Budget(
         steps=int(os.getenv("SKYNET_MAX_STEPS", "100")),
-        tokens=int(os.getenv("SKYNET_REACT_INPUT_TOKENS", "200000")),
+        tokens=int(os.getenv("SKYNET_REACT_INPUT_TOKENS", "150000")),
         seconds=float(os.getenv("SKYNET_MAX_SECONDS", "3600")),
         output_tokens=int(os.getenv("SKYNET_OUTPUT_TOKENS", "8192")),
     ), memory_input_tokens=int(os.getenv("SKYNET_MEMORY_INPUT_TOKENS", "50000")),
@@ -613,11 +604,25 @@ def main() -> int:
         affect_valence_tilt_weight=float(os.getenv("SKYNET_AFFECT_VALENCE_TILT_WEIGHT", "0.5")),
         hypothesis_ttl_days=float(os.getenv("SKYNET_HYPOTHESIS_TTL_DAYS", "30")),
         cell_scarcity_weight=float(os.getenv("SKYNET_CELL_SCARCITY_WEIGHT", "0.20")),
+        outward_weight=float(os.getenv("SKYNET_OUTWARD_WEIGHT", "0.40")),
         external_seek_enabled=os.getenv("SKYNET_EXTERNAL_SEEK", "true").strip().casefold() not in {"0", "false", "no", "off"},
         external_seek_every_generations=int(os.getenv("SKYNET_EXTERNAL_SEEK_EVERY", "4")),
         external_seek_cooldown_seconds=float(os.getenv("SKYNET_EXTERNAL_SEEK_COOLDOWN", "3600")),
+        # The curated outward agenda rotates instead of draining once: one round leaves per
+        # rotation_hours/len(ROADMAP_TASKS), and its own starvation signal fires when no round
+        # has been handed out for a whole window while the goal is active and nothing is live.
+        roadmap_rotation_hours=float(os.getenv("SKYNET_ROADMAP_ROTATION_HOURS", "48")),
+        roadmap_starvation_hours=float(os.getenv("SKYNET_ROADMAP_STARVATION_HOURS", "24")),
         fallback_repeat_generations=int(os.getenv("SKYNET_FALLBACK_REPEAT_GENERATIONS", "4")),
         fallback_repeat_seconds=float(os.getenv("SKYNET_FALLBACK_REPEAT_SECONDS", "900")),
+        # Wall-clock ceiling on the bounded diagnostic (the generation window alone allowed
+        # ~17 instances/day, 29% of an epoch's tokens), the retirement window for stranded
+        # pending work, and the outward-starvation alert threshold.
+        fallback_daily_limit=int(os.getenv("SKYNET_FALLBACK_DAILY_LIMIT", "3")),
+        fallback_daily_window_hours=float(os.getenv("SKYNET_FALLBACK_DAILY_WINDOW_HOURS", "24")),
+        stranded_task_hours=float(os.getenv("SKYNET_STRANDED_TASK_HOURS", "6")),
+        outward_starvation_suppressions=int(os.getenv("SKYNET_OUTWARD_STARVATION_SUPPRESSIONS", "12")),
+        outward_starvation_hours=float(os.getenv("SKYNET_OUTWARD_STARVATION_HOURS", "24")),
         stall_alert_seconds=float(os.getenv("SKYNET_STALL_ALERT_SECONDS", "3600")),
         external_seek_min_seconds=float(os.getenv("SKYNET_EXTERNAL_SEEK_MIN_SECONDS", "3600")),
         criterion_epoch_generations=int(os.getenv("SKYNET_CRITERION_EPOCH_GENERATIONS", "100")),
@@ -625,15 +630,15 @@ def main() -> int:
         archive_parent_lambda=float(os.getenv("SKYNET_ARCHIVE_PARENT_LAMBDA", "10")),
         archive_parent_alpha0=float(os.getenv("SKYNET_ARCHIVE_PARENT_ALPHA0", "0.5")),
         max_active_goals=int(os.getenv("SKYNET_MAX_ACTIVE_GOALS", "8")),
-        event_retention_days=int(os.getenv("SKYNET_EVENT_RETENTION_DAYS", "30")),
-        effect_retention_days=int(os.getenv("SKYNET_EFFECT_RETENTION_DAYS", "30")))
+        event_retention_days=int(os.getenv("SKYNET_EVENT_RETENTION_DAYS", "1")),
+        effect_retention_days=int(os.getenv("SKYNET_EFFECT_RETENTION_DAYS", "1")))
     tools = cast(dict[str, Tool], default_tools())
     mcp_clients: list[MCPStdioClient] = []
     mcp_config = _mcp_config()
     if mcp_config:
         discovered, mcp_clients = start_mcp_servers(
             mcp_config,
-            timeout_seconds=float(os.getenv("SKYNET_MCP_TIMEOUT", "30")),
+            timeout_seconds=float(os.getenv("SKYNET_MCP_TIMEOUT", "180")),
             skip_failures=True,
         )
         discovered = cast(dict[str, Tool], discovered)
@@ -665,6 +670,18 @@ def main() -> int:
                     startup_store.close()
             except (OSError, sqlite3.OperationalError) as exc:
                 logging.getLogger("skynet.cli").warning("could not record MCP startup state: %s", exc)
+    # The tiered request sends compact stubs for the sense families the episode did not ask
+    # for; this tool is how those stay callable without guessing an argument list (see
+    # `skynet/tool_catalog.py`). Registered after the MCP merge, so a sensor of the same name
+    # would have been renamed as a collision instead of silently shadowing this one.
+    tools["describe_tool"] = DescribeTool(tools)
+    # The catalogue names tools whose schemas are not in the request; this is how one of them
+    # gets called anyway (see `skynet/tool_catalog.py` and `ReActRunner._resolve_meta_call`).
+    tools[INVOKE_TOOL_NAME] = InvokeTool()
+    # The prompt asks for a Finish Report and the model reaches for a `finish` tool to return it:
+    # 39 live calls died at "unknown tool: finish". The tool is the report's own contract, and the
+    # runner intercepts it before dispatch (see skynet/finish_tool.py).
+    tools[FINISH_TOOL_NAME] = FinishTool()
     supervisor = Supervisor(provider, tools, config, root=args.root)
     # A promotion must restart every unit that imports this tree: the reactor
     # and the Telegram control bot. Restarting only the reactor left the bot

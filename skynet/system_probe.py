@@ -76,7 +76,7 @@ class SystemProbe:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
-            # FileNotFoundError (no systemctl/sudo), TimeoutExpired, AccessDenied:
+            # FileNotFoundError (no systemctl), TimeoutExpired, AccessDenied:
             # all of them are normal on a stripped-down host and all are data.
             return None
         return completed.stdout or ""
@@ -195,23 +195,34 @@ class SystemProbe:
         rows.sort(key=lambda row: row["rss"], reverse=True)
         return {"count": count, "top": rows[:_TOP_PROCESSES]}
 
+    def _service_buses(self) -> list[list[str]]:
+        """The buses a unit may live on: the system bus, and - for a non-root
+        caller - its own user bus. In production the organism's units are user
+        units while ssh/cron/journald stay system units, so a liveness probe has
+        to ask both and reports a unit active if either bus says so.
+        """
+        buses = [["systemctl"]]
+        if os.geteuid() != 0:
+            buses.append(["systemctl", "--user"])
+        return buses
+
     def _services(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for name in self.services:
-            active_output = self._run(["systemctl", "is-active", name])
-            failed_output = self._run(["systemctl", "is-failed", name])
-            active = active_output.strip() == "active" if active_output is not None else None
-            failed = failed_output.strip() == "failed" if failed_output is not None else None
-            rows.append({"name": name, "active": active, "failed": failed})
+            active: bool | None = None
+            failed: bool | None = None
+            answered = False
+            for bus in self._service_buses():
+                active_output = self._run([*bus, "is-active", name])
+                failed_output = self._run([*bus, "is-failed", name])
+                if active_output is not None:
+                    answered = True
+                    active = bool(active or active_output.strip() == "active")
+                if failed_output is not None:
+                    answered = True
+                    failed = bool(failed or failed_output.strip() == "failed")
+            rows.append({"name": name, "active": active if answered else None, "failed": failed if answered else None})
         return rows
-
-    def _sudo_commands(self) -> list[str]:
-        output = self._run(
-            ["sudo", "-n", "journalctl", "-q", "_COMM=sudo", "-n", "50", "--no-pager"]
-        )
-        if not output:
-            return []
-        return output.splitlines()[:_COMMAND_LINES]
 
     def _bash_history(self) -> list[str]:
         try:
@@ -301,7 +312,6 @@ class SystemProbe:
             "home_listing": self._listing(Path.home()),
             "tmp_listing": self._listing(Path("/tmp")),
             "agent_commands": commands[-_COMMAND_LINES:],
-            "sudo_commands": self._sudo_commands(),
             "bash_history": self._bash_history(),
             "probe_error": "; ".join(errors) or None,
         }

@@ -301,14 +301,15 @@ def axis_pools(
     limit: int,
     *,
     allowed: set[str] | None = None,
-) -> tuple[list[str], list[str], list[str]]:
-    """The three fusion axes in rank order, re-derived by the rig.
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """The four fusion axes in rank order, re-derived by the rig.
 
     The SQL is written out rather than called through ``MemoryStore.search``: a
     cross-check that calls the thing it checks proves nothing. ``_RRF_K`` and
     ``_RRF_WEIGHTS`` are imported, so the check fails if either side's constants move.
     ``allowed`` REPLACES the ``status='active'`` clause, like the shipped reader.
     """
+    import logging
     terms = MemoryStore._normalize_terms(query)
     match = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
     candidate = limit * 5
@@ -345,7 +346,29 @@ def axis_pools(
             (*params, candidate),
         )
     ]
-    return bm25, recency, confidence
+    # Attention pool: the reinforcement axis, the same score MemoryStore uses
+    attention = []
+    attention_query = "SELECT memory_id, retrieval_count, positive_outcome_count, complexity_tier FROM memories WHERE 1=1"
+    attention_params = []
+    if allowed is not None:
+        placeholders = ",".join("?" for _ in allowed)
+        attention_query += f" AND memory_id IN ({placeholders})"
+        attention_params.extend(sorted(allowed))
+    attention_query += " AND status='active' ORDER BY updated_at DESC LIMIT 500"
+    try:
+        rows = connection.execute(attention_query, attention_params).fetchall()
+        for row in rows:
+            memory_id, retrieval_count, positive_outcome_count, complexity_tier = row
+            score = MemoryStore._compute_attention_score(
+                retrieval_count or 0, positive_outcome_count or 0, complexity_tier or "Simple"
+            )
+            if score > 0:
+                attention.append((memory_id, score))
+    except sqlite3.Error as e:
+        logging.getLogger(__name__).debug("Attention pool query failed: %s", e)
+    attention.sort(key=lambda x: (-x[1], x[0]))
+    attention_ids = [mem_id for mem_id, _ in attention]
+    return bm25, recency, confidence, attention_ids
 
 
 def replayed_page(
@@ -356,9 +379,9 @@ def replayed_page(
     allowed: set[str] | None = None,
 ) -> list[str]:
     """The page the rig's own axes + the shipped placement produce for ``query``."""
-    bm25, recency, confidence = axis_pools(connection, query, limit, allowed=allowed)
+    bm25, recency, confidence, attention = axis_pools(connection, query, limit, allowed=allowed)
     scores: dict[str, float] = {}
-    for pool, (_axis, weight) in zip((bm25, recency, confidence), _RRF_WEIGHTS, strict=False):
+    for pool, (_axis, weight) in zip((bm25, recency, confidence, attention), _RRF_WEIGHTS, strict=True):
         for rank, memory_id in enumerate(pool, start=1):
             scores[memory_id] = scores.get(memory_id, 0.0) + weight / (_RRF_K + rank)
     if not scores:

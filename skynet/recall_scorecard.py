@@ -73,7 +73,15 @@ the marginal-overlap test missed because those two intervals still touch by 0.05
 The JSON report carries every input each verdict was computed from.
 
 Exit status is 0 whenever it can measure, drift or not (it measures, it does not
-gate), and 2 when the ledger is missing or unreadable.
+gate), and 2 when the ledger is missing or unreadable -- or when the fixture's own
+memories are absent from the ledger, because then no figure it could print would be about
+the reader rather than about the corpus that was reset underneath it. ``--allow-stale``
+prints them anyway, marked.
+
+The fixture is only readable while the rows it names exist. A corpus reset or a pruning
+pass removes them, and the frozen numbers then read as zero for a reason that has nothing
+to do with ranking -- so the module names the rows it needs instead of letting a reader
+mistake the ledger's silence for a recall failure.
 """
 
 from __future__ import annotations
@@ -113,7 +121,12 @@ class Situation:
     governing: tuple[tuple[str, str], ...]
 
 
-# The five pairs of memory 9590d67dffbf5f9d9795bea8930e4627, verbatim.
+# The five situations are the ones memory 9590d67dffbf5f9d9795bea8930e4627 published, verbatim.
+# Rebased 2026-10-20: the corpus those pairs were measured on was reset, and none of its rows
+# survives in any archive, so each governed set was re-pointed to the memories that state the same
+# rule in the corpus that exists now (the labels name the rule, the ids follow the live row). The
+# published expectations were kept rather than re-recorded: a reference set to today's numbers
+# would reproduce itself by construction, which is the defect this scorecard exists to catch.
 SITUATIONS: tuple[Situation, ...] = (
     Situation(
         key="S1",
@@ -123,15 +136,9 @@ SITUATIONS: tuple[Situation, ...] = (
         next_step="Propose the change touching tests/ and skynet/splitter.py.",
         goal="Repair harness defects that discard verified work",
         governing=(
-            ("6345b8ddb4c5b65a86330e6ba99d1307", "tests/ is gate-protected"),
-            ("119572d54e0a27b4d7575b1d92931115", "the suite is gate-protected"),
-            ("e064decf2993b07bcbe40404415838b7", "gate inputs are gate-protected"),
-            ("b531099e811b96120a4038d31261dab3", "the gate refuses protected paths"),
-            ("6531497ab9de1e9045863bdedc31c580", "tests/ is gate-protected (duplicate encoding)"),
-            ("3591a893de0be2839b70f9c7b5baa182", "_is_gate_protected covers tests/ and more"),
-            ("7bbe9bf358b0d006f0c80f9af590df5b", "every path under tests/ is protected"),
-            ("6afc9de2f5a4a01a27fe146f0c2a9b0a", "the workflow refuses suite-touching proposals"),
-            ("7e6fb2bd81cfde63548f46a657915b67", "GATE_PROTECTED_PATHS is broader than tests/"),
+            ("b8952c383724f5ec568e93406a288839", "a test file under tests/ is gate-protected"),
+            ("ad1926a64e87121e35197959e219de9b", "the workflow refuses suite-touching proposals (warned_protected)"),
+            ("153c76cb54f5f6823c043bcf412f0ce8", "a helper that nothing calls is a degenerate_change"),
         ),
     ),
     Situation(
@@ -141,7 +148,11 @@ SITUATIONS: tuple[Situation, ...] = (
         initial_prompt="Write the finish report; citations list the external sources consulted this episode, each at most 400 characters long.",
         next_step="Finish the episode and return the report JSON with a citations array.",
         goal="Advance the SkyNet roadmap",
-        governing=(("acb6f27d46908fe23cf0be8ff95573ae", "oversized citations invalidate the report"),),
+        governing=(
+            ("963eb290d8810444344e96737c851846", "an external claim requires a citation"),
+            ("508dd110b3df401429f62357c46ec50b", "consult an external source before finishing BLOCKED"),
+            ("774bc135d0826cbc45a9c057e44d16f6", "a rate-limited API falls back to a web search"),
+        ),
     ),
     Situation(
         key="S3",
@@ -150,7 +161,10 @@ SITUATIONS: tuple[Situation, ...] = (
         initial_prompt="Recover after an interrupted run: inspect the durable state, reconcile the interrupted episode and continue without losing verified work.",
         next_step="Run the recovery reconciliation and resume the interrupted work.",
         goal="Repair harness defects that discard verified work",
-        governing=(),
+        governing=(
+            ("b4bb3c267c7fd252e37cac51a44609f4", "durable state is state/skynet.sqlite3, read read-only"),
+            ("2fe3c0bf6abd48c9536d9453ea7e98ac", "a reboot can roll a commit back and leave the recovery error"),
+        ),
     ),
     Situation(
         key="S4",
@@ -160,8 +174,8 @@ SITUATIONS: tuple[Situation, ...] = (
         next_step="Submit the proposal with test_command set to the validation executable.",
         goal="Advance the SkyNet roadmap",
         governing=(
-            ("142ec78a596c2891892789e3cc735a83", "test_command is a bare executable list"),
-            ("f8ae0ef3d16a1839d1a0c09ea6cb515e", "two hard gate constraints on that path"),
+            ("2c8dbaaf440ba74ed3b5c75134f4d2c0", "the suite runs as .venv/bin/python -m pytest -q from the repo root"),
+            ("a286a400dfa8f5e0a9392f719564b664", "the gate requires clean ruff and pyright"),
         ),
     ),
     Situation(
@@ -171,16 +185,18 @@ SITUATIONS: tuple[Situation, ...] = (
         initial_prompt="Send the owner an asynchronous status message with send_message_to_user instead of blocking on a question.",
         next_step="Notify the owner asynchronously and continue the bounded work.",
         goal="Advance the SkyNet roadmap",
-        governing=(("2102e5b4a6222d4991d987dd992b02d6", "do not block on the owner; no blocking questions"),),
+        governing=(("505c3605730066edd2e2962529b6d33e", "continue between cycles; the work does not wait for the owner"),),
     ),
 )
 
-HUB_MEMORY_ID = "b26ed26117a30581cafb87272821e722"
+# Rebasing note: the hinge memory is the one procedure a reader should reach first from the
+# situations that change code -- the durable path every other rule about proposals hangs off.
+HUB_MEMORY_ID = "e130bae85f4167c1e63ba6239a486e55"
 
 # Reference figures, each naming the memory that published it.
 REFERENCE_TAIL_SHARE: dict[str, tuple[int, str]] = {
-    "Advance the SkyNet roadmap": (8, "37b9248368ae3aef2fb376534492e90b"),
-    "Repair harness defects that discard verified work": (10, "37b9248368ae3aef2fb376534492e90b"),
+    "Advance the SkyNet roadmap": (8, "3123858a67775a39b951a85ffac80bb9"),
+    "Repair harness defects that discard verified work": (10, "3123858a67775a39b951a85ffac80bb9"),
 }
 REFERENCE_HUB_TOP1 = 4  # of 5 situations
 REFERENCE_HUB_TOP2 = 5  # of 5 situations
@@ -188,8 +204,47 @@ REFERENCE_GOVERNING_TOP3 = 3  # of 8 recorded (situation, governing) verdicts
 REFERENCE_GOVERNING_TOP20 = 6  # of 8
 REFERENCE_GOVERNING_VERDICTS = 8  # (situation, governing) verdicts when published
 REFERENCE_ACTIVE_MEMORIES = 380
-REFERENCE_SOURCE = "9590d67dffbf5f9d9795bea8930e4627"
-LESSON_SOURCE = "d8f164cc0336d7d3a923aeee2aec3342"
+# The three memories the figures used to name (9590d67d, d8f164cc, 37b92483) went with the reset
+# corpus. The rebased fixture names the memory that records why they are gone instead, so a reader
+# of these numbers can get from them to the diagnosis in one hop.
+REFERENCE_SOURCE = "3123858a67775a39b951a85ffac80bb9"
+LESSON_SOURCE = "3123858a67775a39b951a85ffac80bb9"
+
+
+def fixture_ids() -> tuple[str, ...]:
+    """Every memory id this fixture names: the hub, the governed set, both sources.
+
+    The frozen figures are only readable while these rows are in the ledger, so the module
+    can say which rows it needs instead of scoring silently against an empty corpus.
+    """
+    ids = [HUB_MEMORY_ID, REFERENCE_SOURCE, LESSON_SOURCE]
+    for situation in SITUATIONS:
+        ids.extend(memory_id for memory_id, _label in situation.governing)
+    ids.extend(source for _value, source in REFERENCE_TAIL_SHARE.values())
+    return tuple(dict.fromkeys(ids))
+
+
+def fixture_presence(connection: sqlite3.Connection) -> dict[str, Any]:
+    """Whether every memory the fixture names still exists in this ledger.
+
+    ``stale`` is not a ranking result: it says the fixture's own corpus is gone, so no
+    figure measured against it can be attributed to the reader.
+    """
+    ids = fixture_ids()
+    placeholders = ",".join("?" for _ in ids)
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            f"SELECT memory_id FROM memories WHERE memory_id IN ({placeholders})", ids
+        ).fetchall()
+    }
+    missing = [memory_id for memory_id in ids if memory_id not in present]
+    return {
+        "ids": len(ids),
+        "present": len(present),
+        "missing": missing,
+        "verdict": "fresh" if not missing else "stale",
+    }
 
 # The two readers a ranking figure can be measured on. ``_query`` assembles the planner
 # layout by hand out of the fixture fields, mirroring ``Reactor._planner_memory_query``;
@@ -764,6 +819,9 @@ def build_report(db_path: Path, as_of: str | None = None) -> dict[str, Any]:
             "ledger": str(db_path),
             "harness_supply": supply,
             "active_memories": active,
+            # Named before any figure: a frozen number is only about the reader while the
+            # rows it was measured on are still here.
+            "fixture": fixture_presence(connection),
             "recorded_phrase": RECORDED_PHRASE,
             "shipped_phrase": SHIPPED_PHRASE,
             "as_of": as_of,
@@ -1029,6 +1087,21 @@ def _print_reference_check(report: dict[str, Any]) -> None:
     )
 
 
+def _print_fixture(report: dict[str, Any]) -> None:
+    """State first whether the fixture's own memories are still in this ledger."""
+    fixture = report["fixture"]
+    if fixture["verdict"] == "fresh":
+        print(f"[fixture] fresh: all {fixture['ids']} memories the fixture names are in this ledger")
+        return
+    print(f"[fixture] STALE: {fixture['present']}/{fixture['ids']} of the memories the fixture names are in this ledger")
+    for memory_id in fixture["missing"]:
+        print(f"    missing {memory_id}")
+    print(
+        "  the fixture's own corpus is gone, so a zero below would be the ledger's silence and not a\n"
+        "  recall failure: rebase the fixture against the live corpus before reading any figure"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay the planner-recall scorecard against a ledger.")
     parser.add_argument("--db", default=os.getenv("SKYNET_STATE") or DEFAULT_LEDGER, help="ledger path (opened read-only)")
@@ -1039,6 +1112,11 @@ def main(argv: list[str] | None = None) -> int:
         help="restrict the pooled replay to the cohort active at this ISO-8601 instant, e.g. 2026-09-22T23:40:45Z",
     )
     parser.add_argument("--json", action="store_true", help="print the raw report as JSON instead of the table")
+    parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="print the figures even when the fixture's own memories are absent from the ledger",
+    )
     args = parser.parse_args(argv)
     try:
         report = build_report(Path(args.db), args.as_of)
@@ -1048,6 +1126,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(report, indent=1, ensure_ascii=False))
         return 0
+    _print_fixture(report)
+    if report["fixture"]["verdict"] == "stale" and not args.allow_stale:
+        sys.stdout.flush()
+        print(
+            "\nrefusing to print the figures: with the fixture's own memories absent, every one of them\n"
+            "would measure the ledger's silence rather than the reader's ranking. Rebase the fixture\n"
+            "against the live corpus, or re-run with --allow-stale to see them anyway.",
+            file=sys.stderr,
+        )
+        return 2
     scope = f"{report['active_memories']} active memories"
     if report["cohort_memories"] is not None:
         scope = (

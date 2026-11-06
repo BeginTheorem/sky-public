@@ -26,7 +26,12 @@ host: ${HOST_VALUE}
 time: ${STAMP}"
 
 if command -v journalctl >/dev/null 2>&1; then
-    JOURNAL="$(journalctl -u "$UNIT" -n 5 --no-pager 2>/dev/null || true)"
+    # The failing units are systemd *user* units, so their log lives on the user
+    # bus; a bare `journalctl -u` queries the system manager and returns nothing,
+    # which is why the alert carried no journal lines. XDG_RUNTIME_DIR is set for
+    # user units but is defaulted here so the call works from any context.
+    JOURNAL="$(XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        journalctl --user -u "$UNIT" -n 5 --no-pager 2>/dev/null || true)"
     if [[ -n "$JOURNAL" ]]; then
         MESSAGE="${MESSAGE}
 journal (last 5):

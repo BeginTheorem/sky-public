@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast
 
 from .checkpoints import CheckpointError, CheckpointManager
+from .git_hygiene import clear_stale_index_lock, install_git_read_only_environment
 from .lock import ProcessLock
 from .memory_audit import checkpoint_memory_audit, memory_audit_continuity_report, verify_chain
 from .models import LifecycleState
@@ -20,6 +21,7 @@ from .reactor import HEALTHY_LIFECYCLES, SAFETY_NET_FINGERPRINTS, Reactor, React
 from .recovery import RebootGuard
 from .rollback import consume_request
 from .self_improvement import SelfImprovementManager
+from .systemctl import systemctl_command
 
 log = logging.getLogger("skynet.supervisor")
 
@@ -121,6 +123,9 @@ class Supervisor:
         self.root = Path(root or Path.cwd())
         self.reboot_guard = RebootGuard(Path(self.config.state_path).parent, max_window_age_seconds=self.config.reboot_window_max_age_seconds)
         self.self_improvement = SelfImprovementManager(self.root)
+        # The reconcile pass reads the owner's answer, and only the durable store has it:
+        # without this wire the tier-2 boundary would ask a question nothing could read back.
+        self.self_improvement.set_store(self.reactor.store)
         self._converge_handoff()
         self._restart_callback: Callable[[], None] | None = None
         self._started = False
@@ -146,11 +151,12 @@ class Supervisor:
         except Exception:
             log.exception("roadmap handoff convergence failed; continuing")
             return
-        if summary["tasks_created"] or summary["tasks_retired"]:
+        if summary["tasks_created"] or summary["tasks_retired"] or summary.get("tasks_rehomed"):
             log.info(
-                "roadmap handoff converged created=%s retired=%s",
+                "roadmap handoff converged created=%s retired=%s rehomed=%s",
                 summary["tasks_created"],
                 summary["tasks_retired"],
+                summary.get("tasks_rehomed", 0),
             )
 
     def start(self) -> None:
@@ -160,6 +166,16 @@ class Supervisor:
         try:
             self.reactor.store.append_event("supervisor_start", {"state_path": str(self.config.state_path)})
             log.info("supervisor starting; recovering durable state")
+            # Read-only git must never take .git/index.lock, process-wide: a status that is
+            # killed while refreshing the index is what left the lock on 2026-10-28.
+            install_git_read_only_environment()
+            # The organism owns its own debris. A stale lock (0 bytes, old, no git process
+            # alive) is removed here rather than escalated: bash may not write under .git/
+            # and the sudo gate cannot run at all while the unit sets NoNewPrivileges.
+            swept = clear_stale_index_lock(self.root)
+            if swept is not None:
+                log.warning("cleared a stale git index lock at startup: %s", swept)
+                self.reactor.store.append_event("stale_index_lock_cleared", {"path": str(swept), "where": "startup"})
             # The deployed marker is written only by deploy.sh/rollback.sh, so a
             # tree that moved without them would report a stale commit. Repair
             # it before any lifecycle work; it is best-effort and never fatal.
@@ -202,6 +218,15 @@ class Supervisor:
                     self.reactor.store.append_event("improvement_proposals_reconciled", {"resolved": reconciled})
             except Exception:
                 log.exception("awaiting-reboot reconciliation failed; continuing")
+            # A tier-2 proposal parks until the owner answers, and his answer arrives long
+            # after the run that asked is gone: this is the only pass that resumes one.
+            try:
+                resumed = self.self_improvement.reconcile_awaiting_owner()
+                if resumed:
+                    log.warning("resolved owner-signoff proposals: %s", resumed)
+                    self.reactor.store.append_event("improvement_proposals_owner_resolved", {"resolved": resumed})
+            except Exception:
+                log.exception("owner-signoff reconciliation failed; continuing")
             # The retry guard stops retrying an environment-blocked change once
             # its bounded ceiling is spent, but nothing wrote that outcome back:
             # the record stayed blocked_by_environment, which is terminal to
@@ -332,7 +357,13 @@ class Supervisor:
         request = result.get("proposal_id")
         if isinstance(request, str) and result.get("changed"):
             self.self_improvement.mark_reboot_result(request, result)
-        if result.get("rolled_back"):
+        if result.get("rolled_back") and result.get("changed"):
+            # Act only on the transition this call produced. ``observe`` keeps
+            # returning ``rolled_back`` from the durable guard file on every
+            # later cycle, so a bare truthiness test restarted the service on
+            # every startup: five restarts in 22 seconds tripped systemd's
+            # start limit and left both units failed (2026-10-13). ``changed``
+            # is true only for the call that actually performed the rollback.
             # The tree on disk was reset, but this process still holds the
             # broken promoted code in memory. Reuse the deferred restart path a
             # promotion uses so the rollback actually takes effect.
@@ -365,6 +396,11 @@ class Supervisor:
                 reconciled = self.self_improvement.reconcile_awaiting_reboot()
                 if reconciled:
                     self.reactor.store.append_event("improvement_proposals_reconciled", {"resolved": reconciled})
+                # A closed window is also the moment to resume a proposal the owner has
+                # meanwhile approved: the answer is durable and does not wait for a start.
+                resumed = self.self_improvement.reconcile_awaiting_owner()
+                if resumed:
+                    self.reactor.store.append_event("improvement_proposals_owner_resolved", {"resolved": resumed})
         return result
 
     def stop(self) -> None:
@@ -417,7 +453,7 @@ class Supervisor:
                 raise ValueError("service must be a unit name")
         services = _client_first(services)
         self._record_restart_requested(services)
-        subprocess.Popen(["systemctl", "restart", *services], close_fds=True)
+        subprocess.Popen(systemctl_command("restart", *services), close_fds=True)
 
     def _record_restart_requested(self, units: list[str]) -> None:
         """Make a requested restart observable in the durable event log.

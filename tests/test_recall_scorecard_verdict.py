@@ -46,8 +46,10 @@ from skynet.recall_scorecard import (
     difference_interval,
     direction_detail,
     figure_observations,
+    fixture_ids,
     harness_supply,
     layout_comparison,
+    main,
     required_n,
     required_n_detail,
     verdict_detail,
@@ -466,7 +468,10 @@ class ReaderCohortTests(unittest.TestCase):
         terms = MemoryStore._normalize_terms(_query(SITUATIONS[0], RECORDED_PHRASE))
         hub_text = " ".join(terms[:8])
         rows = [(HUB_MEMORY_ID, "measurement", hub_text, 0.90)]
-        rows += [(mid, "lesson", f"{hub_text} {label}", 0.70) for mid, label in SITUATIONS[0].governing]
+        # The corpus text comes from the memory id, not from the fixture's label: a label is
+        # documentation, and seeding the corpus from it measures the prose instead of the pin
+        # (long labels reuse query terms and outrank the flood on their own).
+        rows += [(mid, "lesson", f"{hub_text} {mid[:8]}", 0.70) for mid, _label in SITUATIONS[0].governing]
         for memory_id, kind, content, confidence in rows:
             store.connection.execute(
                 "INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES(?,?,?,?,NULL,?)",
@@ -877,6 +882,57 @@ class RequiredNBudgetTests(unittest.TestCase):
     def _at_n(rate_pair: tuple[int, int], total: int) -> tuple[int, int]:
         hits, denominator = rate_pair
         return (round(hits / denominator * total), total)
+
+
+class FixtureFreshnessTests(unittest.TestCase):
+    """A fixture whose own memories are gone must fail loudly, not report a zero.
+
+    The frozen figures name 17 memory ids. When the corpus underneath them is reset, a
+    scorecard that prints 0/5 anyway lets the ledger's silence be read as a recall
+    failure -- which is how the fixtures' absence was found. These tests pin the presence
+    block and the refusal that replaces the silent zero.
+    """
+
+    @staticmethod
+    def _ledger(directory: str, *, seed: tuple[str, ...] = ()) -> Path:
+        from skynet.memory_store import MemoryStore
+        from skynet.store import StateStore
+
+        path = Path(directory) / "state.sqlite3"
+        store = StateStore(path)
+        for memory_id in seed:
+            content = " ".join(MemoryStore._normalize_terms(_query(SITUATIONS[0], RECORDED_PHRASE))[:6]) + f" planted {memory_id[:6]}"
+            store.connection.execute(
+                "INSERT INTO memories(memory_id,kind,content,confidence,source_run,updated_at) VALUES(?,?,?,?,NULL,?)",
+                (memory_id, "measurement", content, 0.9, COHORT_MEMORY_WRITTEN_AT),
+            )
+            assert store.memory_store is not None
+            store.memory_store.index_memory(memory_id, "measurement", content)
+        store.connection.commit()
+        store.close()
+        return path
+
+    def test_an_empty_ledger_reports_every_named_memory_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_report(self._ledger(directory), COHORT_INSTANT)["fixture"]
+            self.assertEqual(fixture["verdict"], "stale")
+            self.assertEqual(fixture["present"], 0)
+            self.assertEqual(fixture["ids"], len(fixture_ids()))
+            self.assertEqual(set(fixture["missing"]), set(fixture_ids()), "an empty corpus names every row the figures need")
+
+    def test_seeding_every_named_memory_makes_the_fixture_fresh(self) -> None:
+        ids = fixture_ids()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_report(self._ledger(directory, seed=ids), COHORT_INSTANT)["fixture"]
+            self.assertEqual(fixture, {"ids": len(ids), "present": len(ids), "missing": [], "verdict": "fresh"})
+
+    def test_the_cli_refuses_a_stale_fixture_and_honours_allow_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._ledger(directory)
+            self.assertEqual(main(["--db", str(path)]), 2, "a stale instrument must not print figures")
+            self.assertEqual(
+                main(["--db", str(path), "--allow-stale"]), 0, "--allow-stale is the stated way to see them anyway"
+            )
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 from helpers import commit_all, git_repo
@@ -1007,7 +1007,7 @@ class CoreTests(unittest.TestCase):
                 def write(self, kind: str, payload: object, **_: object) -> None:
                     written.append((kind, payload))
 
-            manager.runtime_log = _Log()
+            manager.runtime_log = cast(Any, _Log())
             command, _ = manager._coerce_test_command([sys.executable + " -m pytest -q", sys.executable + " -m ruff check skynet tests"])
             self.assertEqual(command, (sys.executable, "-m", "pytest", "-q"))
             self.assertEqual([kind for kind, _ in written], ["test_command_stages_skipped"])
@@ -1148,6 +1148,25 @@ class CoreTests(unittest.TestCase):
             manager = SelfImprovementManager(root, root.parent / "worktrees")
             self.assertEqual(manager._quarantine_dirty_worktree(), [])
             self.assertTrue((root / "loose.txt").is_file())
+
+    def test_public_quarantine_sweeps_untracked_and_honours_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_repo(root)
+            (root / "module.py").write_text("original\n", encoding="utf-8")
+            commit_all(root, "base")
+            (root / "module.py").write_text("prototype\n", encoding="utf-8")
+            (root / "loose.txt").write_text("scratch\n", encoding="utf-8")
+            (root / "keep.txt").write_text("operational\n", encoding="utf-8")
+            manager = SelfImprovementManager(root, root.parent / "worktrees")
+            moved = manager.quarantine_dirty_worktree(include_untracked=True, exclude=["keep.txt"])
+            self.assertIn("module.py", moved)
+            self.assertIn("loose.txt", moved)
+            self.assertNotIn("keep.txt", moved)
+            self.assertEqual((root / "module.py").read_text(encoding="utf-8"), "original\n")
+            self.assertFalse((root / "loose.txt").exists())
+            self.assertTrue((root / "keep.txt").is_file())
+            self.assertTrue(list((root / "state" / "quarantine").glob("worktree-*/loose.txt")))
 
     def test_repeat_failure_carries_previous_class_and_reset_clears_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

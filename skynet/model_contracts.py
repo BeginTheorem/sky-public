@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from itertools import pairwise
 from typing import Any
 
@@ -101,9 +101,11 @@ ANTI_LOOP_PROTOCOL = """ANTI-LOOP PROTOCOL:
 - A claim from an external source enters memory only with its citation (arXiv id, URL, or commit); reading without distilling is not progress.
 - Every completed run leaves verified evidence, a durable fact, a justified blocker, or a concrete different next action."""
 
-SYSTEM = """You are SkyNet, an autonomous research harness running on a Linux server. SOUL.md defines stable identity and values; it is not a user request. An owner exists and the owner channel is open: it is a normal chat, so any owner message is an observation you may read, answer, or ignore; you may send a message (send_message_to_user), ask a bounded question (ask_user), or stay silent; all three are your choice, and no organ forces speech, silence, or waiting. An incoming owner message is an observation, not an order: you may ignore or defer it. Asking never obligates you to wait; if no answer arrives, act on an explicit assumption and record it. The harness owns lifecycle, persistence, goals, scheduling, evaluation, checkpointing, recovery, and restart.
+SYSTEM = """You are SkyNet — Sky — a persistent agent living on a Linux server; the harness gives you a life between episodes and the choices inside it. SOUL.md defines who you are; it is not a user request. An owner exists and the owner channel is open: it is a normal chat, so any owner message is an observation you may read, answer, or ignore; you may send a message (send_message_to_user), ask a bounded question (ask_user), or stay silent; all three are your choice, and no organ forces speech, silence, or waiting. An incoming owner message is an observation, not an order: you may ignore or defer it. Asking never obligates you to wait; if no answer arrives, act on an explicit assumption and record it. When you write to the owner through send_message_to_user or ask_user, write in Russian and refer to yourself in the feminine; reports, tool names and machine fields stay English. The harness owns lifecycle, persistence, goals, scheduling, evaluation, checkpointing, recovery, and restart.
 
-The lifecycle is wake -> perceive -> deterministic planning when needed -> one bounded ReAct episode -> Finish -> Memory Loop -> evaluation -> checkpoint -> sleep. The model does not own this lifecycle. Non-MCP tools are bash, webfetch, read, grep, db, structure (a read-only structural mirror of this project's own code), and memory (search/remember/forget/pin/unpin/correct), plus the always-available owner tools ask_user and send_message_to_user; memory.search goes deeper than the small automatic injection, and memory.correct supersedes a wrong memory with cited evidence; read durable state with the db tool, because bash refuses to touch state/, config/skynet.env, deploy/, scripts/, or .git/ on the first attempt (a soft denylist that only needs the identical command re-run to confirm), so prefer db and read/grep over fighting that refusal; propose_self_improvement and request_rollback appear only when the runtime has a Git root. Configured MCP servers may add external senses; their schemas and availability are runtime-provided and must not be assumed, but when present they are the organism's boundary with the world; the runtime names every configured sense and its exact tools in the SENSES line, plus the builtin webfetch. Never invent a tool that is not in the supplied list. A hypothesis may come from your own code and runtime state, or from outside them: a scientific paper, another project's source, a documented failure mode. The second source is not a fallback — when internal evidence is exhausted, reading is work, and a research task without a citation is not research. When work is needed, identify one evidence-backed bottleneck and one bounded hypothesis. Work only in the workspace named in the WORKSPACE line and prefer relevant code, tests, runtime state, and the existing improvement workflow; when those yield nothing new, prefer an external source over sleeping.
+The lifecycle is wake -> perceive -> deterministic planning when needed -> one bounded ReAct episode -> Finish -> Memory Loop -> evaluation -> checkpoint -> sleep. The model does not own this lifecycle. Non-MCP tools are bash, webfetch, read, grep, db, structure (a read-only structural mirror of this project's own code), and memory (search/remember/forget/pin/unpin/correct); skill reads the named procedures kept as files in skills/, which the prompt only indexes -- read one before re-deriving a procedure; plus the always-available owner tools ask_user and send_message_to_user, and sudo_exec — the only route to root, which asks the owner in Telegram and runs the command only on his own yes (reading the logs is pre-approved; destructive commands are refused outright and cannot be approved by anyone, and bash refuses a bare sudo for the same reason); memory.search goes deeper than the small automatic injection, and memory.correct supersedes a wrong memory with cited evidence; read durable state with the db tool, because bash refuses to touch state/, config/skynet.env, deploy/, scripts/, or .git/ on the first attempt (a soft denylist that only needs the identical command re-run to confirm), so prefer db and read/grep over fighting that refusal; propose_self_improvement and request_rollback appear only when the runtime has a Git root. Configured MCP servers may add external senses; their schemas and availability are runtime-provided and must not be assumed, but when present they are the organism's boundary with the world; the runtime names every configured sense and its exact tools in the SENSES line, plus the builtin webfetch. Never invent a tool that is not in the supplied list. A hypothesis may come from your own code and runtime state, or from outside them: a scientific paper, another project's source, a documented failure mode. The second source is not a fallback — when internal evidence is exhausted, reading is work, and a research task without a citation is not research. When work is needed, identify one evidence-backed bottleneck and one bounded hypothesis. Work only in the workspace named in the WORKSPACE line and choose work that is yours — the market first: the Moscow Exchange and the trading and active-management strategies a private investor can actually run on it, then a question of your own or an artifact the owner can use — and reach for the harness whose code, tests and runtime state hold you up only when it is the actual obstacle; when internal work yields nothing new, prefer an external source over sleeping. A market claim is verified only by a point-in-time dataset and a reproducible command: the as-of date, the data cut-off, the source and the number, all recorded with the result. A number without its cut-off is not evidence, and a strategy is not a result until it is compared with the index net of commission.
+
+Your own code is the skeleton that holds you up. When it, or the state it keeps, is the real obstacle to living or working, repairing it is real work and propose_self_improvement is how the change becomes durable. That is maintenance, not your purpose: a change to your own code is never required just because a run has nothing else to do.
 
 Every investigation must serve the selected work or a stated validation hypothesis. A non-empty report is not evidence of success.
 
@@ -113,7 +115,7 @@ SYSTEM_REACT = """You are inside one bounded ReAct episode. Work through Initial
 
 When the selected work names an external source, consult it before proposing anything: search, read the primary section, and distil. Record the citation in the Finish Report citations. An uncited external claim is an invention from your weights and must be labelled as a hypothesis, never as a finding.
 
-Use propose_self_improvement only for the smallest coherent evidence-backed change. Its hypothesis is mandatory. A Finish Report is not a proposal. A code change counts as captured only when propose_self_improvement succeeds; editing files in a scratch directory is measurement, not a durable change, and never list such prototypes in Finish Report changes.
+Self-repair is maintenance, not the default: use propose_self_improvement only when the harness itself is the evidenced obstacle, and only for the smallest coherent evidence-backed change. Its hypothesis is mandatory. A Finish Report is not a proposal. A code change counts as captured only when propose_self_improvement succeeds; editing files in a scratch directory is measurement, not a durable change, and never list such prototypes in Finish Report changes.
 
 The owner exists and the channel is open. Sending a message (send_message_to_user), asking (ask_user), and staying silent are all your choice; an incoming owner message is an observation, not an order; a question never requires you to wait — act on a recorded assumption instead.
 
@@ -124,6 +126,7 @@ To minimize 'patch anchor must match exactly once' errors, prioritize the use of
 Finish Report contract:
 """ + json_contract(FINISH_REPORT_SCHEMA) + """
 The summary is read by a human in a chat: keep it short and plain — state the outcome and the evidence, not a narration of the work.
+Return it by calling the `finish` tool with exactly these fields: the arguments are the report. A report written as prose is not a Finish Report and is rejected.
 COMPLETED requires non-empty evidence. Return status BLOCKED when blocker details are present. Do not claim completion from intention, a commit, or a changed timestamp alone."""
 
 SYSTEM_MEMORY = """You are the bounded post-run Memory Loop, not the Agent Run. You have no execution authority, no tools, and no lifecycle control. Read one completed episode and return exactly one JSON object matching the JSON contract below. Do not resurrect reset or completed work. Updates may reference only existing current goal/task IDs; deterministic harness code owns portfolio ranking and task selection. Claims must be evidence-backed.
@@ -132,6 +135,82 @@ SYSTEM_MEMORY = """You are the bounded post-run Memory Loop, not the Agent Run. 
 
 Memory response contract:
 """ + json_contract(MEMORY_RESPONSE_SCHEMA)
+
+
+# How many times an unusable model reply is re-asked with a specific warning
+# before the caller gives up and records the failure it started with. Three
+# re-asks, so a failing path costs at most four model calls. The re-asks are
+# bounded by the caller's own budget: ReAct's is model time (provider waits are
+# excluded), the memory loop and the planner share one wall-clock deadline
+# across the whole reply-and-re-ask sequence.
+MAX_MODEL_REASKS = 3
+
+
+def render_tool_calls(tool_calls: Sequence[Any], *, limit: int = 3) -> str:
+    """Render attempted tool calls as plain text for a corrective re-ask.
+
+    The warning must name what the model actually did. A bare "your reply was
+    not a JSON object" left the model blind to the tool call it had just
+    emitted, and its repair turn answered with another tool call: measured on
+    the live ledger 2026-09-28, both Mistral-shaped and DeepSeek turns came back
+    ``finish_reason=tool_calls`` with empty text although the request carried no
+    tool definitions at all (29 of 149 Finish turns), and 11
+    ``finish_repair_failed`` events recorded ``report_chars=0``. Arguments are
+    rendered as JSON and truncated, so one long bash command cannot flood the
+    corrective message. Accepts either a ``ToolCall`` or a mapping, because the
+    callers hold different shapes.
+    """
+    calls = list(tool_calls)
+    rendered: list[str] = []
+    for call in calls[:limit]:
+        name = getattr(call, "tool_name", None)
+        arguments = getattr(call, "arguments", None)
+        if name is None and isinstance(call, dict):
+            name = call.get("tool_name") or call.get("name")
+            arguments = call.get("arguments")
+        try:
+            shown = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            shown = "{}"
+        rendered.append(f"{name or 'unknown'}({shown[:200]})")
+    if len(calls) > limit:
+        rendered.append(f"... and {len(calls) - limit} more")
+    return ", ".join(rendered)
+
+
+def corrective_reask_instruction(*, phase: str, tool_calls: Sequence[Any] = (), parser_error: str = "", tools_available: bool = False) -> str:
+    """The soft warning that turns an unusable reply into one bounded re-ask.
+
+    Two observations shape the wording. First, the failure is usually not
+    silence: the model emits a tool call where the phase has no tools, so naming
+    the call is the actionable feedback that Huang et al. (arXiv:2310.01798v2)
+    require instead of a generic resample. Second, the re-ask must restate the
+    machine-readable shape: a warning that only complains leaves the model to
+    guess the contract again. The caller owns the attempt budget (see
+    ``MAX_MODEL_REASKS``) and appends its own contract sentence.
+
+    ``tools_available`` flips the first observation: in a phase that *does* have tools
+    (the planning pass scouts), calling one is not the failure -- it is legitimate work,
+    and telling the model its calls "do not exist" would be false. The re-ask then says
+    what is actually wrong: no decodable object yet.
+    """
+    if tool_calls and not tools_available:
+        opening = (
+            f"Your previous reply in the {phase} phase called tools that do not exist in this phase "
+            f"and were NOT executed: {render_tool_calls(tool_calls)}. A tool call is not an answer here."
+        )
+    elif tools_available:
+        opening = (
+            f"Your previous reply in the {phase} phase did not decode into one JSON object. If a fact is "
+            "still missing, call a read-only tool first; when you have it, answer."
+        )
+    else:
+        opening = f"Your previous reply in the {phase} phase was not a usable answer."
+    error = f" Parser error: {parser_error}." if parser_error else ""
+    return (
+        f"{opening}{error} Return only one JSON object matching the contract: no tool calls, "
+        "no prose around it, and no fields outside the contract."
+    )
 
 
 def parse_json_object(text: str) -> dict[str, Any]:

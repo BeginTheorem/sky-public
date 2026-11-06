@@ -544,7 +544,7 @@ class CoreTests(unittest.TestCase):
                 holder.release()
             self.assertEqual(code, 1)
             self.assertIn("skynet.service", errors.getvalue())
-            self.assertIn("systemctl stop", errors.getvalue())
+            self.assertIn("systemctl --user stop", errors.getvalue())
 
     def test_cli_reset_force_stops_resets_and_restarts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

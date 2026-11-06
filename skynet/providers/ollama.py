@@ -17,6 +17,7 @@ class OllamaCloudProvider:
     base_url: str
     keys: list[str]
     model: str
+    name: str = "ollama_gemma"
     cooldown_seconds: float = 60.0
     max_attempts: int = 3
     timeout_seconds: float = 120.0
@@ -29,10 +30,6 @@ class OllamaCloudProvider:
 
     def __post_init__(self) -> None:
         self._rotator = KeyRotator(self.keys, self.cooldown_seconds, permanent_backoff_seconds=self.permanent_backoff_seconds)
-
-    @property
-    def name(self) -> str:
-        return "ollama"
 
     @property
     def key_state(self) -> dict[str, object]:

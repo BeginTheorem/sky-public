@@ -50,7 +50,8 @@ class PlannerRecallAuditTests(unittest.TestCase):
             }
             goals = [{"title": "Advance the SkyNet roadmap"}]
             query = reactor._planner_memory_query(state, goals)
-            reactor._record_planner_recall(query, [{"memory_id": "m1"}], state, goals)
+            plan_run = reactor._open_plan_run(generation=1, trigger="test")
+            reactor._record_planner_recall(query, [{"memory_id": "m1"}], state, goals, plan_run)
             payload = self._last_row(reactor)
             self.assertIsNotNone(payload)
             assert payload is not None
@@ -58,6 +59,13 @@ class PlannerRecallAuditTests(unittest.TestCase):
             self.assertEqual(payload["query"], query)
             self.assertEqual(payload["query_chars"], len(query))
             self.assertEqual(payload["hits"], 1)
+            self.assertEqual(
+                reactor.store.connection.execute(
+                    "SELECT run_id FROM event_log WHERE kind='planner_memory_recall' ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()[0],
+                plan_run,
+                "the recall row belongs to the planning pass that searched",
+            )
             effective = len(MemoryStore._normalize_terms(query))
             self.assertEqual(payload["query_terms_effective"], effective)
             self.assertGreater(effective, 0)
@@ -89,7 +97,7 @@ class PlannerRecallAuditTests(unittest.TestCase):
             }
             goals = [{"title": "a goal"}]
             query = reactor._planner_memory_query(state, goals)
-            reactor._record_planner_recall(query, [], state, goals)
+            reactor._record_planner_recall(query, [], state, goals, reactor._open_plan_run(generation=1, trigger="test"))
             payload = self._last_row(reactor)
             assert payload is not None
             self.assertGreater(payload["previous_outcome_terms"], 0)
@@ -104,7 +112,7 @@ class PlannerRecallAuditTests(unittest.TestCase):
             goals = [{"title": "Advance the SkyNet roadmap"}]
             query = reactor._planner_memory_query(state, goals)
             self.assertEqual(reactor._planner_query_without_previous_outcome(state, goals), [])
-            reactor._record_planner_recall(query, [], state, goals)
+            reactor._record_planner_recall(query, [], state, goals, reactor._open_plan_run(generation=1, trigger="test"))
             payload = self._last_row(reactor)
             self.assertIsNotNone(payload)
             assert payload is not None

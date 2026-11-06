@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
 
-from skynet.policy import ExecutionPolicy, PolicyError, resurrection_denial, self_preservation_warning, workspace_escape
+from skynet.policy import ExecutionPolicy, PolicyError, resurrection_denial, self_preservation_warning, workspace_write_denial
 from skynet.tools import (
     BashTool,
     DbTool,
@@ -29,11 +29,14 @@ from skynet.tools import (
 
 class CoreTests(unittest.TestCase):
     def test_soft_denylist_warns_then_allows_exact_repeat(self) -> None:
+        # The soft contour is what remains reachable once the workspace is the
+        # read-only own-tree: with the sandbox disabled, a mutation of state/ is
+        # still only warned, and an exact repeat confirms it.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "state").mkdir()
             command = "printf confirmed >> state/skynet.sqlite3"
-            tool = BashTool(ExecutionPolicy(workspace=root))
+            tool = BashTool(ExecutionPolicy())
             first = tool.execute({"command": command, "cwd": str(root)}, idempotency_key="warn")
             self.assertFalse(first["ok"])
             self.assertTrue(first["policy_warning"])
@@ -68,10 +71,20 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self_preservation_warning("rm -rf scripts/"), "scripts/")
         self.assertEqual(self_preservation_warning("printf confirmed >> config/skynet.env"), "config/skynet.env")
         self.assertEqual(resurrection_denial("rm -rf .git/"), ".git/")
-        self.assertEqual(resurrection_denial("truncate -s 0 config/skynet.env"), ".env")
+        # config/skynet.env is the *soft* contour; only a bare ".env" file is a
+        # hard resurrection denial. The old substring test hard-denied the
+        # config file because ".env" is a suffix of "skynet.env".
+        self.assertIsNone(resurrection_denial("truncate -s 0 config/skynet.env"))
+        self.assertEqual(self_preservation_warning("truncate -s 0 config/skynet.env"), "config/skynet.env")
+        self.assertEqual(resurrection_denial("echo x > .env"), ".env")
+        self.assertEqual(resurrection_denial("rm -f /srv/app/.env"), ".env")
+        self.assertIsNone(resurrection_denial("echo x >> my.env"))
         # state/ was downgraded from the hard contour to the soft one.
         self.assertIsNone(resurrection_denial("rm -rf state/"))
         self.assertEqual(self_preservation_warning("rm -rf state/"), "state/")
+        # A directory entry matches as a prefix but not from inside another word.
+        self.assertEqual(self_preservation_warning("rm -rf state/db"), "state/")
+        self.assertIsNone(self_preservation_warning("rm -rf prostate/db"))
 
     def test_denylist_sees_through_quoted_and_split_targets(self) -> None:
         # A quoted or split destination is still a write: quoting the path must
@@ -79,8 +92,10 @@ class CoreTests(unittest.TestCase):
         # matcher fix, which stripped quoted spans before matching redirects.
         self.assertEqual(self_preservation_warning('printf confirmed >> "config/skynet.env"'), "config/skynet.env")
         self.assertEqual(resurrection_denial('echo x > ".git/config"'), ".git/")
-        self.assertEqual(resurrection_denial("echo x >> 'config/skynet.env'"), ".env")
-        self.assertEqual(resurrection_denial("echo x >&config/skynet.env"), ".env")
+        self.assertIsNone(resurrection_denial("echo x >> 'config/skynet.env'"))
+        self.assertEqual(self_preservation_warning("echo x >> 'config/skynet.env'"), "config/skynet.env")
+        self.assertIsNone(resurrection_denial("echo x >&config/skynet.env"))
+        self.assertEqual(self_preservation_warning("echo x >&config/skynet.env"), "config/skynet.env")
         self.assertEqual(resurrection_denial("echo x > '.git/'config"), ".git/")
         self.assertEqual(resurrection_denial("echo x > $'.git/config'"), ".git/")
         self.assertEqual(resurrection_denial('rm -rf ".git/"'), ".git/")
@@ -258,14 +273,16 @@ class CoreTests(unittest.TestCase):
                 policy.check_cwd(Path(directory).parent)
             with self.assertRaises(PolicyError):
                 policy.check_url("http://127.0.0.1:8080")
-    def test_bash_allows_runtime_mutation_and_service_control_syntax(self) -> None:
+    def test_bash_denies_repo_mutation_and_allows_service_control_syntax(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             policy = ExecutionPolicy(workspace)
             tool = BashTool(policy)
             (workspace / "skynet").mkdir()
             args = {"cwd": str(workspace)}
-            self.assertTrue(tool.execute({**args, "command": "printf bad > skynet/app.py"}, idempotency_key="x")["ok"])
+            denied = tool.execute({**args, "command": "printf bad > skynet/app.py"}, idempotency_key="x")
+            self.assertTrue(denied["policy_denied"])
+            self.assertFalse((workspace / "skynet" / "app.py").exists())
             # Validate the command boundary without restarting the real test
             # process or its systemd unit from inside the test suite.
             result = tool.execute({**args, "command": "printf '%s' 'systemctl restart skynet.service'"}, idempotency_key="y")
@@ -362,10 +379,68 @@ class CoreTests(unittest.TestCase):
             scratch.mkdir()
             policy = ExecutionPolicy(workspace=workspace, scratch_root=scratch)
             self.assertEqual(policy.check_cwd(scratch / "prototype.py"), (scratch / "prototype.py").resolve())
-            self.assertIsNone(workspace_escape(f"cd {scratch}", workspace, policy.workspace, (scratch,)))
-            self.assertEqual(workspace_escape("cd /etc", workspace, policy.workspace, (scratch,)), "/etc")
             with self.assertRaises(PolicyError):
                 policy.check_cwd(Path(directory) / "elsewhere")
+
+    def test_execution_policy_allows_every_root_the_owner_opened(self) -> None:
+        """The allow-list is a list: /tmp and the home directory, not one scratch path.
+
+        ``SKYNET_SCRATCH_DIR`` can only ever *replace* /tmp, so free work outside the tree
+        had no readable home at all: the organism could write into its home directory and
+        not read it back, which is what an unreadable workspace looks like from inside.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            workspace, home, shared, scratch = base / "workspace", base / "home", base / "tmp", base / "skynet-scratch"
+            for path in (workspace, home, shared):
+                path.mkdir()
+            policy = ExecutionPolicy(workspace=workspace, scratch_root=scratch, extra_roots=(home, shared))
+            self.assertEqual(
+                policy.allowed_roots(),
+                (workspace.resolve(), scratch.resolve(), home.resolve(), shared.resolve()),
+                "workspace first, duplicates dropped, extra roots in the order given",
+            )
+            self.assertEqual(policy.check_cwd(home / "notes.md"), (home / "notes.md").resolve())
+            self.assertEqual(policy.check_cwd(shared), shared.resolve())
+            with self.assertRaises(PolicyError):
+                policy.check_cwd(base / "elsewhere")
+
+    def test_execution_policy_reads_its_roots_from_the_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            home = Path(directory) / "home"
+            workspace.mkdir()
+            home.mkdir()
+            clean = {key: value for key, value in os.environ.items() if not key.startswith("SKYNET_SANDBOX_")}
+            clean["SKYNET_SANDBOX_WORKSPACE"] = str(workspace)
+            clean["SKYNET_SANDBOX_ROOTS"] = f"/tmp:{home}"
+            with patch.dict(os.environ, clean, clear=True):
+                policy = ExecutionPolicy.from_environment()
+        self.assertIn(Path("/tmp").resolve(), policy.allowed_roots())
+        self.assertIn(home.resolve(), policy.allowed_roots())
+        self.assertEqual(policy.check_cwd(home), home.resolve())
+
+    def test_bash_writes_outside_the_tree_from_inside_it(self) -> None:
+        """The boundary is the tree, not the starting directory.
+
+        A command run from the repository that writes into /tmp or the home directory is
+        the free work the owner asked for; refusing it wholesale was the shape that put
+        every one of those refusals into the event log as a policy_denied row.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace, home = root / "repo", root / "home"
+            workspace.mkdir()
+            home.mkdir()
+            tool = BashTool(ExecutionPolicy(workspace=workspace, scratch_root=root / "scratch", extra_roots=(home,)))
+            outside = tool.execute({"command": f"printf x > {home / 'note.txt'}", "cwd": str(workspace)}, idempotency_key="outside-write")
+            inside = tool.execute({"command": "printf x > inside.txt", "cwd": str(workspace)}, idempotency_key="inside-write")
+            read_back = ReadTool(tool.policy).execute({"path": str(home / "note.txt")}, idempotency_key="read-home")
+            self.assertTrue(outside["ok"], outside.get("error"))
+            self.assertTrue((home / "note.txt").is_file())
+            self.assertTrue(inside.get("policy_denied"), "a relative write from inside the tree stays denied")
+            self.assertTrue(read_back["ok"], read_back.get("error"))
+            self.assertFalse((workspace / "inside.txt").exists(), "a denied write must not have landed")
 
     def test_webfetch_redirect_is_revalidated_by_policy(self) -> None:
         class RedirectHandler(BaseHTTPRequestHandler):
@@ -623,17 +698,16 @@ class CoreTests(unittest.TestCase):
             policy = ExecutionPolicy.from_environment()
         self.assertIsNone(policy.workspace)
 
-    def test_bash_warns_on_cd_escape_then_allows_repeat(self) -> None:
+    def test_bash_allows_leaving_the_workspace(self) -> None:
+        # Leaving the tree to work in a new directory is never warned: only
+        # writing inside the own-tree is denied.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tool = BashTool(ExecutionPolicy(workspace=root))
-            args: dict[str, object] = {"command": "cd /tmp && pwd", "cwd": str(root)}
-            first = tool.execute(args, idempotency_key="cd-warn")
-            self.assertFalse(first["ok"])
-            self.assertTrue(first["policy_warning"])
-            second = tool.execute(args, idempotency_key="cd-confirm")
-            self.assertTrue(second["ok"])
-            self.assertTrue(second["policy_override"])
+            result = tool.execute({"command": "cd /tmp && pwd", "cwd": str(root)}, idempotency_key="cd-leave")
+            self.assertTrue(result["ok"])
+            self.assertNotIn("policy_warning", result)
+            self.assertNotIn("policy_denied", result)
 
     def test_bash_allows_cd_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -667,14 +741,60 @@ class CoreTests(unittest.TestCase):
             result = tool.execute({"command": "rm scripts/rollback.sh", "cwd": str(root)}, idempotency_key="hard-rollback")
         self.assertTrue(result["policy_denied"])
 
-    def test_bash_soft_warning_is_not_hard_denied(self) -> None:
+    def test_bash_read_only_workspace_beats_the_soft_contour(self) -> None:
+        # state/ is inside the own-tree, so the read-only workspace hard-denies a
+        # mutation there before the soft self-preservation contour can warn.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "state").mkdir()
             tool = BashTool(ExecutionPolicy(workspace=root))
             result = tool.execute({"command": "printf x >> state/skynet.sqlite3", "cwd": str(root)}, idempotency_key="soft")
-        self.assertTrue(result["policy_warning"])
-        self.assertNotIn("policy_denied", result)
+        self.assertTrue(result["policy_denied"])
+        self.assertNotIn("policy_warning", result)
+
+    def test_bash_denies_redirect_into_the_workspace_from_outside(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            scratch = root / "scratch"
+            workspace.mkdir()
+            scratch.mkdir()
+            tool = BashTool(ExecutionPolicy(workspace=workspace, scratch_root=scratch))
+            result = tool.execute(
+                {"command": f"echo x > {workspace / 'f.txt'}", "cwd": str(scratch)},
+                idempotency_key="outside-redirect",
+            )
+        self.assertTrue(result["policy_denied"])
+
+    def test_bash_allows_mutation_in_a_new_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "repo"
+            outside = root / "scratch"
+            workspace.mkdir()
+            outside.mkdir()
+            tool = BashTool(ExecutionPolicy(workspace=workspace))
+            result = tool.execute(
+                {"command": f"cd {outside} && printf x > f.txt", "cwd": str(workspace)},
+                idempotency_key="new-dir",
+            )
+            self.assertTrue(result["ok"])
+            self.assertTrue((outside / "f.txt").is_file())
+
+    def test_workspace_write_denial_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "repo"
+            workspace.mkdir()
+            self.assertEqual(workspace_write_denial("printf x > app.py", workspace, workspace), ".")
+            self.assertIsNone(workspace_write_denial("cat app.py", workspace, workspace))
+            self.assertIsNone(workspace_write_denial("cd /tmp && printf x > f.txt", workspace, workspace))
+            self.assertIsNone(workspace_write_denial("printf x > app.py", workspace, None))
+            # Aimed outside the tree from inside it: free work, and the case that used to be
+            # refused wholesale (every such refusal was a policy_denied row in the log).
+            self.assertIsNone(workspace_write_denial("printf x > /tmp/f.txt", workspace, workspace))
+            self.assertIsNone(workspace_write_denial("rm -f /tmp/f.txt", workspace, workspace))
+            self.assertEqual(workspace_write_denial("printf x > /tmp/f.txt && printf y > app.py", workspace, workspace), ".")
+            self.assertEqual(workspace_write_denial(f"sed -i s/a/b/ {workspace}/skynet/policy.py", workspace, workspace), ".")
 
     def test_bash_reads_of_state_are_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

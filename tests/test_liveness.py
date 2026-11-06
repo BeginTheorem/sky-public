@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 from helpers import FixtureTool
 
+from skynet import handoff
 from skynet.dialogue import AcknowledgeInboxTool
+from skynet.handoff import ROADMAP_AREA, ROADMAP_GOAL_TITLE, ROADMAP_TASKS
 from skynet.metrics import format_report, memory_health
 from skynet.models import AgentRunResult, ModelTurn, RunStatus, ToolCall
 from skynet.planner import PortfolioPlanner
@@ -366,6 +368,57 @@ class LivenessTests(unittest.TestCase):
             self.assertGreater(pending, 0)
             reactor.close()
 
+    def test_roadmap_seed_refills_when_every_goal_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, InboxProvider())
+            store = reactor.store
+            store.connection.execute("DELETE FROM tasks")
+            store.connection.execute("DELETE FROM goals")
+            store.connection.commit()
+            dead = store.add_goal(ROADMAP_GOAL_TITLE, priority=1.0)
+            title, fact = ROADMAP_TASKS[0]
+            hypothesis, structural = handoff._roadmap_fingerprints(title, fact)
+            store.add_task(
+                title,
+                dead,
+                expected_new_fact=fact,
+                hypothesis_fingerprint=hypothesis,
+                structural_fingerprint=structural,
+                area=ROADMAP_AREA,
+            )
+            store.connection.execute("UPDATE goals SET status='completed' WHERE goal_id=?", (dead,))
+            store.connection.commit()
+            # A completed goal is terminal, not a blockage: the pool refills and
+            # the orphaned pending item is re-homed, so the safety net stays alive
+            # instead of sleeping forever behind a non-empty goal table.
+            self.assertTrue(reactor._ensure_roadmap_seed())
+            self.assertGreater(
+                store.connection.execute("SELECT COUNT(*) FROM goals WHERE status='active'").fetchone()[0],
+                0,
+            )
+            selectable = store.connection.execute(
+                "SELECT COUNT(*) FROM tasks t JOIN goals g ON g.goal_id=t.goal_id "
+                "WHERE t.status='pending' AND g.status='active'"
+            ).fetchone()[0]
+            self.assertGreater(selectable, 0)
+            reactor.close()
+
+    def test_roadmap_reseed_refuses_while_a_blocked_goal_still_lives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reactor = self._reactor(directory, InboxProvider())
+            store = reactor.store
+            store.connection.execute("DELETE FROM tasks")
+            store.connection.execute("DELETE FROM goals")
+            store.connection.commit()
+            blocked = store.add_goal("blocked, awaiting revival", priority=1.0)
+            store.connection.execute("UPDATE goals SET status='blocked' WHERE goal_id=?", (blocked,))
+            store.connection.commit()
+            # A blocked goal is live -- the scheduler revives it -- so re-seeding
+            # here would mask the block. The fallback arm stays off, unlike the
+            # all-completed case above.
+            self.assertFalse(reactor._ensure_roadmap_seed())
+            reactor.close()
+
     def test_owner_message_is_not_auto_consumed_when_the_last_goal_closes(self) -> None:
         """Closing the last goal must not swallow a pending owner message.
 
@@ -413,8 +466,8 @@ class LivenessTests(unittest.TestCase):
             self.assertIsNotNone(row)
             payload = json.loads(row[0])
             # fixture_tool plus the always-injected ask_user/send_message/memory/
-            # acknowledge_inbox/read_inbox/record_plan tools.
-            self.assertEqual(payload["tool_count"], 7)
+            # acknowledge_inbox/read_inbox/record_plan/sudo_exec/skill tools.
+            self.assertEqual(payload["tool_count"], 9)
             self.assertIsInstance(payload["request_chars"], int)
             self.assertTrue(payload["model"])
             reactor.close()
@@ -547,9 +600,9 @@ class LivenessTests(unittest.TestCase):
             facts = observations["runtime_facts"]
             self.assertIn("test_command", facts)
             # ask_user, send_message_to_user, memory, acknowledge_inbox,
-            # read_inbox and record_plan are always injected, so the runtime
-            # surface is never empty even with no operator tools.
-            self.assertEqual(facts["tool_count"], 6)
+            # read_inbox, record_plan, sudo_exec and skill are always injected, so
+            # the runtime surface is never empty even with no operator tools.
+            self.assertEqual(facts["tool_count"], 8)
             # The model used to query tables that do not exist (`events` instead
             # of `event_log`); the schema is injected so it stops guessing.
             self.assertIn("event_log", facts["tables"])

@@ -56,6 +56,16 @@ DEFAULT_COOLDOWN_SECONDS = 21_600.0
 ALERT_KIND = "planner_judge_degraded"
 ALERT_DEDUP_KEY = "planner-judge-degraded"
 EVENT_KIND = "judge_health_degraded"
+# A total-rejection streak is invisible to ``success_rate``: ``all_rejected``
+# counts as decided, so a planner that decodes every reply but has every
+# proposal rejected keeps the rate at 1.0 and raises nothing. That is exactly
+# the 2026-10-12 deadlock -- seven consecutive all_rejected windows (~70 min)
+# left the portfolio empty and the owner was never paged. Five in a row is the
+# floor: one rejection is a bad proposal, five is a broken validation contract.
+DEFAULT_REJECT_STREAK = 5
+ALERT_KIND_REJECTED_STREAK = "planner_all_rejected_streak"
+ALERT_DEDUP_KEY_REJECTED_STREAK = "planner-all-rejected-streak"
+EVENT_KIND_REJECTED_STREAK = "judge_all_rejected_streak"
 # The durable post-restart boundary that RebootGuard.begin writes at startup.
 GUARD_FILENAME = "reboot-guard.json"
 
@@ -127,7 +137,15 @@ def planner_success_rate(store: Any, *, window: int = DEFAULT_WINDOW, since: str
             (bounded_window,),
         ).fetchall()
     statuses = [str(row["status"]) for row in rows]
+    # Rows arrive newest-first, so the streak is how many of the most recent
+    # attempts are ``all_rejected`` before the first different status.
+    reject_streak = 0
+    for status in statuses:
+        if status != "all_rejected":
+            break
+        reject_streak += 1
     decided = sum(1 for status in statuses if status in DECIDED_PLANNER_STATUSES)
+    all_rejected = statuses.count("all_rejected")
     invalid_response = statuses.count("invalid_response")
     provider_error = statuses.count("provider_error")
     output_truncated = statuses.count("output_truncated")
@@ -138,6 +156,8 @@ def planner_success_rate(store: Any, *, window: int = DEFAULT_WINDOW, since: str
         "samples": samples,
         "decided": decided,
         "failed": failed,
+        "all_rejected": all_rejected,
+        "reject_streak": reject_streak,
         "invalid_response": invalid_response,
         "provider_error": provider_error,
         "output_truncated": output_truncated,
@@ -152,6 +172,7 @@ def check_judge_health(
     min_samples: int = DEFAULT_MIN_SAMPLES,
     threshold: float = DEFAULT_THRESHOLD,
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
+    min_streak: int = DEFAULT_REJECT_STREAK,
     since: str | None = None,
 ) -> dict[str, Any]:
     """Escalate a degraded planner to the owner; never raise.
@@ -201,7 +222,49 @@ def check_judge_health(
             occurrences = int(result.get("occurrences", 0))
             if alerted:
                 store.append_event(EVENT_KIND, detail)
-        return {**observation, "degraded": degraded, "alerted": alerted, "occurrences": occurrences}
+        # A total-rejection streak is a second, independent failure mode: the
+        # reply decodes and the judge reaches a decision, but nothing survives
+        # validation. It leaves ``success_rate`` at 1.0, so it needs its own
+        # alert with its own dedup key rather than riding on ``degraded``.
+        reject_streak = int(observation.get("reject_streak", 0))
+        streak_degraded = reject_streak >= max(1, int(min_streak))
+        streak_alerted = False
+        streak_occurrences = 0
+        if streak_degraded:
+            streak_detail = {
+                "reject_streak": reject_streak,
+                "window": observation["window"],
+                "samples": observation["samples"],
+                "all_rejected": observation["all_rejected"],
+            }
+            streak_result = store.raise_alert(
+                ALERT_KIND_REJECTED_STREAK,
+                {
+                    **streak_detail,
+                    "note": (
+                        "Every planner proposal in a row was rejected by validation, so the "
+                        "portfolio stays empty even though the judge keeps deciding. The "
+                        "reasons are durable under planner_proposal_rejected events; the "
+                        "validator lives in skynet/autonomous_planner.py."
+                    ),
+                },
+                severity="warning",
+                dedup_key=ALERT_DEDUP_KEY_REJECTED_STREAK,
+                dedup_window_seconds=max(0.0, float(cooldown_seconds)),
+            )
+            streak_alerted = bool(streak_result.get("new"))
+            streak_occurrences = int(streak_result.get("occurrences", 0))
+            if streak_alerted:
+                store.append_event(EVENT_KIND_REJECTED_STREAK, streak_detail)
+        return {
+            **observation,
+            "degraded": degraded,
+            "alerted": alerted,
+            "occurrences": occurrences,
+            "streak_degraded": streak_degraded,
+            "streak_alerted": streak_alerted,
+            "streak_occurrences": streak_occurrences,
+        }
     except Exception as exc:
         log.warning("judge health check failed: %s", exc, exc_info=True)
         return {"degraded": False, "alerted": False, "error": str(exc)}

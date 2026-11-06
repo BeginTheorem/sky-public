@@ -171,6 +171,12 @@ class RebootGuard:
             self._atomic_write(guard)
             raise
         guard["rolled_back"] = True
+        # A rolled-back window is terminal. Mark it inactive so a reader of the
+        # durable bytes -- and the restart decision in the supervisor -- sees a
+        # finished window rather than one that looks perpetually open. Leaving
+        # ``active`` true here kept the failure branch of ``observe`` reachable
+        # and the restart request re-armed on every startup.
+        guard["active"] = False
         self._atomic_write(guard)
         return {"active": False, "ok": False, "rolled_back": True, "commit": commit, "proposal_id": guard.get("proposal_id"), "changed": True}
 

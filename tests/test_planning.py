@@ -13,8 +13,9 @@ from unittest.mock import Mock
 from helpers import FakeProvider
 
 from skynet.autonomous_planner import AutonomousPlanner
-from skynet.models import ModelTurn
+from skynet.models import ModelTurn, ToolCall
 from skynet.planner import PortfolioPlanner, hypothesis_fingerprint, structural_fingerprint
+from skynet.providers.errors import ProviderError
 from skynet.reactor import Reactor, ReactorConfig
 from skynet.store import StateStore
 
@@ -119,7 +120,7 @@ class CoreTests(unittest.TestCase):
             self.assertIsNotNone(second_id)
             self.assertNotEqual(second_id, first_id)
             pending = reactor.store.connection.execute(
-                "SELECT COUNT(*) FROM tasks WHERE goal_id=? AND title LIKE 'Diagnose one concrete SkyNet bottleneck%' AND status='pending'",
+                "SELECT COUNT(*) FROM tasks WHERE goal_id=? AND title LIKE 'Measure one concrete fact about the MOEX market%' AND status='pending'",
                 (goal_id,),
             ).fetchone()[0]
             self.assertEqual(pending, 1)
@@ -127,7 +128,7 @@ class CoreTests(unittest.TestCase):
             # template identity so the dedup can fire.
             rows = reactor.store.connection.execute(
                 "SELECT hypothesis_fingerprint, structural_fingerprint FROM tasks "
-                "WHERE goal_id=? AND title LIKE 'Diagnose one concrete SkyNet bottleneck%' ORDER BY created_at",
+                "WHERE goal_id=? AND title LIKE 'Measure one concrete fact about the MOEX market%' ORDER BY created_at",
                 (goal_id,),
             ).fetchall()
             self.assertEqual(len(rows), 2)
@@ -685,7 +686,7 @@ class PlannerParseContractTests(unittest.TestCase):
 
 
 class PlannerRetryTests(unittest.TestCase):
-    """A parse failure is retried exactly once, never looped."""
+    """A parse failure is re-asked up to MAX_MODEL_REASKS times, never looped."""
 
     def test_retry_fires_exactly_once_and_repairs(self) -> None:
         class RepairingProvider:
@@ -713,7 +714,7 @@ class PlannerRetryTests(unittest.TestCase):
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_retry'").fetchone()[0], 1)
             store.close()
 
-    def test_retry_is_capped_at_one(self) -> None:
+    def test_retry_is_capped_at_three(self) -> None:
         class GarbageProvider:
             def __init__(self) -> None:
                 self.calls = 0
@@ -730,10 +731,43 @@ class PlannerRetryTests(unittest.TestCase):
             planner = AutonomousPlanner(provider, store, timeout_seconds=1000.0)
             created = planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="retry")
             self.assertEqual(created, [])
-            self.assertEqual(provider.calls, 2)
+            # The initial reply plus MAX_MODEL_REASKS re-asks, then it stops.
+            self.assertEqual(provider.calls, 4)
             self.assertEqual(planner.last_status, "invalid_response")
             self.assertEqual(store.connection.execute("SELECT status FROM planner_attempts").fetchone()[0], "invalid_response")
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_retry'").fetchone()[0], 3)
             self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_invalid_response'").fetchone()[0], 1)
+            store.close()
+
+    def test_a_tool_call_reply_is_named_in_the_re_ask(self) -> None:
+        """A tool call where the planner has no tools is not a parse mystery."""
+
+        class ToolCallThenValid:
+            def __init__(self, goal_id: str) -> None:
+                self.goal_id = goal_id
+                self.calls = 0
+                self.reask_prompt = ""
+
+            def complete(self, messages, *, max_tokens, tools=()):
+                self.calls += 1
+                if self.calls == 1:
+                    return ModelTurn(tool_calls=[ToolCall("bash", {"command": "ls"})])
+                self.reask_prompt = str(messages[-1].get("content", ""))
+                return ModelTurn(text=json.dumps({"proposals": [_valid_proposal(self.goal_id)]}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            goal_id = store.add_goal("tool call goal", priority=1.0)
+            goals, _ = store.active_work()
+            provider = ToolCallThenValid(goal_id)
+            planner = AutonomousPlanner(provider, store, timeout_seconds=1000.0)
+            created = planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="tool-call")
+            self.assertEqual(len(created), 1)
+            self.assertEqual(provider.calls, 2)
+            self.assertIn("called tools that do not exist in this phase", provider.reask_prompt)
+            self.assertIn("bash(", provider.reask_prompt)
+            retry = json.loads(store.connection.execute("SELECT payload FROM event_log WHERE kind='planner_retry'").fetchone()[0])
+            self.assertEqual(retry["attempted_tools"], ["bash"])
             store.close()
 
 
@@ -774,7 +808,7 @@ class PlannerTruncationTests(unittest.TestCase):
             provider = RecordingProvider()
             planner = AutonomousPlanner(provider, store, output_tokens=16_384, timeout_seconds=1000.0)
             planner.generate(generation=0, goals=goals, tasks=[], memories=[], previous={}, trigger="retry")
-            self.assertEqual(provider.limits, [16_384, 16_384])
+            self.assertEqual(provider.limits, [16_384, 16_384, 16_384, 16_384])
             store.close()
 
 
@@ -839,6 +873,50 @@ class PlannerFailureVisibilityTests(unittest.TestCase):
             reactor.tick("timer")
             reasons = [row["reason"] for row in reactor.store.connection.execute("SELECT reason FROM planner_decisions").fetchall()]
             self.assertEqual(reasons, ["no novel work"])
+            # An EMPTY portfolio is exactly what the bounded diagnostic is for, so
+            # the gate below must not have disarmed it.
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM tasks WHERE title LIKE 'Measure one concrete fact about the MOEX market%'").fetchone()[0],
+                1,
+            )
+            reactor.close()
+
+    def test_a_provider_error_manufactures_no_fallback_task(self) -> None:
+        """A planner that could not CALL the model must not mint work.
+
+        Measured 2026-10-16 on an empty wallet: every plan pass ended
+        ``planner_provider_error``, the fixed diagnostic was manufactured anyway,
+        its three attempts died at the provider (zero steps each) and blocked it,
+        and a fresh twin appeared every ~15 minutes -- generations 20, 23, 26 of
+        the same task. The safety net is for an empty portfolio, not a dead chain.
+        """
+
+        class NoProvider:
+            def complete(self, messages, *, max_tokens, tools=()):
+                raise ProviderError("openrouter request failed: HTTP 402", category="invalid_request", retryable=False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            store = StateStore(path)
+            goal_id = store.add_goal("blocked autonomous work", priority=1.0)
+            blocked = store.add_task("blocked task", goal_id)
+            store.connection.execute("UPDATE tasks SET status='blocked' WHERE task_id=?", (blocked,))
+            store.connection.commit()
+            store.close()
+
+            reactor = Reactor(NoProvider(), {}, ReactorConfig(state_path=path))
+            reactor.tick("timer")
+            reasons = [row["reason"] for row in reactor.store.connection.execute("SELECT reason FROM planner_decisions").fetchall()]
+            self.assertEqual(reasons, ["planner_provider_error"])
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM tasks WHERE title LIKE 'Measure one concrete fact about the MOEX market%'").fetchone()[0],
+                0,
+                "a planner that never reached a provider has said nothing about the portfolio",
+            )
+            self.assertEqual(
+                reactor.store.connection.execute("SELECT COUNT(*) FROM event_log WHERE kind='planner_fallback_skipped'").fetchone()[0],
+                1,
+            )
             reactor.close()
 
 

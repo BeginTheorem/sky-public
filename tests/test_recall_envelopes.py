@@ -466,7 +466,7 @@ class SelfCheckTests(unittest.TestCase):
         import skynet.recall_envelopes as module
 
         self.assertEqual((_RRF_K, _RRF_WEIGHTS), (module._RRF_K, module._RRF_WEIGHTS))
-        self.assertEqual(len(module._RRF_WEIGHTS), 3, "the rig re-derives exactly the shipped three axes")
+        self.assertEqual(len(module._RRF_WEIGHTS), 4, "the rig re-derives exactly the shipped four axes")
 
     def test_the_report_carries_the_agreement_per_arm(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

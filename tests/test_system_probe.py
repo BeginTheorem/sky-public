@@ -24,7 +24,6 @@ REQUIRED_KEYS = {
     "home_listing",
     "tmp_listing",
     "agent_commands",
-    "sudo_commands",
     "bash_history",
     "probe_error",
 }
@@ -65,7 +64,6 @@ class SystemProbeSampleTests(unittest.TestCase):
             with patch.object(system_probe.subprocess, "run", side_effect=FileNotFoundError):
                 sample = probe.sample(agent_commands=["x"])
             self.assertTrue(REQUIRED_KEYS.issubset(sample.keys()))
-            self.assertEqual(sample["sudo_commands"], [])
             self.assertEqual(sample["home_listing"], [])
             self.assertEqual(sample["services"][0]["active"], None)
             self.assertEqual(sample["services"][0]["failed"], None)

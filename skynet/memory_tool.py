@@ -11,6 +11,7 @@ store returns a structured error instead of crashing the run.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence
 from typing import Any
 
 from .memory_store import normalize_memory_kind
@@ -32,8 +33,16 @@ class MemoryTool(Tool):
     MAX_CONTENT_CHARS = 4000
     MAX_EVIDENCE_CHARS = 2000
 
-    def __init__(self, store: StateStore) -> None:
+    def __init__(self, store: StateStore, *, actions: Sequence[str] | None = None) -> None:
         self.store = store
+        # A restricted instance is a different capability, not a filtered one: the
+        # planning pass gets `search` alone, so the tool declares itself read-only
+        # instead of claiming a write surface it cannot use.
+        self.actions = tuple(actions) if actions else self.ACTIONS
+        unknown = sorted(set(self.actions) - set(self.ACTIONS))
+        if unknown:
+            raise ValueError(f"unknown memory actions: {unknown}")
+        self.capability_kind = "read" if set(self.actions) == {"search"} else "write"
 
     @property
     def schema(self) -> dict[str, Any]:
@@ -52,7 +61,7 @@ class MemoryTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": list(self.ACTIONS)},
+                        "action": {"type": "string", "enum": list(self.actions)},
                         "query": {"type": "string", "description": "Search text; required for action='search'."},
                         "limit": {
                             "type": "integer",
@@ -63,6 +72,16 @@ class MemoryTool(Tool):
                         "include_inactive": {
                             "type": "boolean",
                             "description": "Also return forgotten or superseded memories in action='search'.",
+                        },
+                        "lifecycle_stage": {
+                            "type": "string",
+                            "description": "Memory lifecycle stage filter for search (raw/extracted/consolidated/revised), or stage to store for remember.",
+                            "enum": ["raw", "extracted", "consolidated", "revised"],
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Memory scope filter for search (thread/user/agent/global), or scope to store for remember.",
+                            "enum": ["thread", "user", "agent", "global"],
                         },
                         "content": {
                             "type": "string",
@@ -82,6 +101,8 @@ class MemoryTool(Tool):
 
     def execute(self, arguments: dict[str, Any], *, idempotency_key: str) -> dict[str, Any]:
         action = str(arguments.get("action", "")).strip()
+        if action not in self.actions:
+            return {"ok": False, "error": f"action {action or '<missing>'} is not available on this instance"}
         if action == "search":
             return self._search(arguments)
         if action == "remember":
@@ -105,12 +126,17 @@ class MemoryTool(Tool):
             high=self.MAX_SEARCH_LIMIT,
         )
         include_inactive = self._as_bool(arguments.get("include_inactive", False))
+        lifecycle_stage = str(arguments.get("lifecycle_stage", "")).strip() or None
+        scope = str(arguments.get("scope", "")).strip() or None
         missing = self._missing("search_memories")
         if missing is not None:
             return missing
         try:
             if self._supports_include_inactive():
-                memories = self.store.search_memories(query, limit=limit, include_inactive=include_inactive)
+                memories = self.store.search_memories(
+                    query, limit=limit, include_inactive=include_inactive,
+                    lifecycle_stage=lifecycle_stage, scope=scope
+                )
             else:
                 # Mid-integration: the store has search but not the inactive filter yet.
                 memories = self.store.search_memories(query, limit=limit)
@@ -142,6 +168,8 @@ class MemoryTool(Tool):
             high=1.0,
         )
         pinned = self._as_bool(arguments.get("pinned", False))
+        lifecycle_stage = str(arguments.get("lifecycle_stage", "")).strip() or "raw"
+        scope = str(arguments.get("scope", "")).strip() or "thread"
         run_id, _step = _run_context_from_effect_key(self.store, idempotency_key)
         if not self._supports_source_run():
             # Mid-integration: the store cannot attribute the run yet, so the
@@ -156,7 +184,8 @@ class MemoryTool(Tool):
         bounded_content = content[: self.MAX_CONTENT_CHARS].strip()
         try:
             memory_id = self.store.remember_memory(
-                bounded_content, kind=effective_kind, confidence=confidence, pinned=pinned, source_run=run_id
+                bounded_content, kind=effective_kind, confidence=confidence, pinned=pinned,
+                source_run=run_id, lifecycle_stage=lifecycle_stage, scope=scope
             )
         except Exception as exc:
             return {"ok": False, "error": f"remember_memory failed: {exc}"}
@@ -166,6 +195,8 @@ class MemoryTool(Tool):
             "kind": effective_kind,
             "confidence": confidence,
             "pinned": pinned,
+            "lifecycle_stage": lifecycle_stage,
+            "scope": scope,
         }
         notes: list[str] = []
         if effective_kind != requested_kind:

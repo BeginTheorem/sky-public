@@ -189,10 +189,14 @@ class TheDrawIsComparedAgainstTheTiltedThresholdTests(unittest.TestCase):
             store.next_random = lambda: 0.11  # type: ignore[method-assign]
             inert = PortfolioPlanner(store, epsilon=0.1, valence=(VALENCE_PRIOR, 0))
             self.assertEqual(inert.threshold, 0.1)
-            self.assertEqual(inert.select()["task"]["task_id"], top.task_id)
+            exploited_choice = inert.select()
+            assert exploited_choice is not None
+            self.assertEqual(exploited_choice["task"]["task_id"], top.task_id)
             low = PortfolioPlanner(store, epsilon=0.1, valence=(0.0, 20))
             self.assertGreater(low.threshold, 0.11)
-            self.assertNotEqual(low.select()["task"]["task_id"], top.task_id)
+            explored_choice = low.select()
+            assert explored_choice is not None
+            self.assertNotEqual(explored_choice["task"]["task_id"], top.task_id)
             store.close()
 
     def test_a_high_reading_keeps_the_top_candidate_where_a_low_one_explores(self) -> None:
@@ -202,7 +206,9 @@ class TheDrawIsComparedAgainstTheTiltedThresholdTests(unittest.TestCase):
             store.next_random = lambda: 0.11  # type: ignore[method-assign]
             high = PortfolioPlanner(store, epsilon=0.1, valence=(1.0, 20))
             self.assertLess(high.threshold, 0.11)
-            self.assertEqual(high.select()["task"]["task_id"], top.task_id)
+            chosen = high.select()
+            assert chosen is not None
+            self.assertEqual(chosen["task"]["task_id"], top.task_id)
             store.close()
 
 
